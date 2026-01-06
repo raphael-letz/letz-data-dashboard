@@ -521,16 +521,19 @@ with tab1:
     
     try:
         # Get users with activities who have completed onboarding
-        # days column contains comma-separated weekdays like "Tuesday,Monday,Wednesday"
+        # days column is JSONB - can be a string like "Tuesday,Monday" or possibly an array
         calendar_data = run_query("""
             SELECT 
-                ua.days,
+                ua.days::text as days,
                 u.full_name,
                 u.id as user_id
             FROM user_activities ua
             JOIN users u ON ua.user_id = u.id
             JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            WHERE ua.days IS NOT NULL AND ua.days != ''
+            WHERE ua.days IS NOT NULL 
+              AND ua.days::text != 'null'
+              AND ua.days::text != '""'
+              AND ua.days::text != ''
             ORDER BY u.full_name
         """)
         
@@ -541,7 +544,7 @@ with tab1:
                 'thursday': 'Thu', 'friday': 'Fri', 'saturday': 'Sat', 'sunday': 'Sun'
             }
             
-            # Build users by day - parse comma-separated days
+            # Build users by day - parse days (can be comma-separated or JSON)
             users_by_day = {day: set() for day in weekday_names}
             
             for _, row in calendar_data.iterrows():
@@ -549,8 +552,14 @@ with tab1:
                 user_name = row['full_name'] or 'Unknown'
                 
                 if pd.notna(days_str) and days_str:
+                    days_str = str(days_str).strip()
+                    
+                    # Remove JSON quotes if present (e.g., '"Tuesday,Monday"' -> 'Tuesday,Monday')
+                    if days_str.startswith('"') and days_str.endswith('"'):
+                        days_str = days_str[1:-1]
+                    
                     # Split comma-separated days
-                    for day in str(days_str).split(','):
+                    for day in days_str.split(','):
                         day_clean = day.strip().lower()
                         day_short = weekday_map.get(day_clean, day_clean[:3].title())
                         if day_short in users_by_day:
