@@ -317,18 +317,6 @@ GROUP BY timezone
 ORDER BY user_count DESC
 """,
 
-    "📅 User Activities Schema": """
--- Explore user_activities table structure
-SELECT column_name, data_type 
-FROM information_schema.columns 
-WHERE table_name = 'user_activities'
-ORDER BY ordinal_position
-""",
-
-    "📅 User Activities Sample": """
--- Sample of user_activities data
-SELECT * FROM user_activities LIMIT 10
-""",
 
     "📅 Daily Active Users": """
 -- Daily active users who SENT messages (deduplicated by waid)
@@ -533,59 +521,55 @@ with tab1:
     
     try:
         # Get users with activities who have completed onboarding
-        # First, let's check what columns exist in user_activities
+        # days column contains comma-separated weekdays like "Tuesday,Monday,Wednesday"
         calendar_data = run_query("""
             SELECT 
-                ua.weekday,
+                ua.days,
                 u.full_name,
                 u.id as user_id
             FROM user_activities ua
             JOIN users u ON ua.user_id = u.id
             JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            WHERE ua.weekday IS NOT NULL
-            ORDER BY ua.weekday, u.full_name
+            WHERE ua.days IS NOT NULL AND ua.days != ''
+            ORDER BY u.full_name
         """)
         
         if not calendar_data.empty:
-            # Map weekday numbers to names (assuming 0=Monday or 0=Sunday)
             weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+            weekday_map = {
+                'monday': 'Mon', 'tuesday': 'Tue', 'wednesday': 'Wed',
+                'thursday': 'Thu', 'friday': 'Fri', 'saturday': 'Sat', 'sunday': 'Sun'
+            }
             
-            # Check if weekday is numeric or string
-            sample_weekday = calendar_data['weekday'].iloc[0]
+            # Build users by day - parse comma-separated days
+            users_by_day = {day: set() for day in weekday_names}
             
-            if isinstance(sample_weekday, (int, float)) or str(sample_weekday).isdigit():
-                # Numeric weekdays - create mapping
-                calendar_data['weekday_name'] = calendar_data['weekday'].apply(
-                    lambda x: weekday_names[int(x) % 7] if pd.notna(x) else 'Unknown'
-                )
-            else:
-                # String weekdays - use as is or map common formats
-                weekday_map = {
-                    'monday': 'Mon', 'tuesday': 'Tue', 'wednesday': 'Wed',
-                    'thursday': 'Thu', 'friday': 'Fri', 'saturday': 'Sat', 'sunday': 'Sun',
-                    'mon': 'Mon', 'tue': 'Tue', 'wed': 'Wed', 'thu': 'Thu',
-                    'fri': 'Fri', 'sat': 'Sat', 'sun': 'Sun'
-                }
-                calendar_data['weekday_name'] = calendar_data['weekday'].apply(
-                    lambda x: weekday_map.get(str(x).lower().strip(), str(x)[:3].title()) if pd.notna(x) else 'Unknown'
-                )
+            for _, row in calendar_data.iterrows():
+                days_str = row['days']
+                user_name = row['full_name'] or 'Unknown'
+                
+                if pd.notna(days_str) and days_str:
+                    # Split comma-separated days
+                    for day in str(days_str).split(','):
+                        day_clean = day.strip().lower()
+                        day_short = weekday_map.get(day_clean, day_clean[:3].title())
+                        if day_short in users_by_day:
+                            users_by_day[day_short].add(user_name)
             
-            # Group users by weekday
-            users_by_day = {}
-            for day in weekday_names:
-                day_users = calendar_data[calendar_data['weekday_name'] == day]['full_name'].unique().tolist()
-                users_by_day[day] = day_users
+            # Convert sets to sorted lists
+            for day in users_by_day:
+                users_by_day[day] = sorted(list(users_by_day[day]))
             
             # Display as columns
             cols = st.columns(7)
             for i, day in enumerate(weekday_names):
                 with cols[i]:
-                    user_count = len(users_by_day.get(day, []))
+                    users = users_by_day.get(day, [])
+                    user_count = len(users)
                     st.markdown(f"**{day}**")
                     st.markdown(f"<div style='font-size: 24px; font-weight: bold; color: #00d4aa;'>{user_count}</div>", unsafe_allow_html=True)
                     
                     # Show user names (limit to 5 with expander for more)
-                    users = users_by_day.get(day, [])
                     if users:
                         display_users = users[:5]
                         for user in display_users:
