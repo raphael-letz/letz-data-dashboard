@@ -463,92 +463,142 @@ with tab1:
                 return ""
             msg_str = str(raw_msg).strip()
             
+            # Helper to parse JSON (handles double-encoded strings)
+            def parse_json(s):
+                try:
+                    data = json.loads(s)
+                    # If result is still a string, try parsing again (double-encoded)
+                    if isinstance(data, str):
+                        try:
+                            return json.loads(data)
+                        except:
+                            return data
+                    return data
+                except:
+                    return None
+            
             # Helper to recursively find text in nested dicts
             def find_text(obj, depth=0):
-                if depth > 5:  # Prevent infinite recursion
+                if depth > 10:
                     return None
-                if isinstance(obj, str):
-                    return obj if len(obj) > 2 else None
+                if isinstance(obj, str) and len(obj) > 2:
+                    return obj
                 if isinstance(obj, dict):
-                    # Priority keys to check first
-                    for key in ['text', 'title', 'body', 'message', 'content', 'caption']:
+                    # Priority: check 'text' key first at any level
+                    if 'text' in obj:
+                        val = obj['text']
+                        if isinstance(val, str) and len(val) > 2:
+                            return val
+                    # Then check other common keys
+                    for key in ['title', 'body', 'message', 'content', 'caption']:
                         if key in obj:
                             val = obj[key]
                             if isinstance(val, str) and len(val) > 2:
                                 return val
-                            elif isinstance(val, dict):
-                                result = find_text(val, depth + 1)
-                                if result:
-                                    return result
-                    # Check all values
+                            result = find_text(val, depth + 1)
+                            if result:
+                                return result
+                    # Check all other values
                     for val in obj.values():
-                        result = find_text(val, depth + 1)
+                        if isinstance(val, (dict, list)):
+                            result = find_text(val, depth + 1)
+                            if result:
+                                return result
+                if isinstance(obj, list):
+                    for item in obj:
+                        result = find_text(item, depth + 1)
                         if result:
                             return result
                 return None
             
-            # Try to parse as JSON
-            try:
-                data = json.loads(msg_str)
-                if isinstance(data, dict):
-                    # Handle postback messages (button clicks)
-                    if 'postback' in data:
-                        payload = data['postback'].get('payload', {})
-                        if isinstance(payload, dict):
-                            text = payload.get('text', '')
-                            value = payload.get('value', '')
-                            if text:
-                                return f"🔘 {text}"
-                            if value:
-                                return f"🔘 [{value}]"
-                    
-                    # Handle flows messages
-                    if 'flows' in data:
-                        text = find_text(data['flows'])
-                        if text:
-                            return text[:150]
-                    
-                    # Handle quickReply messages
-                    if 'quickReply' in data:
-                        text = find_text(data['quickReply'])
-                        if text:
-                            return text[:150]
-                    
-                    # Handle interactive messages
-                    if 'interactive' in data:
-                        interactive = data['interactive']
-                        if isinstance(interactive, dict):
-                            if 'button_reply' in interactive:
-                                return f"🔘 {interactive['button_reply'].get('title', 'Button')}"
-                            if 'list_reply' in interactive:
-                                return f"📋 {interactive['list_reply'].get('title', 'Selection')}"
-                            text = find_text(interactive)
-                            if text:
-                                return text[:150]
-                    
-                    # Handle media messages
-                    if 'image' in data:
-                        caption = find_text(data.get('image', {}))
-                        return f"📷 Image{': ' + caption[:50] if caption else ''}"
-                    if 'document' in data:
-                        filename = data['document'].get('filename', '')
-                        return f"📄 Document{': ' + filename if filename else ''}"
-                    if 'audio' in data:
-                        return "🎵 Audio"
-                    if 'video' in data:
-                        return "🎬 Video"
-                    if 'location' in data:
-                        return "📍 Location"
-                    
-                    # Generic search for text
-                    text = find_text(data)
-                    if text:
-                        return text[:150]
+            # Parse the JSON
+            data = parse_json(msg_str)
+            
+            if isinstance(data, dict):
+                # === WHATSAPP MESSAGE TYPES ===
                 
-                return msg_str[:100] + "..." if len(msg_str) > 100 else msg_str
-            except (json.JSONDecodeError, TypeError):
-                # Not JSON, return as-is (truncated)
-                return msg_str[:150] if len(msg_str) > 150 else msg_str
+                # 1. Flows messages: {"flows": {"body": {"text": "..."}}}
+                if 'flows' in data:
+                    text = find_text(data['flows'])
+                    if text:
+                        return text[:200]
+                
+                # 2. QuickReply messages: {"quickReply": {"body": {"text": "..."}}}
+                if 'quickReply' in data:
+                    text = find_text(data['quickReply'])
+                    if text:
+                        return text[:200]
+                
+                # 3. Postback (button click): {"postback": {"payload": {"text": "...", "value": "..."}}}
+                if 'postback' in data:
+                    payload = data['postback'].get('payload', {})
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except:
+                            return f"🔘 {payload[:100]}"
+                    if isinstance(payload, dict):
+                        text = payload.get('text', '')
+                        value = payload.get('value', '')
+                        if text:
+                            # Clean up unicode escapes
+                            return f"🔘 {text}"
+                        if value:
+                            return f"🔘 [{value}]"
+                    text = find_text(data['postback'])
+                    if text:
+                        return f"🔘 {text[:100]}"
+                
+                # 4. Interactive messages
+                if 'interactive' in data:
+                    interactive = data['interactive']
+                    if isinstance(interactive, dict):
+                        if 'button_reply' in interactive:
+                            return f"🔘 {interactive['button_reply'].get('title', 'Button')}"
+                        if 'list_reply' in interactive:
+                            return f"📋 {interactive['list_reply'].get('title', 'Selection')}"
+                        text = find_text(interactive)
+                        if text:
+                            return text[:200]
+                
+                # 5. Media messages
+                if 'image' in data:
+                    caption = find_text(data.get('image', {}))
+                    return f"📷 Image{': ' + caption[:80] if caption else ''}"
+                if 'document' in data:
+                    doc = data['document']
+                    filename = doc.get('filename', '') if isinstance(doc, dict) else ''
+                    return f"📄 Document{': ' + filename if filename else ''}"
+                if 'audio' in data:
+                    return "🎵 Audio message"
+                if 'video' in data:
+                    return "🎬 Video"
+                if 'sticker' in data:
+                    return "😀 Sticker"
+                if 'location' in data:
+                    return "📍 Location"
+                if 'contacts' in data:
+                    return "👤 Contact shared"
+                
+                # 6. Template messages
+                if 'template' in data:
+                    text = find_text(data['template'])
+                    if text:
+                        return text[:200]
+                
+                # 7. Generic fallback - find any text
+                text = find_text(data)
+                if text:
+                    return text[:200]
+            
+            # If data is a plain string (not dict), return it
+            if isinstance(data, str) and len(data) > 2:
+                return data[:200]
+            
+            # Last resort: return truncated original (but try to show it's JSON)
+            if msg_str.startswith('{') or msg_str.startswith('['):
+                return "[Complex message]"
+            return msg_str[:150] if len(msg_str) > 150 else msg_str
         
         # Format timestamp nicely
         def format_timestamp(ts):
