@@ -671,5 +671,5 @@ with tab3:
 
 # Footer
 st.markdown("---")
-st.caption(f"LETZ Data Dashboard • Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"LETZ Data Dashboard v1.1 • Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
