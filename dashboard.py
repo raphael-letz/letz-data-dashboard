@@ -9,9 +9,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 import json
+import re
 import pytz
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # Load environment variables
 load_dotenv()
@@ -673,6 +674,35 @@ with tab1:
                 return "[Complex message]"
             return msg_str[:150] if len(msg_str) > 150 else msg_str
         
+        # Parse timezone string like "UTC-3", "-3", "America/Sao_Paulo"
+        def parse_timezone(tz_str):
+            if not tz_str or pd.isna(tz_str):
+                return None
+            tz_str = str(tz_str).strip()
+            
+            # Try standard pytz timezone name first
+            try:
+                return pytz.timezone(tz_str)
+            except:
+                pass
+            
+            # Handle formats like "UTC-3", "GMT-3", "UTC+5:30", "-3", "-03:00"
+            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
+            if match:
+                sign = -1 if match.group(1) == '-' else 1
+                # Check if there's a minus before the number in the original string
+                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
+                    sign = -1
+                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
+                    sign = 1
+                
+                hours = int(match.group(2)) * sign
+                minutes = int(match.group(3) or 0)
+                offset = timedelta(hours=hours, minutes=minutes)
+                return timezone(offset)
+            
+            return None
+        
         # Format timestamp in user's local timezone
         def format_timestamp_local(row):
             ts = row['timestamp']
@@ -689,35 +719,14 @@ with tab1:
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=pytz.UTC)
                 
-                # Convert to user's timezone if available
-                if tz_str and not pd.isna(tz_str):
-                    tz_str = str(tz_str).strip()
-                    user_tz = None
-                    
-                    # Try direct pytz lookup first (e.g., "America/Sao_Paulo")
-                    try:
-                        user_tz = pytz.timezone(tz_str)
-                    except:
-                        pass
-                    
-                    # Handle numeric offsets like "-3", "-03:00", "UTC-3", "GMT-3"
-                    if user_tz is None:
-                        import re
-                        # Extract numeric offset
-                        match = re.search(r'([+-]?\d{1,2})(?::?(\d{2}))?', tz_str)
-                        if match:
-                            hours = int(match.group(1))
-                            minutes = int(match.group(2) or 0)
-                            # Create fixed offset timezone
-                            from datetime import timedelta, timezone
-                            offset = timedelta(hours=hours, minutes=minutes)
-                            user_tz = timezone(offset)
-                    
-                    # Apply timezone conversion
-                    if user_tz:
-                        ts = ts.astimezone(user_tz)
-                
-                return ts.strftime("%b %d, %H:%M")
+                # Convert to user's timezone
+                user_tz = parse_timezone(tz_str)
+                if user_tz:
+                    ts = ts.astimezone(user_tz)
+                    return ts.strftime("%b %d, %H:%M")
+                else:
+                    # Show UTC if no timezone
+                    return ts.strftime("%b %d, %H:%M") + " UTC"
             except Exception as e:
                 return str(ts)[:16]
         
