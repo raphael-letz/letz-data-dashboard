@@ -521,53 +521,37 @@ with tab1:
     
     try:
         # Get users with activities who have completed onboarding
-        # days column is JSONB - can be a string like "Tuesday,Monday" or possibly an array
+        # days column is JSONB array like ["Monday", "Tuesday"]
         calendar_data = run_query("""
             SELECT 
-                ua.days::text as days,
                 u.full_name,
-                u.id as user_id
-            FROM user_activities ua
-            JOIN users u ON ua.user_id = u.id
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Monday' THEN u.id END) > 0 as has_monday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Tuesday' THEN u.id END) > 0 as has_tuesday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Wednesday' THEN u.id END) > 0 as has_wednesday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Thursday' THEN u.id END) > 0 as has_thursday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Friday' THEN u.id END) > 0 as has_friday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Saturday' THEN u.id END) > 0 as has_saturday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Sunday' THEN u.id END) > 0 as has_sunday
+            FROM users u
+            JOIN user_activities ua ON u.id = ua.user_id
             JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            WHERE ua.days IS NOT NULL 
-              AND ua.days::text != 'null'
-              AND ua.days::text != '""'
-              AND ua.days::text != ''
+            WHERE ua.days IS NOT NULL
+            GROUP BY u.id, u.full_name
             ORDER BY u.full_name
         """)
         
         if not calendar_data.empty:
             weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            weekday_map = {
-                'monday': 'Mon', 'tuesday': 'Tue', 'wednesday': 'Wed',
-                'thursday': 'Thu', 'friday': 'Fri', 'saturday': 'Sat', 'sunday': 'Sun'
-            }
+            day_columns = ['has_monday', 'has_tuesday', 'has_wednesday', 'has_thursday', 'has_friday', 'has_saturday', 'has_sunday']
             
-            # Build users by day - parse days (can be comma-separated or JSON)
-            users_by_day = {day: set() for day in weekday_names}
+            # Build users by day
+            users_by_day = {day: [] for day in weekday_names}
             
             for _, row in calendar_data.iterrows():
-                days_str = row['days']
                 user_name = row['full_name'] or 'Unknown'
-                
-                if pd.notna(days_str) and days_str:
-                    days_str = str(days_str).strip()
-                    
-                    # Remove JSON quotes if present (e.g., '"Tuesday,Monday"' -> 'Tuesday,Monday')
-                    if days_str.startswith('"') and days_str.endswith('"'):
-                        days_str = days_str[1:-1]
-                    
-                    # Split comma-separated days
-                    for day in days_str.split(','):
-                        day_clean = day.strip().lower()
-                        day_short = weekday_map.get(day_clean, day_clean[:3].title())
-                        if day_short in users_by_day:
-                            users_by_day[day_short].add(user_name)
-            
-            # Convert sets to sorted lists
-            for day in users_by_day:
-                users_by_day[day] = sorted(list(users_by_day[day]))
+                for i, day in enumerate(weekday_names):
+                    if row[day_columns[i]]:
+                        users_by_day[day].append(user_name)
             
             # Display as columns
             cols = st.columns(7)
