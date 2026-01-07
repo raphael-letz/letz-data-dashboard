@@ -828,19 +828,125 @@ with tab1:
     
     st.markdown("---")
     
-    # Recent users (deduplicated by waid, showing 10 most recent unique users)
-    st.markdown("### 👥 Recent Users")
-    recent_users = run_query("""
-        SELECT * FROM (
-            SELECT DISTINCT ON (waid) id, waid, full_name, gender, pillar, level, phase, is_active, created_at 
+    # All users (deduplicated by waid) with last message info
+    st.markdown("### 👥 All Users")
+    
+    # Query users with their last sent/received message times
+    all_users = run_query("""
+        WITH unique_users AS (
+            SELECT DISTINCT ON (waid) 
+                id, waid, full_name, gender, pillar, level, phase, is_active, timezone, created_at 
             FROM users 
             ORDER BY waid, created_at DESC
-        ) unique_users
-        ORDER BY created_at DESC
-        LIMIT 10
+        ),
+        last_sent AS (
+            SELECT DISTINCT ON (m.user_id)
+                m.user_id,
+                m.sent_at as last_sent_at
+            FROM messages m
+            WHERE m.sender = 'user'
+            ORDER BY m.user_id, m.sent_at DESC
+        ),
+        last_received AS (
+            SELECT DISTINCT ON (m.user_id)
+                m.user_id,
+                m.sent_at as last_received_at
+            FROM messages m
+            WHERE m.sender = 'bot'
+            ORDER BY m.user_id, m.sent_at DESC
+        )
+        SELECT 
+            u.id,
+            u.waid,
+            u.full_name,
+            u.gender,
+            u.pillar,
+            u.level,
+            u.phase,
+            u.is_active,
+            u.timezone,
+            u.created_at,
+            ls.last_sent_at,
+            lr.last_received_at
+        FROM unique_users u
+        LEFT JOIN last_sent ls ON u.id = ls.user_id
+        LEFT JOIN last_received lr ON u.id = lr.user_id
+        ORDER BY u.created_at DESC
     """)
-    if not recent_users.empty:
-        st.dataframe(recent_users, use_container_width=True, hide_index=True)
+    
+    if not all_users.empty:
+        # Parse timezone string like "UTC-3", "-3", "America/Sao_Paulo"
+        def parse_tz(tz_str):
+            if not tz_str or pd.isna(tz_str):
+                return None
+            tz_str = str(tz_str).strip()
+            try:
+                return pytz.timezone(tz_str)
+            except:
+                pass
+            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
+            if match:
+                sign = -1 if match.group(1) == '-' else 1
+                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
+                    sign = -1
+                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
+                    sign = 1
+                hours = int(match.group(2)) * sign
+                minutes = int(match.group(3) or 0)
+                offset = timedelta(hours=hours, minutes=minutes)
+                return timezone(offset)
+            return None
+        
+        # Format timestamp in user's local timezone
+        def format_ts(ts, tz_str):
+            if pd.isna(ts) or ts is None:
+                return "—"
+            try:
+                if isinstance(ts, str):
+                    ts = pd.to_datetime(ts)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=pytz.UTC)
+                user_tz = parse_tz(tz_str)
+                if user_tz:
+                    ts = ts.astimezone(user_tz)
+                    return ts.strftime("%b %d, %H:%M")
+                else:
+                    return ts.strftime("%b %d, %H:%M") + " UTC"
+            except:
+                return str(ts)[:16] if ts else "—"
+        
+        # Build display dataframe
+        display_df = pd.DataFrame({
+            'Name': all_users['full_name'].fillna('Unknown'),
+            'WhatsApp ID': all_users['waid'],
+            'Pillar': all_users['pillar'].fillna('—'),
+            'Level': all_users['level'].fillna('—'),
+            'Phase': all_users['phase'].fillna('—'),
+            'Active': all_users['is_active'].apply(lambda x: '✓' if x else '✗'),
+            'Signed Up': all_users.apply(lambda r: format_ts(r['created_at'], r['timezone']), axis=1),
+            'Last Sent': all_users.apply(lambda r: format_ts(r['last_sent_at'], r['timezone']), axis=1),
+            'Last Received': all_users.apply(lambda r: format_ts(r['last_received_at'], r['timezone']), axis=1),
+        })
+        
+        # Show count and expandable table
+        st.caption(f"{len(display_df)} total users")
+        
+        with st.expander("📋 View All Users", expanded=False):
+            st.dataframe(
+                display_df, 
+                use_container_width=True, 
+                hide_index=True,
+                height=400
+            )
+            
+            # Download button
+            csv = display_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download CSV",
+                csv,
+                "all_users.csv",
+                "text/csv"
+            )
     else:
         st.info("No users found or table doesn't exist yet")
 
