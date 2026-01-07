@@ -62,23 +62,28 @@ st.markdown("""
 def get_connection():
     """Create database connection. Supports both local .env and Streamlit Cloud secrets."""
     try:
-        # Try Streamlit secrets first (for cloud deployment), then fall back to .env
-        if hasattr(st, 'secrets') and 'DB_HOST' in st.secrets:
-            conn = psycopg2.connect(
-                host=st.secrets["DB_HOST"],
-                database=st.secrets["DB_NAME"],
-                user=st.secrets["DB_USER"],
-                password=st.secrets["DB_PASSWORD"],
-                port=st.secrets.get("DB_PORT", "5432")
-            )
-        else:
-            conn = psycopg2.connect(
-                host=os.getenv("DB_HOST"),
-                database=os.getenv("DB_NAME"),
-                user=os.getenv("DB_USER"),
-                password=os.getenv("DB_PASSWORD"),
-                port=os.getenv("DB_PORT", "5432")
-            )
+        # Try Streamlit secrets first (for cloud deployment)
+        try:
+            if hasattr(st, 'secrets') and 'DB_HOST' in st.secrets:
+                conn = psycopg2.connect(
+                    host=st.secrets["DB_HOST"],
+                    database=st.secrets["DB_NAME"],
+                    user=st.secrets["DB_USER"],
+                    password=st.secrets["DB_PASSWORD"],
+                    port=st.secrets.get("DB_PORT", "5432")
+                )
+                return conn
+        except:
+            pass  # No secrets.toml, fall back to .env
+        
+        # Fall back to .env
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),
+            database=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            port=os.getenv("DB_PORT", "5432")
+        )
         return conn
     except Exception as e:
         st.error(f"Database connection failed: {e}")
@@ -523,71 +528,6 @@ with tab1:
     
     st.markdown("---")
     
-    # Weekly Activity Calendar
-    st.markdown("### 📅 Weekly Activity Schedule")
-    st.caption("Users who completed onboarding and have activities scheduled")
-    
-    try:
-        # Get users with activities who have completed onboarding
-        # days column is JSONB array like ["Monday", "Tuesday"]
-        calendar_data = run_query("""
-            SELECT 
-                u.full_name,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Monday' THEN u.id END) > 0 as has_monday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Tuesday' THEN u.id END) > 0 as has_tuesday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Wednesday' THEN u.id END) > 0 as has_wednesday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Thursday' THEN u.id END) > 0 as has_thursday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Friday' THEN u.id END) > 0 as has_friday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Saturday' THEN u.id END) > 0 as has_saturday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Sunday' THEN u.id END) > 0 as has_sunday
-            FROM users u
-            JOIN user_activities ua ON u.id = ua.user_id
-            JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            WHERE ua.days IS NOT NULL
-            GROUP BY u.id, u.full_name
-            ORDER BY u.full_name
-        """)
-        
-        if not calendar_data.empty:
-            weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            day_columns = ['has_monday', 'has_tuesday', 'has_wednesday', 'has_thursday', 'has_friday', 'has_saturday', 'has_sunday']
-            
-            # Build users by day
-            users_by_day = {day: [] for day in weekday_names}
-            
-            for _, row in calendar_data.iterrows():
-                user_name = row['full_name'] or 'Unknown'
-                for i, day in enumerate(weekday_names):
-                    if row[day_columns[i]]:
-                        users_by_day[day].append(user_name)
-            
-            # Display as columns
-            cols = st.columns(7)
-            for i, day in enumerate(weekday_names):
-                with cols[i]:
-                    users = users_by_day.get(day, [])
-                    user_count = len(users)
-                    st.markdown(f"**{day}**")
-                    st.markdown(f"<div style='font-size: 24px; font-weight: bold; color: #00d4aa;'>{user_count}</div>", unsafe_allow_html=True)
-                    
-                    # Show user names (limit to 5 with expander for more)
-                    if users:
-                        display_users = users[:5]
-                        for user in display_users:
-                            st.caption(f"• {user}")
-                        if len(users) > 5:
-                            with st.expander(f"+{len(users)-5} more"):
-                                for user in users[5:]:
-                                    st.caption(f"• {user}")
-                    else:
-                        st.caption("—")
-        else:
-            st.info("No activity schedule data found")
-    except Exception as e:
-        st.warning(f"Could not load activity calendar: {e}")
-    
-    st.markdown("---")
-    
     # Recent messages section
     st.markdown("### 💬 Recent Messages")
     recent_messages = run_query("""
@@ -831,7 +771,7 @@ with tab1:
     # All users (deduplicated by waid) with last message info
     st.markdown("### 👥 All Users")
     
-    # Query users with their last sent/received message times
+    # Query users with their last sent/received message times and content
     all_users = run_query("""
         WITH unique_users AS (
             SELECT DISTINCT ON (waid) 
@@ -842,7 +782,8 @@ with tab1:
         last_sent AS (
             SELECT DISTINCT ON (m.user_id)
                 m.user_id,
-                m.sent_at as last_sent_at
+                m.sent_at as last_sent_at,
+                m.message as last_sent_msg
             FROM messages m
             WHERE m.sender = 'user'
             ORDER BY m.user_id, m.sent_at DESC
@@ -850,9 +791,10 @@ with tab1:
         last_received AS (
             SELECT DISTINCT ON (m.user_id)
                 m.user_id,
-                m.sent_at as last_received_at
+                m.sent_at as last_received_at,
+                m.message as last_received_msg
             FROM messages m
-            WHERE m.sender = 'bot'
+            WHERE m.sender != 'user'
             ORDER BY m.user_id, m.sent_at DESC
         )
         SELECT 
@@ -867,7 +809,9 @@ with tab1:
             u.timezone,
             u.created_at,
             ls.last_sent_at,
-            lr.last_received_at
+            ls.last_sent_msg,
+            lr.last_received_at,
+            lr.last_received_msg
         FROM unique_users u
         LEFT JOIN last_sent ls ON u.id = ls.user_id
         LEFT JOIN last_received lr ON u.id = lr.user_id
@@ -915,17 +859,66 @@ with tab1:
             except:
                 return str(ts)[:16] if ts else "—"
         
+        # Extract readable text from message JSON
+        def extract_msg(raw_msg):
+            if pd.isna(raw_msg) or raw_msg is None:
+                return "—"
+            msg_str = str(raw_msg).strip()
+            
+            # Try to parse JSON and find text
+            def find_text(obj, depth=0):
+                if depth > 5:
+                    return None
+                if isinstance(obj, str) and len(obj) > 2:
+                    return obj
+                if isinstance(obj, dict):
+                    for key in ['text', 'body', 'title', 'message', 'content', 'caption']:
+                        if key in obj:
+                            val = obj[key]
+                            if isinstance(val, str) and len(val) > 2:
+                                return val
+                            result = find_text(val, depth + 1)
+                            if result:
+                                return result
+                    for val in obj.values():
+                        if isinstance(val, (dict, list)):
+                            result = find_text(val, depth + 1)
+                            if result:
+                                return result
+                if isinstance(obj, list):
+                    for item in obj:
+                        result = find_text(item, depth + 1)
+                        if result:
+                            return result
+                return None
+            
+            try:
+                data = json.loads(msg_str)
+                # Handle double-encoded JSON
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except:
+                        return data[:80] if len(data) > 80 else data
+                
+                text = find_text(data)
+                if text:
+                    return text[:80] + "..." if len(text) > 80 else text
+                return "[Complex message]"
+            except:
+                return msg_str[:80] + "..." if len(msg_str) > 80 else msg_str
+        
         # Build display dataframe
         display_df = pd.DataFrame({
             'Name': all_users['full_name'].fillna('Unknown'),
             'WhatsApp ID': all_users['waid'],
-            'Pillar': all_users['pillar'].fillna('—'),
             'Level': all_users['level'].fillna('—'),
             'Phase': all_users['phase'].fillna('—'),
-            'Active': all_users['is_active'].apply(lambda x: '✓' if x else '✗'),
             'Signed Up': all_users.apply(lambda r: format_ts(r['created_at'], r['timezone']), axis=1),
             'Last Sent': all_users.apply(lambda r: format_ts(r['last_sent_at'], r['timezone']), axis=1),
+            'Last Sent Msg': all_users['last_sent_msg'].apply(extract_msg),
             'Last Received': all_users.apply(lambda r: format_ts(r['last_received_at'], r['timezone']), axis=1),
+            'Last Received Msg': all_users['last_received_msg'].apply(extract_msg),
         })
         
         # Show count and expandable table
@@ -949,6 +942,71 @@ with tab1:
             )
     else:
         st.info("No users found or table doesn't exist yet")
+    
+    st.markdown("---")
+    
+    # Weekly Activity Calendar
+    st.markdown("### 📅 Weekly Activity Schedule")
+    st.caption("Users who completed onboarding and have activities scheduled")
+    
+    try:
+        # Get users with activities who have completed onboarding
+        # days column is JSONB array like ["Monday", "Tuesday"]
+        calendar_data = run_query("""
+            SELECT 
+                u.full_name,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Monday' THEN u.id END) > 0 as has_monday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Tuesday' THEN u.id END) > 0 as has_tuesday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Wednesday' THEN u.id END) > 0 as has_wednesday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Thursday' THEN u.id END) > 0 as has_thursday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Friday' THEN u.id END) > 0 as has_friday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Saturday' THEN u.id END) > 0 as has_saturday,
+                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Sunday' THEN u.id END) > 0 as has_sunday
+            FROM users u
+            JOIN user_activities ua ON u.id = ua.user_id
+            JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
+            WHERE ua.days IS NOT NULL
+            GROUP BY u.id, u.full_name
+            ORDER BY u.full_name
+        """)
+        
+        if not calendar_data.empty:
+            weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+            day_columns = ['has_monday', 'has_tuesday', 'has_wednesday', 'has_thursday', 'has_friday', 'has_saturday', 'has_sunday']
+            
+            # Build users by day
+            users_by_day = {day: [] for day in weekday_names}
+            
+            for _, row in calendar_data.iterrows():
+                user_name = row['full_name'] or 'Unknown'
+                for i, day in enumerate(weekday_names):
+                    if row[day_columns[i]]:
+                        users_by_day[day].append(user_name)
+            
+            # Display as columns
+            cols = st.columns(7)
+            for i, day in enumerate(weekday_names):
+                with cols[i]:
+                    users = users_by_day.get(day, [])
+                    user_count = len(users)
+                    st.markdown(f"**{day}**")
+                    st.markdown(f"<div style='font-size: 24px; font-weight: bold; color: #00d4aa;'>{user_count}</div>", unsafe_allow_html=True)
+                    
+                    # Show user names (limit to 5 with expander for more)
+                    if users:
+                        display_users = users[:5]
+                        for user in display_users:
+                            st.caption(f"• {user}")
+                        if len(users) > 5:
+                            with st.expander(f"+{len(users)-5} more"):
+                                for user in users[5:]:
+                                    st.caption(f"• {user}")
+                    else:
+                        st.caption("—")
+        else:
+            st.info("No activity schedule data found")
+    except Exception as e:
+        st.warning(f"Could not load activity calendar: {e}")
 
 
 # Tab 2: Predefined Queries
