@@ -152,7 +152,7 @@ SELECT
     (SELECT COUNT(DISTINCT waid) FROM users WHERE is_active = true) as active_users,
     (SELECT COUNT(DISTINCT waid) FROM users WHERE created_at > NOW() - INTERVAL '7 days') as new_users_7d,
     (SELECT COUNT(DISTINCT waid) FROM users WHERE created_at > NOW() - INTERVAL '24 hours') as new_users_24h,
-    (SELECT COUNT(*) FROM user_activities WHERE completed = true) as completed_activities,
+    (SELECT COUNT(*) FROM user_activities_history WHERE completed_at IS NOT NULL) as completed_activities,
     (SELECT COUNT(*) FROM user_milestones WHERE completed = true) as completed_milestones
 """,
     
@@ -233,18 +233,18 @@ ORDER BY user_count DESC
     "✅ Completed Activities": """
 -- Activities completed by users
 SELECT 
-    ua.id,
+    ua.user_activity_id,
     ua.user_id,
     u.full_name,
-    ua.activity,
-    ua.completed,
-    ua.progress,
-    ua.created_at,
-    ua.last_activity_at
-FROM user_activities ua
+    ua.activity_type,
+    ua.completed_at,
+    ua.completion_method,
+    ua.xp_earned,
+    ua.created_at
+FROM user_activities_history ua
 LEFT JOIN users u ON ua.user_id = u.id
-WHERE ua.completed = true
-ORDER BY ua.last_activity_at DESC
+WHERE ua.completed_at IS NOT NULL
+ORDER BY ua.completed_at DESC
 LIMIT 50
 """,
 
@@ -405,7 +405,7 @@ with st.sidebar:
 
 
 # Main content tabs
-tab1, tab2 = st.tabs(["📊 Quick Insights", "📋 Predefined Queries"])
+tab1, tab2 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive"])
 
 
 # Tab 1: Quick Insights
@@ -477,13 +477,13 @@ with tab1:
         total_users = total_users_result['total'].iloc[0] if not total_users_result.empty else 0
         
         if total_users > 0:
-            # Get counts for each journey milestone
+            # Get counts for each journey milestone from events table
             journey_stats = run_query("""
                 SELECT 
                     event_type,
                     COUNT(DISTINCT user_id) as user_count
                 FROM events
-                WHERE event_type IN ('onboarding_completed', 'complete_activity', 'update_experience', 'settings_updated')
+                WHERE event_type IN ('onboarding_completed', 'update_experience', 'settings_updated')
                 GROUP BY event_type
             """)
             
@@ -493,10 +493,19 @@ with tab1:
                 for _, row in journey_stats.iterrows():
                     stats_dict[row['event_type']] = row['user_count']
             
+            # Get unique users who completed an activity (have completed_at timestamp in user_activities_history)
+            # This is also the count for "Earned XP" since completing activity = earning XP
+            completed_activities_result = run_query("""
+                SELECT COUNT(DISTINCT user_id) as count
+                FROM user_activities_history
+                WHERE completed_at IS NOT NULL
+            """)
+            completed_activities_count = completed_activities_result['count'].iloc[0] if not completed_activities_result.empty else 0
+            
             # Calculate percentages
             onboarding_pct = round(100 * stats_dict.get('onboarding_completed', 0) / total_users, 1)
-            activity_pct = round(100 * stats_dict.get('complete_activity', 0) / total_users, 1)
-            xp_pct = round(100 * stats_dict.get('update_experience', 0) / total_users, 1)
+            activity_pct = round(100 * completed_activities_count / total_users, 1)
+            xp_pct = activity_pct  # Same as completed activity - completing activity = earning XP
             settings_pct = round(100 * stats_dict.get('settings_updated', 0) / total_users, 1)
             
             # Display as metrics
@@ -509,18 +518,58 @@ with tab1:
             jcol2.metric(
                 "🏃 Completed Activity", 
                 f"{activity_pct}%",
-                f"{stats_dict.get('complete_activity', 0)} users"
+                f"{completed_activities_count} users"
             )
             jcol3.metric(
                 "⭐ Earned XP", 
                 f"{xp_pct}%",
-                f"{stats_dict.get('update_experience', 0)} users"
+                f"{completed_activities_count} users"
             )
             jcol4.metric(
                 "⚙️ Updated Settings", 
                 f"{settings_pct}%",
                 f"{stats_dict.get('settings_updated', 0)} users"
             )
+            
+            # Breakdown of completed activities by type
+            st.markdown("#### 🏋️ Activities Completed by Type")
+            activity_breakdown = run_query("""
+                SELECT 
+                    activity_type,
+                    COUNT(*) as completions,
+                    COUNT(DISTINCT user_id) as unique_users
+                FROM user_activities_history
+                WHERE completed_at IS NOT NULL
+                GROUP BY activity_type
+                ORDER BY completions DESC
+            """)
+            
+            if not activity_breakdown.empty:
+                # Display as horizontal metrics
+                acols = st.columns(len(activity_breakdown))
+                for i, (_, row) in enumerate(activity_breakdown.iterrows()):
+                    activity_name = str(row['activity_type']).capitalize() if row['activity_type'] else 'Unknown'
+                    # Choose emoji based on activity type
+                    emoji_map = {
+                        'strength': '💪',
+                        'cardio': '🏃',
+                        'steps': '👟',
+                        'walk': '🚶',
+                        'run': '🏃',
+                        'yoga': '🧘',
+                        'meditation': '🧘',
+                        'sleep': '😴',
+                        'water': '💧',
+                        'nutrition': '🥗',
+                    }
+                    emoji = emoji_map.get(str(row['activity_type']).lower(), '✅')
+                    acols[i].metric(
+                        f"{emoji} {activity_name}",
+                        f"{row['completions']} completions",
+                        f"{row['unique_users']} users"
+                    )
+            else:
+                st.caption("No completed activities yet")
         else:
             st.info("No users found")
     except Exception as e:
@@ -943,90 +992,246 @@ with tab1:
     else:
         st.info("No users found or table doesn't exist yet")
     
-    st.markdown("---")
+
+
+# Tab 2: User Deep Dive
+with tab2:
+    st.markdown("### 🔍 User Deep Dive")
+    st.caption("Select a user to view messages, activity plan, XP, and engagement")
     
-    # Weekly Activity Calendar
-    st.markdown("### 📅 Weekly Activity Schedule")
-    st.caption("Users who completed onboarding and have activities scheduled")
+    users_df = run_query("""
+        SELECT 
+            id,
+            COALESCE(full_name, 'Unknown') as full_name,
+            waid,
+            timezone,
+            created_at
+        FROM users
+        ORDER BY created_at DESC
+        LIMIT 500
+    """)
     
-    try:
-        # Get users with activities who have completed onboarding
-        # days column is JSONB array like ["Monday", "Tuesday"]
-        calendar_data = run_query("""
+    if users_df.empty:
+        st.info("No users found")
+    else:
+        users_df['label'] = users_df.apply(lambda r: f"{r['full_name']} ({r['waid']})", axis=1)
+        selected_label = st.selectbox("Select user", users_df['label'])
+        selected_row = users_df[users_df['label'] == selected_label].iloc[0]
+        user_id = int(selected_row['id'])
+        user_tz_str = selected_row.get('timezone')
+        
+        # Helper: parse timezone strings like "UTC-3", "-3", "America/Sao_Paulo"
+        def parse_tz(tz_str):
+            if not tz_str or pd.isna(tz_str):
+                return None
+            tz_str = str(tz_str).strip()
+            try:
+                return pytz.timezone(tz_str)
+            except:
+                pass
+            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
+            if match:
+                sign = -1 if match.group(1) == '-' else 1
+                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
+                    sign = -1
+                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
+                    sign = 1
+                hours = int(match.group(2)) * sign
+                minutes = int(match.group(3) or 0)
+                offset = timedelta(hours=hours, minutes=minutes)
+                return timezone(offset)
+            return None
+        
+        def format_ts_local(ts):
+            if pd.isna(ts) or ts is None:
+                return "—"
+            try:
+                if isinstance(ts, str):
+                    ts = pd.to_datetime(ts)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=pytz.UTC)
+                user_tz = parse_tz(user_tz_str)
+                if user_tz:
+                    ts = ts.astimezone(user_tz)
+                return ts.strftime("%b %d, %H:%M")
+            except:
+                return str(ts)[:16]
+        
+        # Engagement metrics
+        msg_counts = run_query(f"""
             SELECT 
-                u.full_name,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Monday' THEN u.id END) > 0 as has_monday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Tuesday' THEN u.id END) > 0 as has_tuesday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Wednesday' THEN u.id END) > 0 as has_wednesday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Thursday' THEN u.id END) > 0 as has_thursday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Friday' THEN u.id END) > 0 as has_friday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Saturday' THEN u.id END) > 0 as has_saturday,
-                COUNT(DISTINCT CASE WHEN ua.days::jsonb ? 'Sunday' THEN u.id END) > 0 as has_sunday
-            FROM users u
-            JOIN user_activities ua ON u.id = ua.user_id
-            JOIN events e ON e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            WHERE ua.days IS NOT NULL
-            GROUP BY u.id, u.full_name
-            ORDER BY u.full_name
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '24 hours') as count_24h,
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '3 days') as count_3d,
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '7 days') as count_7d
+            FROM messages
+            WHERE user_id = {user_id}
+              AND sender = 'user'
+              AND sent_at IS NOT NULL
+        """)
+        mc_row = msg_counts.iloc[0] if not msg_counts.empty else {}
+        count_24h = int(mc_row.get('count_24h', 0)) if isinstance(mc_row, pd.Series) else 0
+        count_3d = int(mc_row.get('count_3d', 0)) if isinstance(mc_row, pd.Series) else 0
+        count_7d = int(mc_row.get('count_7d', 0)) if isinstance(mc_row, pd.Series) else 0
+        
+        last_active_df = run_query(f"""
+            SELECT sent_at 
+            FROM messages 
+            WHERE user_id = {user_id} AND sender = 'user' AND sent_at IS NOT NULL
+            ORDER BY sent_at DESC
+            LIMIT 1
+        """)
+        last_active = format_ts_local(last_active_df['sent_at'].iloc[0]) if not last_active_df.empty else "—"
+        
+        xp_total_df = run_query(f"""
+            SELECT COALESCE(SUM(xp_earned), 0) as total_xp
+            FROM user_activities_history
+            WHERE user_id = {user_id}
+        """)
+        total_xp = int(xp_total_df['total_xp'].iloc[0]) if not xp_total_df.empty else 0
+        
+        last_completed_df = run_query(f"""
+            SELECT activity_type, completed_at
+            FROM user_activities_history
+            WHERE user_id = {user_id} AND completed_at IS NOT NULL
+            ORDER BY completed_at DESC
+            LIMIT 1
+        """)
+        last_activity_name = last_completed_df['activity_type'].iloc[0] if not last_completed_df.empty else "—"
+        last_activity_time = format_ts_local(last_completed_df['completed_at'].iloc[0]) if not last_completed_df.empty else "—"
+        
+        # Activity plan (schedule) from user_activities
+        plan_df = run_query(f"""
+            SELECT 
+                activity,
+                days,
+                created_at
+            FROM user_activities
+            WHERE user_id = {user_id}
         """)
         
-        if not calendar_data.empty:
-            weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            day_columns = ['has_monday', 'has_tuesday', 'has_wednesday', 'has_thursday', 'has_friday', 'has_saturday', 'has_sunday']
-            
-            # Build users by day
-            users_by_day = {day: [] for day in weekday_names}
-            
-            for _, row in calendar_data.iterrows():
-                user_name = row['full_name'] or 'Unknown'
-                for i, day in enumerate(weekday_names):
-                    if row[day_columns[i]]:
-                        users_by_day[day].append(user_name)
-            
-            # Display as columns
+        week_full = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        week_short = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        day_to_idx = {day: i for i, day in enumerate(week_full)}
+        
+        def parse_days(val):
+            if val is None:
+                return []
+            # If already a list/array-like, return normalized strings
+            if isinstance(val, (list, tuple)):
+                return [str(v) for v in val]
+            # Strings: try JSON parse first
+            if isinstance(val, str):
+                try:
+                    data = json.loads(val)
+                    if isinstance(data, list):
+                        return [str(v) for v in data]
+                except Exception:
+                    # Fallback: comma-separated list
+                    if ',' in val:
+                        return [v.strip() for v in val.split(',')]
+                # If nothing parsed, treat as single value
+                return [val.strip()]
+            # Any other type -> best effort string
+            try:
+                return [str(val)]
+            except Exception:
+                return []
+        
+        # Build weekly calendar and find next activity
+        calendar = {day: [] for day in week_short}
+        next_activity_name = "—"
+        next_activity_day = "—"
+        today_idx = datetime.utcnow().weekday()  # Monday = 0
+        best_delta = None
+        
+        if not plan_df.empty:
+            for _, row in plan_df.iterrows():
+                act_name = row.get('activity') or 'Activity'
+                days_list = parse_days(row.get('days'))
+                for day in days_list:
+                    normalized = day.strip().capitalize()
+                    if normalized in week_full:
+                        idx = day_to_idx[normalized]
+                        calendar[week_short[idx]].append(act_name)
+                        delta = (idx - today_idx) % 7
+                        if best_delta is None or delta < best_delta:
+                            best_delta = delta
+                            next_activity_name = act_name
+                            next_activity_day = week_full[idx]
+        
+        # Metrics row
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("⭐ XP Earned", total_xp)
+        m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
+        m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
+        m4.metric("⏱️ Last Active", last_active)
+        m5.metric("💬 Messages (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
+        
+        # Activity plan weekly calendar
+        st.markdown("#### 📅 Activity Plan (weekly)")
+        if plan_df.empty:
+            st.info("No activity plan found for this user.")
+        else:
             cols = st.columns(7)
-            for i, day in enumerate(weekday_names):
+            for i, day in enumerate(week_short):
                 with cols[i]:
-                    users = users_by_day.get(day, [])
-                    user_count = len(users)
+                    items = calendar.get(day, [])
                     st.markdown(f"**{day}**")
-                    st.markdown(f"<div style='font-size: 24px; font-weight: bold; color: #00d4aa;'>{user_count}</div>", unsafe_allow_html=True)
-                    
-                    # Show user names (limit to 5 with expander for more)
-                    if users:
-                        display_users = users[:5]
-                        for user in display_users:
-                            st.caption(f"• {user}")
-                        if len(users) > 5:
-                            with st.expander(f"+{len(users)-5} more"):
-                                for user in users[5:]:
-                                    st.caption(f"• {user}")
+                    st.markdown(f"<div style='font-size: 22px; font-weight: bold; color: #00d4aa;'>{len(items)}</div>", unsafe_allow_html=True)
+                    if items:
+                        for act in items[:4]:
+                            st.caption(f"• {act}")
+                        if len(items) > 4:
+                            with st.expander(f"+{len(items)-4} more"):
+                                for act in items[4:]:
+                                    st.caption(f"• {act}")
                     else:
                         st.caption("—")
+        
+        st.markdown("#### 💬 Message History")
+        messages_df = run_query(f"""
+            SELECT sent_at, sender, message
+            FROM messages
+            WHERE user_id = {user_id} AND sent_at IS NOT NULL
+            ORDER BY sent_at DESC
+            LIMIT 100
+        """)
+        
+        def extract_msg_text(raw_msg):
+            if pd.isna(raw_msg) or raw_msg is None:
+                return ""
+            msg_str = str(raw_msg).strip()
+            try:
+                data = json.loads(msg_str)
+                if isinstance(data, dict):
+                    for key in ['text', 'body', 'message', 'title', 'content', 'caption']:
+                        if key in data and isinstance(data[key], str) and len(data[key]) > 2:
+                            return data[key][:200]
+                    return "[Complex message]"
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, str) and len(item) > 2:
+                            return item[:200]
+                if isinstance(data, str) and len(data) > 2:
+                    return data[:200]
+            except:
+                pass
+            return msg_str[:200]
+        
+        if messages_df.empty:
+            st.info("No messages found for this user.")
         else:
-            st.info("No activity schedule data found")
-    except Exception as e:
-        st.warning(f"Could not load activity calendar: {e}")
-
-
-# Tab 2: Predefined Queries
-with tab2:
-    st.markdown("### 📋 Predefined Queries")
-    st.caption("Click to run common queries - edit the QUERIES dict in dashboard.py to customize")
-    
-    for query_name, query_sql in QUERIES.items():
-        with st.expander(query_name):
-            st.code(query_sql, language="sql")
-            
-            if st.button(f"Run: {query_name}", key=f"run_{query_name}"):
-                with st.spinner("Running..."):
-                    result = run_query(query_sql)
-                
-                if not result.empty:
-                    st.success(f"✓ {len(result)} rows")
-                    st.dataframe(result, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("No results - table may not exist or is empty")
+            history_df = pd.DataFrame({
+                "Time": messages_df['sent_at'].apply(format_ts_local),
+                "From": messages_df['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
+                "Message": messages_df['message'].apply(extract_msg_text)
+            })
+            st.dataframe(
+                history_df,
+                use_container_width=True,
+                hide_index=True,
+                height=420
+            )
 
 
 # Footer
