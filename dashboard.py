@@ -506,9 +506,65 @@ with tab1:
             WHERE days::jsonb ? '{today_day}'
         """)
         activity_today = activity_today_df['count'].iloc[0] if not activity_today_df.empty else 0
-        col7.metric("Activity Today", activity_today, today_day)
+        col7.metric("Users with Activities Scheduled Today", activity_today, today_day)
     except:
-        col7.metric("Activity Today", "—")
+        col7.metric("Users with Activities Scheduled Today", "—")
+    
+    # Expandable simple lists for key metrics
+    try:
+        new_today_list = run_query("""
+            SELECT COALESCE(full_name, 'Unknown') AS name
+            FROM users
+            WHERE created_at >= CURRENT_DATE
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
+        with st.expander("New Today - names"):
+            if new_today_list.empty:
+                st.caption("No users")
+            else:
+                for n in new_today_list['name']:
+                    st.caption(f"• {n}")
+    except:
+        st.warning("Could not load New Today list")
+    
+    try:
+        active_today_list = run_query("""
+            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name
+            FROM messages m
+            JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at >= CURRENT_DATE 
+              AND m.user_id IS NOT NULL
+              AND m.sender = 'user'
+            ORDER BY name
+            LIMIT 200
+        """)
+        with st.expander("Active Today - names"):
+            if active_today_list.empty:
+                st.caption("No users")
+            else:
+                for n in active_today_list['name']:
+                    st.caption(f"• {n}")
+    except:
+        st.warning("Could not load Active Today list")
+    
+    try:
+        templates_24h_list = run_query("""
+            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name
+            FROM recovery_logs r
+            JOIN users u ON r.user_id = u.id
+            WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY name
+            LIMIT 200
+        """)
+        with st.expander("Templates Sent 24h - recipients"):
+            if templates_24h_list.empty:
+                st.caption("No users")
+            else:
+                for n in templates_24h_list['name']:
+                    st.caption(f"• {n}")
+    except:
+        st.warning("Could not load Templates 24h list")
     
     st.markdown("---")
     
