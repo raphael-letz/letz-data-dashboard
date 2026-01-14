@@ -410,7 +410,7 @@ tab1, tab2 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive"])
 
 # Tab 1: Quick Insights
 with tab1:
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     
     # Try to get quick stats (all deduplicated by waid)
     try:
@@ -486,6 +486,17 @@ with tab1:
         col5.metric("% Outside 24h", f"{outside_pct}%", f"{outside} users")
     except:
         col5.metric("% Outside 24h", "—")
+    
+    try:
+        templates_24h_df = run_query("""
+            SELECT COUNT(*) as count
+            FROM recovery_logs
+            WHERE sent_at >= NOW() - INTERVAL '24 hours'
+        """)
+        templates_24h = templates_24h_df['count'].iloc[0] if not templates_24h_df.empty else 0
+        col6.metric("Templates Sent 24h", templates_24h)
+    except:
+        col6.metric("Templates Sent 24h", "—")
     
     st.markdown("---")
     
