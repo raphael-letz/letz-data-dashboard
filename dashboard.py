@@ -1280,7 +1280,7 @@ with tab2:
         m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
         m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
         m4.metric("⏱️ Last Active", last_active)
-        m5.metric("💬 Messages (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
+        m5.metric("💬 Messages Sent (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
         m6.metric("Outside 24h", "Yes" if outside_24h_flag else "No")
         
         # Activity plan weekly calendar
