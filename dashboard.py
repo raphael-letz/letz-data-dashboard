@@ -615,33 +615,34 @@ with tab1:
     """)
     
     if not recent_messages.empty:
+        # Helper to check if message payload is a template
+        def is_template(raw_msg):
+            if pd.isna(raw_msg) or raw_msg is None:
+                return False
+            msg_str = str(raw_msg).strip()
+            try:
+                data = json.loads(msg_str)
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except Exception:
+                        pass
+                if isinstance(data, dict):
+                    if 'template' in data:
+                        return True
+                    if data.get('type') == 'template':
+                        return True
+                if isinstance(data, str) and 'template' in data.lower():
+                    return True
+            except Exception:
+                return False
+            return False
+        
         # Process messages to extract readable text from JSON
         def extract_message_text(raw_msg):
             if pd.isna(raw_msg) or raw_msg is None:
                 return ""
             msg_str = str(raw_msg).strip()
-            
-            def is_template(raw_msg):
-                if pd.isna(raw_msg) or raw_msg is None:
-                    return False
-                msg_str = str(raw_msg).strip()
-                try:
-                    data = json.loads(msg_str)
-                    if isinstance(data, str):
-                        try:
-                            data = json.loads(data)
-                        except Exception:
-                            pass
-                    if isinstance(data, dict):
-                        if 'template' in data:
-                            return True
-                        if data.get('type') == 'template':
-                            return True
-                    if isinstance(data, str) and 'template' in data.lower():
-                        return True
-                except Exception:
-                    return False
-                return False
             
             def parse_json(s):
                 try:
