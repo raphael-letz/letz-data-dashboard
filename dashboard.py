@@ -410,14 +410,15 @@ tab1, tab2 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive"])
 
 # Tab 1: Quick Insights
 with tab1:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     # Try to get quick stats (all deduplicated by waid)
     try:
         # User count (unique waids)
-        user_count = run_query("SELECT COUNT(DISTINCT waid) as count FROM users")
-        if not user_count.empty:
-            col1.metric("Total Users", user_count['count'].iloc[0])
+        user_count_df = run_query("SELECT COUNT(DISTINCT waid) as count FROM users")
+        total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
+        if user_count_df is not None and not user_count_df.empty:
+            col1.metric("Total Users", total_users_count)
         else:
             col1.metric("Total Users", "—")
     except:
@@ -465,6 +466,24 @@ with tab1:
             col4.metric("Active Today", "—")
     except:
         col4.metric("Active Today", "—")
+    
+    try:
+        # Users outside the 24h window (no interactions in last 24h using users.updated_at)
+        if 'total_users_count' not in locals():
+            user_count_df = run_query("SELECT COUNT(DISTINCT waid) as count FROM users")
+            total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
+        
+        active_24h_df = run_query("""
+            SELECT COUNT(DISTINCT waid) as count
+            FROM users
+            WHERE updated_at >= NOW() - INTERVAL '24 hours'
+        """)
+        active_24h = active_24h_df['count'].iloc[0] if not active_24h_df.empty else 0
+        outside = max(total_users_count - active_24h, 0)
+        outside_pct = round(100 * outside / total_users_count, 1) if total_users_count > 0 else 0
+        col5.metric("% Outside 24h", f"{outside_pct}%", f"{outside} users")
+    except:
+        col5.metric("% Outside 24h", "—")
     
     st.markdown("---")
     
