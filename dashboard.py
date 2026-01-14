@@ -631,45 +631,6 @@ with tab1:
                 f"{stats_dict.get('settings_updated', 0)} users"
             )
             
-            # Breakdown of completed activities by type
-            st.markdown("#### 🏋️ Activities Completed by Type")
-            activity_breakdown = run_query("""
-                SELECT 
-                    activity_type,
-                    COUNT(*) as completions,
-                    COUNT(DISTINCT user_id) as unique_users
-                FROM user_activities_history
-                WHERE completed_at IS NOT NULL
-                GROUP BY activity_type
-                ORDER BY completions DESC
-            """)
-            
-            if not activity_breakdown.empty:
-                # Display as horizontal metrics
-                acols = st.columns(len(activity_breakdown))
-                for i, (_, row) in enumerate(activity_breakdown.iterrows()):
-                    activity_name = str(row['activity_type']).capitalize() if row['activity_type'] else 'Unknown'
-                    # Choose emoji based on activity type
-                    emoji_map = {
-                        'strength': '💪',
-                        'cardio': '🏃',
-                        'steps': '👟',
-                        'walk': '🚶',
-                        'run': '🏃',
-                        'yoga': '🧘',
-                        'meditation': '🧘',
-                        'sleep': '😴',
-                        'water': '💧',
-                        'nutrition': '🥗',
-                    }
-                    emoji = emoji_map.get(str(row['activity_type']).lower(), '✅')
-                    acols[i].metric(
-                        f"{emoji} {activity_name}",
-                        f"{row['completions']} completions",
-                        f"{row['unique_users']} users"
-                    )
-            else:
-                st.caption("No completed activities yet")
         else:
             st.info("No users found")
     except Exception as e:
@@ -1230,6 +1191,29 @@ with tab2:
         last_activity_name = last_completed_df['activity_type'].iloc[0] if not last_completed_df.empty else "—"
         last_activity_time = format_ts_local(last_completed_df['completed_at'].iloc[0]) if not last_completed_df.empty else "—"
         
+        # 24h active window flag based on last user message
+        last_msg_df = run_query(f"""
+            SELECT sent_at
+            FROM messages
+            WHERE user_id = {user_id} AND sender = 'user' AND sent_at IS NOT NULL
+            ORDER BY sent_at DESC
+            LIMIT 1
+        """)
+        def is_outside_24h(ts):
+            if ts is None or pd.isna(ts):
+                return True
+            try:
+                t = pd.to_datetime(ts)
+                if t.tzinfo is None:
+                    t = t.tz_localize(pytz.UTC)
+                cutoff = pd.Timestamp.utcnow().tz_localize(None) if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow()
+                if cutoff.tzinfo is None:
+                    cutoff = cutoff.tz_localize(pytz.UTC)
+                return t < cutoff - pd.Timedelta(hours=24)
+            except Exception:
+                return True
+        outside_24h_flag = is_outside_24h(last_msg_df['sent_at'].iloc[0]) if not last_msg_df.empty else True
+        
         # Activity plan (schedule) from user_activities
         plan_df = run_query(f"""
             SELECT 
@@ -1291,12 +1275,13 @@ with tab2:
                             next_activity_day = week_full[idx]
         
         # Metrics row
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("⭐ XP Earned", total_xp)
         m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
         m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
         m4.metric("⏱️ Last Active", last_active)
         m5.metric("💬 Messages (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
+        m6.metric("Outside 24h", "Yes" if outside_24h_flag else "No")
         
         # Activity plan weekly calendar
         st.markdown("#### 📅 Activity Plan (weekly)")
@@ -1404,7 +1389,8 @@ with tab2:
             history_df = pd.DataFrame({
                 "Time": messages_df['sent_at'].apply(format_ts_local),
                 "From": messages_df['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
-                "Message": messages_df['message'].apply(extract_msg_text)
+                "Message": messages_df['message'].apply(extract_msg_text),
+                "Template?": messages_df['message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
             })
             st.dataframe(
                 history_df,
