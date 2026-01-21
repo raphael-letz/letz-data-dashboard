@@ -650,7 +650,7 @@ with tab1:
                     event_type,
                     COUNT(DISTINCT user_id) as user_count
                 FROM events
-                WHERE event_type IN ('onboarding_completed', 'update_experience', 'settings_updated')
+                WHERE event_type IN ('onboarding_completed', 'settings_updated')
                 GROUP BY event_type
             """)
             
@@ -660,8 +660,16 @@ with tab1:
                 for _, row in journey_stats.iterrows():
                     stats_dict[row['event_type']] = row['user_count']
             
+            # Get unique users who have added a slogan (from post_onboarding flow)
+            added_slogan_result = run_query("""
+                SELECT COUNT(DISTINCT user_id) as count
+                FROM ai_companion_flows
+                WHERE type = 'post_onboarding'
+                AND content->>'slogan' IS NOT NULL
+            """)
+            added_slogan_count = added_slogan_result['count'].iloc[0] if not added_slogan_result.empty else 0
+            
             # Get unique users who completed an activity (have completed_at timestamp in user_activities_history)
-            # This is also the count for "Earned XP" since completing activity = earning XP
             completed_activities_result = run_query("""
                 SELECT COUNT(DISTINCT user_id) as count
                 FROM user_activities_history
@@ -671,8 +679,8 @@ with tab1:
             
             # Calculate percentages
             onboarding_pct = round(100 * stats_dict.get('onboarding_completed', 0) / total_users, 1)
+            slogan_pct = round(100 * added_slogan_count / total_users, 1)
             activity_pct = round(100 * completed_activities_count / total_users, 1)
-            xp_pct = activity_pct  # Same as completed activity - completing activity = earning XP
             settings_pct = round(100 * stats_dict.get('settings_updated', 0) / total_users, 1)
             
             # Display as metrics
@@ -683,13 +691,13 @@ with tab1:
                 f"{stats_dict.get('onboarding_completed', 0)} users"
             )
             jcol2.metric(
-                "🏃 Completed Activity", 
-                f"{activity_pct}%",
-                f"{completed_activities_count} users"
+                "💬 Added Slogan", 
+                f"{slogan_pct}%",
+                f"{added_slogan_count} users"
             )
             jcol3.metric(
-                "⭐ Earned XP", 
-                f"{xp_pct}%",
+                "🏃 Completed Activity", 
+                f"{activity_pct}%",
                 f"{completed_activities_count} users"
             )
             jcol4.metric(
@@ -801,19 +809,59 @@ with tab1:
     
     # Recent messages section
     st.markdown("### 💬 Recent Messages")
-    recent_messages = run_query("""
-        SELECT 
-            m.sent_at as timestamp,
-            u.full_name as user_name,
-            u.timezone as user_timezone,
-            m.sender,
-            m.message as raw_message
-        FROM messages m
-        LEFT JOIN users u ON m.user_id = u.id
-        WHERE m.sent_at IS NOT NULL
-        ORDER BY m.sent_at DESC
-        LIMIT 10
-    """)
+    
+    # Time range selector
+    time_range = st.selectbox(
+        "Filter by time range:",
+        ["Last 20 messages", "Last 1 hour", "Last 24 hours"],
+        key="recent_messages_range"
+    )
+    
+    # Build query based on selected time range
+    if time_range == "Last 20 messages":
+        query = """
+            SELECT 
+                m.sent_at as timestamp,
+                u.full_name as user_name,
+                u.timezone as user_timezone,
+                m.sender,
+                m.message as raw_message
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+            ORDER BY m.sent_at DESC
+            LIMIT 20
+        """
+    elif time_range == "Last 1 hour":
+        query = """
+            SELECT 
+                m.sent_at as timestamp,
+                u.full_name as user_name,
+                u.timezone as user_timezone,
+                m.sender,
+                m.message as raw_message
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+              AND m.sent_at >= NOW() - INTERVAL '1 hour'
+            ORDER BY m.sent_at DESC
+        """
+    else:  # Last 24 hours
+        query = """
+            SELECT 
+                m.sent_at as timestamp,
+                u.full_name as user_name,
+                u.timezone as user_timezone,
+                m.sender,
+                m.message as raw_message
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+              AND m.sent_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY m.sent_at DESC
+        """
+    
+    recent_messages = run_query(query)
     
     if not recent_messages.empty:
         # Process messages to extract readable text from JSON

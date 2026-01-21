@@ -3,4 +3,5 @@ psycopg2-binary>=2.9.9
 python-dotenv>=1.0.0
 pandas>=2.1.0
 pytz>=2024.1
+altair>=5.0.0
 
