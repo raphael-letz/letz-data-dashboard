@@ -619,19 +619,21 @@ with tab1:
     
     try:
         templates_24h_list = run_query("""
-            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name
+            SELECT 
+                COALESCE(u.full_name, 'Unknown') AS name,
+                COALESCE(r.template_name, 'Unknown') AS template_name
             FROM recovery_logs r
             JOIN users u ON r.user_id = u.id
             WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
-            ORDER BY name
+            ORDER BY name, template_name
             LIMIT 200
         """)
         with st.expander("Templates Sent 24h - recipients"):
             if templates_24h_list.empty:
                 st.caption("No users")
             else:
-                for n in templates_24h_list['name']:
-                    st.caption(f"• {n}")
+                for _, row in templates_24h_list.iterrows():
+                    st.caption(f"• {row['name']} ({row['template_name']})")
     except:
         st.warning("Could not load Templates 24h list")
     
@@ -747,13 +749,32 @@ with tab1:
 
         # Ladder drop-off by step and template
         dropoff_df = run_query("""
+            WITH recovery_sends AS (
+                SELECT 
+                    r.id,
+                    COALESCE(r.ladder_step, 0) AS ladder_step,
+                    COALESCE(r.template_name, 'Unknown') AS template_name,
+                    r.user_id,
+                    r.sent_at
+                FROM recovery_logs r
+            ),
+            conversions AS (
+                SELECT DISTINCT r.id
+                FROM recovery_sends r
+                JOIN messages m ON m.user_id = r.user_id 
+                    AND m.sender = 'user' 
+                    AND m.sent_at > r.sent_at
+            )
             SELECT 
-                COALESCE(ladder_step, 0) AS ladder_step,
-                COALESCE(template_name, 'Unknown') AS template_name,
-                COUNT(*) AS sends
-            FROM recovery_logs
-            GROUP BY ladder_step, template_name
-            ORDER BY ladder_step, sends DESC
+                r.ladder_step,
+                r.template_name,
+                COUNT(*) AS sends,
+                COUNT(c.id) AS conversions,
+                ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
+            FROM recovery_sends r
+            LEFT JOIN conversions c ON r.id = c.id
+            GROUP BY r.ladder_step, r.template_name
+            ORDER BY r.ladder_step, sends DESC
             LIMIT 50
         """)
 
@@ -818,6 +839,7 @@ with tab1:
     )
     
     # Build query based on selected time range
+    # Note: Using CURRENT_TIMESTAMP for timezone-aware comparison
     if time_range == "Last 20 messages":
         query = """
             SELECT 
@@ -862,6 +884,10 @@ with tab1:
         """
     
     recent_messages = run_query(query)
+    
+    # Show message count for debugging
+    if not recent_messages.empty:
+        st.caption(f"Showing {len(recent_messages)} message(s)")
     
     if not recent_messages.empty:
         # Process messages to extract readable text from JSON
@@ -1358,7 +1384,7 @@ with tab2:
     st.caption("Select a user to view messages, activity plan, XP, and engagement")
     
     users_df = run_query("""
-        SELECT * FROM (
+        WITH unique_users AS (
             SELECT DISTINCT ON (waid)
                 id,
                 COALESCE(full_name, 'Unknown') as full_name,
@@ -1367,15 +1393,31 @@ with tab2:
                 created_at
             FROM users
             ORDER BY waid, created_at DESC
-        ) unique_users
-        ORDER BY created_at DESC
+        ),
+        active_users AS (
+            SELECT DISTINCT user_id
+            FROM messages
+            WHERE sender = 'user'
+              AND sent_at >= NOW() - INTERVAL '24 hours'
+              AND user_id IS NOT NULL
+        )
+        SELECT 
+            u.id,
+            u.full_name,
+            u.waid,
+            u.timezone,
+            u.created_at,
+            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
+        FROM unique_users u
+        LEFT JOIN active_users a ON u.id = a.user_id
+        ORDER BY u.full_name ASC
         LIMIT 500
     """)
     
     if users_df.empty:
         st.info("No users found")
     else:
-        users_df['label'] = users_df.apply(lambda r: f"{r['full_name']} ({r['waid']})", axis=1)
+        users_df['label'] = users_df.apply(lambda r: f"{r['full_name']}{' *' if r.get('is_active_24h') else ''} ({r['waid']})", axis=1)
         selected_label = st.selectbox("Select user", users_df['label'])
         selected_row = users_df[users_df['label'] == selected_label].iloc[0]
         user_id = int(selected_row['id'])
