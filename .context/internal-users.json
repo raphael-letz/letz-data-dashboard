@@ -1,0 +1,56 @@
+{
+  "internal_users": [
+    {
+      "waid": "555198161419",
+      "full_name": "Leticia",
+      "coach_name": "Bia",
+      "user_id": 5,
+      "notes": "8 active days, 49 messages (Jan 15–23)"
+    },
+    {
+      "waid": "5511988649591",
+      "full_name": "Andre ",
+      "coach_name": "Bia",
+      "user_id": 7,
+      "notes": "6 active days, 27 messages (Jan 16–23)"
+    },
+    {
+      "waid": "555195455326",
+      "full_name": "Grazi",
+      "coach_name": "Bia",
+      "user_id": 10,
+      "notes": "6 active days, 24 messages (Jan 15–22)"
+    },
+    {
+      "waid": "555397038122",
+      "full_name": "Gabi",
+      "coach_name": "Bia",
+      "user_id": 20,
+      "notes": "Internal user"
+    },
+    {
+      "waid": "5511970544995",
+      "full_name": "Vitor",
+      "coach_name": "Bia",
+      "user_id": 19,
+      "notes": "Internal user"
+    },
+    {
+      "waid": "6593366209",
+      "full_name": "Raphael",
+      "coach_name": "Alex",
+      "user_id": 8,
+      "notes": "Internal user"
+    },
+    {
+      "waid": "555199885544",
+      "full_name": "Maicon",
+      "coach_name": "Bia",
+      "user_id": 23,
+      "notes": "Internal user"
+    }
+  ],
+  "last_updated": "2026-01-23",
+  "notes": "These users should be excluded from analysis queries to get accurate user behavior metrics. Always filter them out using: WHERE u.waid NOT IN (SELECT waid FROM internal_users list)"
+}
+

@@ -210,19 +210,48 @@ def get_table_schema(table_name: str) -> pd.DataFrame:
 
 
 def load_internal_users():
-    """Load internal users from JSON file. Returns list of WAIDs to exclude."""
+    """
+    Load internal users from JSON file. Returns list of WAIDs to exclude.
+
+    Primary source (tracked in this repo):
+        .context/internal-users.json  (next to dashboard.py)
+
+    Legacy fallback (for backwards compatibility):
+        ../.context/internal-users.json
+
+    Fallback:
+        Hardcoded WAID list (to avoid silently disabling the filter if the JSON
+        file is missing or malformed).
+    """
+    fallback_internal_waids = [
+        '555198161419', '5511988649591', '555195455326',
+        '555397038122', '5511970544995', '6593366209', '555199885544'
+    ]
+
     try:
-        internal_users_path = os.path.join(os.path.dirname(__file__), "..", ".context", "internal-users.json")
-        if os.path.exists(internal_users_path):
-            with open(internal_users_path, 'r') as f:
-                internal_users_data = json.load(f)
-                return [user['waid'] for user in internal_users_data.get('internal_users', [])]
-        else:
-            # Fallback to empty list if JSON doesn't exist
-            return []
+        base_dir = os.path.dirname(__file__)
+
+        # 1) Preferred location: .context/internal-users.json inside this repo
+        repo_context_path = os.path.join(base_dir, ".context", "internal-users.json")
+
+        # 2) Legacy location: ../.context/internal-users.json (older setup)
+        legacy_context_path = os.path.join(base_dir, "..", ".context", "internal-users.json")
+
+        for candidate_path in [repo_context_path, legacy_context_path]:
+            if os.path.exists(candidate_path):
+                with open(candidate_path, "r") as f:
+                    internal_users_data = json.load(f)
+                    waids = [user.get("waid") for user in internal_users_data.get("internal_users", [])]
+                    # Filter out any Nones / empty strings
+                    waids = [w for w in waids if w]
+                    if waids:
+                        return waids
+        # If file doesn't exist or is empty, fall back to hardcoded list
+        return fallback_internal_waids
     except Exception:
-        # Fallback to empty list on any error
-        return []
+        # On any error, still fall back to hardcoded list so the filter
+        # continues to work instead of silently doing nothing.
+        return fallback_internal_waids
 
 
 def get_internal_users_filter_sql(exclude_internal: bool = True) -> str:
