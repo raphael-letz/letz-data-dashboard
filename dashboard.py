@@ -475,7 +475,7 @@ with st.sidebar:
 
 
 # Main content tabs
-tab1, tab2 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive"])
+tab1, tab2, tab3 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive", "📈 User Retention"])
 
 
 # Tab 1: Quick Insights
@@ -1740,6 +1740,11 @@ with tab2:
         """)
         
         def extract_msg_text(raw_msg):
+            """Extract the most human-readable text from a message payload.
+            
+            NOTE: this intentionally returns the full text without truncation
+            so the message history shows complete content.
+            """
             if pd.isna(raw_msg) or raw_msg is None:
                 return ""
             msg_str = str(raw_msg).strip()
@@ -1797,17 +1802,47 @@ with tab2:
                 return None
             
             data = parse_json(msg_str)
+            if isinstance(data, dict):
+                for key in ["interactive", "postback", "template"]:
+                    if key in data:
+                        found = find_text(data[key])
+                        if found:
+                            return found
+            
             if data is not None:
                 found = find_text(data)
                 if found:
-                    return found[:200]
+                    return found
             
             if isinstance(data, str) and len(data) > 2:
-                return data[:200]
+                return data
             
+            # Fallback: show payload itself (untrimmed) if it looks like JSON,
+            # otherwise return the original string.
             if msg_str.startswith("{") or msg_str.startswith("["):
-                return msg_str[:200]
-            return msg_str[:200]
+                return msg_str
+            return msg_str
+        
+        # Simple cached English translation helper (same as Recent Messages)
+        if "user_deepdive_translations" not in st.session_state:
+            st.session_state.user_deepdive_translations = {}
+        
+        def translate_to_english(text: str) -> str:
+            if not text:
+                return ""
+            # If translator library is unavailable, just return original text
+            if GoogleTranslator is None:
+                return text
+            cache = st.session_state.user_deepdive_translations
+            if text in cache:
+                return cache[text]
+            try:
+                translated = GoogleTranslator(source="auto", target="en").translate(text)
+                cache[text] = translated
+                return translated
+            except Exception:
+                # If translation fails, just return original text so the table still renders
+                return text
         
         if messages_df.empty:
             st.info("No messages found for this user.")
@@ -1816,14 +1851,595 @@ with tab2:
                 "Time": messages_df['sent_at'].apply(format_ts_local),
                 "From": messages_df['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
                 "Message": messages_df['message'].apply(extract_msg_text),
+                "Message (EN)": messages_df['message'].apply(lambda x: translate_to_english(extract_msg_text(x))),
                 "Template?": messages_df['message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
             })
             st.dataframe(
                 history_df,
                 use_container_width=True,
                 hide_index=True,
-                height=420
+                height=420,
+                column_config={
+                    "Time": st.column_config.TextColumn(width="small"),
+                    "From": st.column_config.TextColumn(width="small"),
+                    "Message": st.column_config.TextColumn(width="large"),
+                    "Message (EN)": st.column_config.TextColumn(width="large"),
+                    "Template?": st.column_config.TextColumn(width="small"),
+                }
             )
+
+
+# Tab 3: User Retention
+with tab3:
+    st.markdown("### 📈 User Retention by Weekly Cohort")
+    st.caption("Track how many users from each weekly cohort remain active over time. Retention is calculated as active users divided by the original cohort size.")
+    st.info("ℹ️ **Note:** This data excludes internal users for accurate user behavior metrics.")
+    
+    # Load internal users from JSON file
+    try:
+        internal_users_path = os.path.join(os.path.dirname(__file__), "..", ".context", "internal-users.json")
+        if os.path.exists(internal_users_path):
+            with open(internal_users_path, 'r') as f:
+                internal_users_data = json.load(f)
+                internal_waids = [user['waid'] for user in internal_users_data.get('internal_users', [])]
+        else:
+            # Fallback to hardcoded list if JSON doesn't exist
+            internal_waids = [
+                '555198161419', '5511988649591', '555195455326',
+                '555397038122', '5511970544995', '6593366209', '555199885544'
+            ]
+    except Exception:
+        # Fallback to hardcoded list on any error
+        internal_waids = [
+            '555198161419', '5511988649591', '555195455326',
+            '555397038122', '5511970544995', '6593366209', '555199885544'
+        ]
+    
+    # Build the retention query
+    internal_waids_str = "', '".join(internal_waids)
+    
+    retention_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+
+product_users AS (
+  SELECT id, full_name, waid
+  FROM users
+  WHERE waid NOT IN (SELECT waid FROM internal_waids)
+),
+
+user_messages AS (
+  SELECT
+    u.id  AS user_id,
+    u.full_name,
+    u.waid,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
+  WHERE m.sender = 'user'
+),
+
+user_first_last AS (
+  SELECT
+    user_id,
+    full_name,
+    waid,
+    MIN(local_date) AS first_active_date,
+    MAX(local_date) AS last_active_date
+  FROM user_messages
+  GROUP BY user_id, full_name, waid
+),
+
+-- 1) Assign each user to a weekly cohort by first-active week (local time)
+user_with_cohort_week AS (
+  SELECT
+    ufl.*,
+    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
+  FROM user_first_last ufl
+),
+
+-- 2) Map each active date to a cohort_day within that user's lifetime
+user_days AS (
+  SELECT
+    um.user_id,
+    uwc.full_name,
+    uwc.waid,
+    uwc.cohort_week_start,
+    um.local_date,
+    uwc.first_active_date,
+    (um.local_date - uwc.first_active_date)       AS day_offset,
+    (um.local_date - uwc.first_active_date) + 1   AS cohort_day
+  FROM user_messages um
+  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
+),
+
+-- 3) Cohort size per week (denominator)
+cohort_sizes AS (
+  SELECT
+    cohort_week_start,
+    COUNT(DISTINCT user_id) AS cohort_size
+  FROM user_with_cohort_week
+  GROUP BY cohort_week_start
+),
+
+-- 4) Numerator: active users per cohort week & cohort day
+users_active_on_day AS (
+  SELECT
+    cohort_week_start,
+    cohort_day,
+    COUNT(DISTINCT user_id) AS active_users,
+    STRING_AGG(DISTINCT full_name, ', ' ORDER BY full_name) AS user_names
+  FROM user_days
+  GROUP BY cohort_week_start, cohort_day
+),
+
+-- 5) Final weekly cohort retention table
+cohort_retention_weekly AS (
+  SELECT
+    ua.cohort_week_start,
+    ua.cohort_day,
+    cs.cohort_size,
+    COALESCE(ua.active_users, 0) AS active_users,
+    ROUND(
+      100.0 * COALESCE(ua.active_users, 0) / cs.cohort_size,
+      1
+    ) AS retention_pct,
+    COALESCE(ua.user_names, '') AS user_names
+  FROM users_active_on_day ua
+  JOIN cohort_sizes cs
+    ON cs.cohort_week_start = ua.cohort_week_start
+)
+
+SELECT
+  cohort_week_start,
+  cohort_day,
+  cohort_size,
+  active_users,
+  retention_pct,
+  user_names
+FROM cohort_retention_weekly
+ORDER BY cohort_week_start, cohort_day
+"""
+    
+    try:
+        retention_df = run_query(retention_query)
+        
+        if retention_df.empty:
+            st.info("No retention data available yet. Users need to send messages to generate cohort data.")
+        else:
+            # Summary metrics
+            total_cohorts = retention_df['cohort_week_start'].nunique()
+            total_users = retention_df.groupby('cohort_week_start')['cohort_size'].first().sum()
+            
+            # Get rolling-window retention data for summary metrics
+            try:
+                rolling_retention_summary_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+product_users AS (
+  SELECT id, full_name, waid
+  FROM users
+  WHERE waid NOT IN (SELECT waid FROM internal_waids)
+),
+user_messages AS (
+  SELECT
+    u.id  AS user_id,
+    u.full_name,
+    u.waid,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
+  WHERE m.sender = 'user'
+),
+user_first_last AS (
+  SELECT
+    user_id,
+    full_name,
+    waid,
+    MIN(local_date) AS first_active_date,
+    MAX(local_date) AS last_active_date
+  FROM user_messages
+  GROUP BY user_id, full_name, waid
+),
+user_with_cohort_week AS (
+  SELECT
+    ufl.*,
+    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
+  FROM user_first_last ufl
+),
+user_days AS (
+  SELECT
+    um.user_id,
+    uwc.full_name,
+    uwc.waid,
+    uwc.cohort_week_start,
+    um.local_date,
+    uwc.first_active_date,
+    (um.local_date - uwc.first_active_date) AS cohort_day
+  FROM user_messages um
+  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
+),
+user_activity_by_day AS (
+  SELECT
+    user_id,
+    cohort_week_start,
+    MAX(CASE WHEN cohort_day <= 7 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_7
+  FROM user_days
+  GROUP BY user_id, cohort_week_start
+),
+cohort_sizes AS (
+  SELECT
+    cohort_week_start,
+    COUNT(DISTINCT user_id) AS cohort_size
+  FROM user_with_cohort_week
+  GROUP BY cohort_week_start
+),
+rolling_retention_summary AS (
+  SELECT
+    uwc.cohort_week_start,
+    uwc.user_id,
+    COALESCE(uabd.active_day1_to_7, 0) AS active_within_7d
+  FROM user_with_cohort_week uwc
+  LEFT JOIN user_activity_by_day uabd ON uabd.user_id = uwc.user_id AND uabd.cohort_week_start = uwc.cohort_week_start
+),
+cohort_7d_retention AS (
+  SELECT
+    rrs.cohort_week_start,
+    cs.cohort_size,
+    CASE 
+      WHEN (CURRENT_DATE - rrs.cohort_week_start) >= 7 
+      THEN ROUND(100.0 * SUM(rrs.active_within_7d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_7d
+  FROM rolling_retention_summary rrs
+  JOIN cohort_sizes cs ON cs.cohort_week_start = rrs.cohort_week_start
+  GROUP BY rrs.cohort_week_start, cs.cohort_size
+)
+SELECT AVG(retention_7d) AS avg_7d_retention
+FROM cohort_7d_retention
+WHERE retention_7d IS NOT NULL
+"""
+                avg_7d_result = run_query(rolling_retention_summary_query)
+                avg_7d_retention = avg_7d_result['avg_7d_retention'].iloc[0] if not avg_7d_result.empty and not pd.isna(avg_7d_result['avg_7d_retention'].iloc[0]) else None
+            except Exception:
+                avg_7d_retention = None
+            
+            # Get avg and median days active for top section
+            try:
+                days_active_summary_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+product_users AS (
+  SELECT id, full_name, waid
+  FROM users
+  WHERE waid NOT IN (SELECT waid FROM internal_waids)
+),
+user_messages AS (
+  SELECT
+    u.id  AS user_id,
+    u.full_name,
+    u.waid,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
+  WHERE m.sender = 'user'
+),
+user_first_last AS (
+  SELECT
+    user_id,
+    full_name,
+    waid,
+    MIN(local_date) AS first_active_date,
+    MAX(local_date) AS last_active_date
+  FROM user_messages
+  GROUP BY user_id, full_name, waid
+),
+user_with_cohort_week AS (
+  SELECT
+    ufl.*,
+    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
+  FROM user_first_last ufl
+),
+user_days AS (
+  SELECT
+    um.user_id,
+    uwc.cohort_week_start,
+    um.local_date,
+    (um.local_date - uwc.first_active_date) AS cohort_day
+  FROM user_messages um
+  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
+),
+user_days_active AS (
+  SELECT
+    user_id,
+    cohort_week_start,
+    COUNT(DISTINCT local_date) FILTER (WHERE cohort_day <= 13) AS days_active_week2
+  FROM user_days
+  GROUP BY user_id, cohort_week_start
+)
+SELECT
+  ROUND(AVG(days_active_week2), 1) AS avg_days_active,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_active_week2) AS median_days_active
+FROM user_days_active
+"""
+                days_active_summary = run_query(days_active_summary_query)
+                avg_days_active_summary = days_active_summary['avg_days_active'].iloc[0] if not days_active_summary.empty else None
+                median_days_active_summary = days_active_summary['median_days_active'].iloc[0] if not days_active_summary.empty else None
+            except Exception:
+                avg_days_active_summary = None
+                median_days_active_summary = None
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Total Cohort Weeks", total_cohorts)
+            col2.metric("Total Users (All Cohorts)", total_users)
+            col3.metric("Avg 7d Retention", f"{avg_7d_retention:.1f}%" if avg_7d_retention is not None and not pd.isna(avg_7d_retention) else "N/A")
+            col4.metric("Avg Days Active", f"{avg_days_active_summary:.1f}" if avg_days_active_summary is not None and not pd.isna(avg_days_active_summary) else "N/A")
+            col5.metric("Median Days Active", f"{median_days_active_summary:.1f}" if median_days_active_summary is not None and not pd.isna(median_days_active_summary) else "N/A")
+            
+            st.markdown("---")
+            
+            # Retention curves
+            st.markdown("#### 📉 Retention Curves by Cohort")
+            st.caption("Each line shows the retention curve for a weekly cohort: retention % (y-axis) over days since first active (x-axis).")
+
+            # Build data for retention curves (one line per cohort)
+            import altair as alt
+            
+            curves_data = retention_df.copy()
+            curves_data['cohort_week_start_str'] = curves_data['cohort_week_start'].astype(str)
+
+            # Limit to first 50 days for readability
+            curves_data_filtered = curves_data[curves_data['cohort_day'] <= 50].copy()
+
+            if not curves_data_filtered.empty:
+                curves_chart = alt.Chart(curves_data_filtered).mark_line(point=True).encode(
+                    x=alt.X('cohort_day:Q', title='Days Since First Active'),
+                    y=alt.Y('retention_pct:Q', title='Retention %'),
+                    color=alt.Color('cohort_week_start_str:N', title='Cohort Week'),
+                    tooltip=[
+                        alt.Tooltip('cohort_week_start_str:N', title='Cohort Week'),
+                        alt.Tooltip('cohort_day:Q', title='Day'),
+                        alt.Tooltip('retention_pct:Q', title='Retention %', format='.1f'),
+                        alt.Tooltip('active_users:Q', title='Active Users'),
+                        alt.Tooltip('cohort_size:Q', title='Cohort Size'),
+                    ]
+                ).properties(
+                    height=300
+                )
+
+                st.altair_chart(curves_chart, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # Rolling-window retention metrics section
+            st.markdown("#### 📊 Rolling-Window Retention Metrics")
+            st.caption("Retention measured as % of users with at least one interaction within the specified time window. Better suited for products with irregular usage patterns.")
+            
+            # Query for rolling-window retention metrics
+            rolling_retention_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+
+product_users AS (
+  SELECT id, full_name, waid
+  FROM users
+  WHERE waid NOT IN (SELECT waid FROM internal_waids)
+),
+
+user_messages AS (
+  SELECT
+    u.id  AS user_id,
+    u.full_name,
+    u.waid,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
+  WHERE m.sender = 'user'
+),
+
+user_first_last AS (
+  SELECT
+    user_id,
+    full_name,
+    waid,
+    MIN(local_date) AS first_active_date,
+    MAX(local_date) AS last_active_date
+  FROM user_messages
+  GROUP BY user_id, full_name, waid
+),
+
+user_with_cohort_week AS (
+  SELECT
+    ufl.*,
+    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
+  FROM user_first_last ufl
+),
+
+user_days AS (
+  SELECT
+    um.user_id,
+    uwc.full_name,
+    uwc.waid,
+    uwc.cohort_week_start,
+    um.local_date,
+    uwc.first_active_date,
+    (um.local_date - uwc.first_active_date) AS cohort_day
+  FROM user_messages um
+  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
+),
+
+cohort_sizes AS (
+  SELECT
+    cohort_week_start,
+    COUNT(DISTINCT user_id) AS cohort_size
+  FROM user_with_cohort_week
+  GROUP BY cohort_week_start
+),
+
+-- Rolling window retention: users active within X days
+-- Day 0 = first day (everyone is active), Day 1 = day after, etc.
+-- "Within 1 day" = active on Day 1 (the day after first day)
+-- "Within 2 days" = active on Day 1 OR Day 2
+-- "Within 7 days" = active on Day 1, 2, 3, 4, 5, 6, or 7
+user_activity_by_day AS (
+  SELECT
+    user_id,
+    cohort_week_start,
+    MAX(CASE WHEN cohort_day = 1 THEN 1 ELSE 0 END) AS active_day1,
+    MAX(CASE WHEN cohort_day <= 2 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_or_2,
+    MAX(CASE WHEN cohort_day <= 3 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_3,
+    MAX(CASE WHEN cohort_day <= 7 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_7,
+    MAX(CASE WHEN cohort_day <= 14 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_14
+  FROM user_days
+  GROUP BY user_id, cohort_week_start
+),
+
+rolling_retention AS (
+  SELECT
+    uwc.cohort_week_start,
+    uwc.user_id,
+    uwc.first_active_date,
+    -- Check if user was active within the window (after Day 0)
+    COALESCE(uabd.active_day1, 0) AS active_within_1d,
+    COALESCE(uabd.active_day1_or_2, 0) AS active_within_2d,
+    COALESCE(uabd.active_day1_to_3, 0) AS active_within_3d,
+    COALESCE(uabd.active_day1_to_7, 0) AS active_within_7d,
+    COALESCE(uabd.active_day1_to_14, 0) AS active_within_14d,
+    -- Days active in first week (days 0-6, which is 7 days total)
+    COUNT(DISTINCT ud.local_date) FILTER (WHERE ud.cohort_day <= 6) AS days_active_week1,
+    -- Days active in first 2 weeks (days 0-13, which is 14 days total)
+    COUNT(DISTINCT ud.local_date) FILTER (WHERE ud.cohort_day <= 13) AS days_active_week2,
+    -- Count interactions in first week (days 0-6)
+    COUNT(*) FILTER (WHERE ud.cohort_day <= 6) AS interactions_week1
+  FROM user_with_cohort_week uwc
+  LEFT JOIN user_days ud ON ud.user_id = uwc.user_id
+  LEFT JOIN user_activity_by_day uabd ON uabd.user_id = uwc.user_id AND uabd.cohort_week_start = uwc.cohort_week_start
+  GROUP BY uwc.cohort_week_start, uwc.user_id, uwc.first_active_date, uabd.active_day1, uabd.active_day1_or_2, uabd.active_day1_to_3, uabd.active_day1_to_7, uabd.active_day1_to_14
+),
+
+cohort_rolling_metrics AS (
+  SELECT
+    rr.cohort_week_start,
+    cs.cohort_size,
+    -- Calculate days since cohort week started (cohort_week_start is Monday of that week)
+    (CURRENT_DATE - rr.cohort_week_start) AS days_since_cohort_start,
+    -- Rolling window retention percentages (active_within_Xd is 1 if active, 0 if not)
+    -- Set to NULL if cohort hasn't reached that age yet
+    -- For 1d retention, need at least 1 day since cohort start (to measure Day 1)
+    CASE 
+      WHEN (CURRENT_DATE - rr.cohort_week_start) >= 1 
+      THEN ROUND(100.0 * SUM(rr.active_within_1d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_1d,
+    CASE 
+      WHEN (CURRENT_DATE - rr.cohort_week_start) >= 2 
+      THEN ROUND(100.0 * SUM(rr.active_within_2d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_2d,
+    CASE 
+      WHEN (CURRENT_DATE - rr.cohort_week_start) >= 3 
+      THEN ROUND(100.0 * SUM(rr.active_within_3d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_3d,
+    CASE 
+      WHEN (CURRENT_DATE - rr.cohort_week_start) >= 7 
+      THEN ROUND(100.0 * SUM(rr.active_within_7d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_7d,
+    CASE 
+      WHEN (CURRENT_DATE - rr.cohort_week_start) >= 14 
+      THEN ROUND(100.0 * SUM(rr.active_within_14d) / cs.cohort_size, 1) 
+      ELSE NULL 
+    END AS retention_14d,
+    -- Blended average days active (across all days 0-13, which covers first 2 weeks)
+    ROUND(AVG(rr.days_active_week2), 1) AS avg_days_active,
+    -- Median days active per cohort (blended across all days)
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rr.days_active_week2) AS median_days_active,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE rr.interactions_week1 >= 2) / cs.cohort_size, 1) AS pct_2plus_interactions_week1
+  FROM rolling_retention rr
+  JOIN cohort_sizes cs ON cs.cohort_week_start = rr.cohort_week_start
+  GROUP BY rr.cohort_week_start, cs.cohort_size
+)
+
+SELECT
+  cohort_week_start,
+  cohort_size,
+  retention_1d,
+  retention_2d,
+  retention_3d,
+  retention_7d,
+  retention_14d,
+  avg_days_active,
+  median_days_active,
+  pct_2plus_interactions_week1
+FROM cohort_rolling_metrics
+ORDER BY cohort_week_start DESC
+"""
+            
+            try:
+                rolling_retention_df = run_query(rolling_retention_query)
+                
+                if not rolling_retention_df.empty:
+                    # Display metrics in a table format
+                    display_rolling_df = rolling_retention_df.copy()
+                    display_rolling_df['cohort_week_start'] = pd.to_datetime(display_rolling_df['cohort_week_start']).dt.strftime('%Y-%m-%d')
+                    display_rolling_df = display_rolling_df.rename(columns={
+                        'cohort_week_start': 'Cohort Week',
+                        'cohort_size': 'Cohort Size',
+                        'retention_1d': '1d Retention',
+                        'retention_2d': '2d Retention',
+                        'retention_3d': '3d Retention',
+                        'retention_7d': '7d Retention',
+                        'retention_14d': '14d Retention',
+                        'avg_days_active': 'Avg Days Active',
+                        'median_days_active': 'Median Days Active',
+                        'pct_2plus_interactions_week1': '% with 2+ Interactions (Week 1)'
+                    })
+                    
+                    # Replace NaN with "N/A" for retention columns
+                    retention_cols = ['1d Retention', '2d Retention', '3d Retention', '7d Retention', '14d Retention']
+                    for col in retention_cols:
+                        if col in display_rolling_df.columns:
+                            display_rolling_df[col] = display_rolling_df[col].apply(lambda x: 'N/A' if pd.isna(x) else f"{x:.1f}%")
+                    
+                    st.dataframe(
+                        display_rolling_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Cohort Week": st.column_config.TextColumn(width="small"),
+                            "Cohort Size": st.column_config.NumberColumn(width="small", format="%d"),
+                            "1d Retention": st.column_config.TextColumn(width="small"),
+                            "2d Retention": st.column_config.TextColumn(width="small"),
+                            "3d Retention": st.column_config.TextColumn(width="small"),
+                            "7d Retention": st.column_config.TextColumn(width="small"),
+                            "14d Retention": st.column_config.TextColumn(width="small"),
+                            "Avg Days Active": st.column_config.NumberColumn(width="small", format="%.1f"),
+                            "Median Days Active": st.column_config.NumberColumn(width="small", format="%.1f"),
+                            "% with 2+ Interactions (Week 1)": st.column_config.NumberColumn(width="small", format="%.1f"),
+                        }
+                    )
+                    
+                    # Download button
+                    csv_rolling = display_rolling_df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Rolling-Window Metrics (CSV)",
+                        csv_rolling,
+                        "rolling_retention_metrics.csv",
+                        "text/csv"
+                    )
+                else:
+                    st.info("No rolling-window retention data available yet.")
+            except Exception as e:
+                st.warning(f"Could not load rolling-window retention metrics: {e}")
+            
+    except Exception as e:
+        st.error(f"Error loading retention data: {e}")
+        st.exception(e)
 
 
 # Footer
