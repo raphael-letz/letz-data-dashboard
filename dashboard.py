@@ -30,8 +30,37 @@ st.set_page_config(
 )
 
 # Simple password protection (per-session)
-AUTH_USERNAME = "admin"
-AUTH_PASSWORD = "letzdoit2026!"
+# Read from Streamlit secrets (production) or .env file (local development)
+# NEVER hardcode credentials in the code - they must be set via secrets or .env!
+try:
+    # Try Streamlit secrets first (for cloud deployment)
+    if hasattr(st, 'secrets') and 'AUTH_USERNAME' in st.secrets:
+        AUTH_USERNAME = st.secrets["AUTH_USERNAME"]
+        AUTH_PASSWORD = st.secrets["AUTH_PASSWORD"]
+    else:
+        # Fall back to .env file (for local development)
+        AUTH_USERNAME = os.getenv("AUTH_USERNAME")
+        AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
+except Exception:
+    # Final fallback to .env
+    AUTH_USERNAME = os.getenv("AUTH_USERNAME")
+    AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
+
+# Security check: credentials must be set
+if not AUTH_USERNAME or not AUTH_PASSWORD:
+    st.error("""
+    **Configuration Error**: Authentication credentials are not set.
+    
+    Please configure credentials in one of the following ways:
+    
+    **For Streamlit Cloud:**
+    - Go to Settings → Secrets
+    - Add: `AUTH_USERNAME` and `AUTH_PASSWORD`
+    
+    **For Local Development:**
+    - Add `AUTH_USERNAME` and `AUTH_PASSWORD` to your `.env` file
+    """)
+    st.stop()
 
 if "auth" not in st.session_state:
     st.session_state.auth = {"logged_in": False}
