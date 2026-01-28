@@ -209,6 +209,67 @@ def get_table_schema(table_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_internal_users():
+    """Load internal users from JSON file. Returns list of WAIDs to exclude."""
+    try:
+        internal_users_path = os.path.join(os.path.dirname(__file__), "..", ".context", "internal-users.json")
+        if os.path.exists(internal_users_path):
+            with open(internal_users_path, 'r') as f:
+                internal_users_data = json.load(f)
+                return [user['waid'] for user in internal_users_data.get('internal_users', [])]
+        else:
+            # Fallback to empty list if JSON doesn't exist
+            return []
+    except Exception:
+        # Fallback to empty list on any error
+        return []
+
+
+def get_internal_users_filter_sql(exclude_internal: bool = True) -> str:
+    """Generate SQL filter clause to exclude internal users.
+    
+    Args:
+        exclude_internal: If True, returns WHERE clause to exclude internal users.
+                         If False, returns empty string (no filter).
+    
+    Returns:
+        SQL WHERE clause string (e.g., "WHERE waid NOT IN (...)")
+    """
+    if not exclude_internal:
+        return ""
+    
+    internal_waids = load_internal_users()
+    if not internal_waids:
+        return ""
+    
+    # Format as SQL array
+    internal_waids_str = "', '".join(internal_waids)
+    return f"WHERE waid NOT IN ('{internal_waids_str}')"
+
+
+def get_internal_users_filter_join_sql(exclude_internal: bool = True, table_alias: str = "u") -> str:
+    """Generate SQL JOIN/WHERE clause to exclude internal users when joining with users table.
+    
+    Args:
+        exclude_internal: If True, returns clause to exclude internal users.
+                         If False, returns empty string (no filter).
+        table_alias: The alias used for the users table (default: "u")
+    
+    Returns:
+        SQL WHERE clause string (e.g., "AND u.waid NOT IN (...)")
+    """
+    if not exclude_internal:
+        return ""
+    
+    internal_waids = load_internal_users()
+    if not internal_waids:
+        return ""
+    
+    # Format as SQL array
+    internal_waids_str = "', '".join(internal_waids)
+    return f"AND {table_alias}.waid NOT IN ('{internal_waids_str}')"
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -509,12 +570,35 @@ tab1, tab2, tab3 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive", "📈 
 
 # Tab 1: Quick Insights
 with tab1:
+    # Internal users filter toggle (subtle, compact design)
+    filter_col1, filter_col2 = st.columns([1, 11])
+    with filter_col1:
+        exclude_internal = st.toggle(
+            "🔒",
+            value=True,
+            help="Exclude internal users (coaches, test accounts) from all metrics. Internal users are loaded from analysis/.context/internal-users.json",
+            label_visibility="collapsed"
+        )
+    with filter_col2:
+        internal_users_list = load_internal_users()
+        if exclude_internal:
+            if internal_users_list:
+                st.caption(f"Excluding {len(internal_users_list)} internal users")
+            else:
+                st.caption("Filter active (no internal users file found)")
+        else:
+            st.caption("Showing all users (including internal)")
+    
+    st.markdown("---")
+    
     col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     
     # Try to get quick stats (all deduplicated by waid)
     try:
         # User count (unique waids)
-        user_count_df = run_query("SELECT COUNT(DISTINCT waid) as count FROM users")
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        user_count_query = f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users"
+        user_count_df = run_query(user_count_query)
         total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
         if user_count_df is not None and not user_count_df.empty:
             col1.metric("Total Users", total_users_count)
@@ -525,9 +609,11 @@ with tab1:
     
     try:
         # Today's users (unique waids)
-        today_users = run_query("""
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        where_clause = "WHERE created_at >= CURRENT_DATE" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE"
+        today_users = run_query(f"""
             SELECT COUNT(DISTINCT waid) as count FROM users 
-            WHERE created_at >= CURRENT_DATE
+            {where_clause}
         """)
         if not today_users.empty:
             col2.metric("New Today", today_users['count'].iloc[0])
@@ -538,9 +624,11 @@ with tab1:
     
     try:
         # This week's users (unique waids)
-        week_users = run_query("""
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        where_clause = "WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE - INTERVAL '7 days'"
+        week_users = run_query(f"""
             SELECT COUNT(DISTINCT waid) as count FROM users 
-            WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+            {where_clause}
         """)
         if not week_users.empty:
             col3.metric("New This Week", week_users['count'].iloc[0])
@@ -551,13 +639,15 @@ with tab1:
     
     try:
         # Active today (unique waids who SENT a message today)
-        active_today = run_query("""
+        internal_filter = get_internal_users_filter_join_sql(exclude_internal, "u")
+        active_today = run_query(f"""
             SELECT COUNT(DISTINCT u.waid) as count 
             FROM messages m
             JOIN users u ON m.user_id = u.id
             WHERE m.sent_at >= CURRENT_DATE 
               AND m.user_id IS NOT NULL
               AND m.sender = 'user'
+              {internal_filter}
         """)
         if not active_today.empty:
             col4.metric("Active Today", active_today['count'].iloc[0])
@@ -569,15 +659,19 @@ with tab1:
     try:
         # Users outside the 24h window based on last user message (sender='user')
         if 'total_users_count' not in locals():
-            user_count_df = run_query("SELECT COUNT(DISTINCT waid) as count FROM users")
+            internal_filter = get_internal_users_filter_sql(exclude_internal)
+            user_count_query = f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users"
+            user_count_df = run_query(user_count_query)
             total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
         
-        active_24h_df = run_query("""
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        active_24h_df = run_query(f"""
             SELECT COUNT(DISTINCT u.waid) as count
             FROM messages m
             JOIN users u ON m.user_id = u.id
             WHERE m.sender = 'user'
               AND m.sent_at >= NOW() - INTERVAL '24 hours'
+              {internal_filter_join}
         """)
         active_24h = active_24h_df['count'].iloc[0] if not active_24h_df.empty else 0
         outside = max(total_users_count - active_24h, 0)
@@ -587,23 +681,45 @@ with tab1:
         col5.metric("% Outside 24h", "—")
     
     try:
-        templates_24h_df = run_query("""
-            SELECT COUNT(*) as count
-            FROM recovery_logs
-            WHERE sent_at >= NOW() - INTERVAL '24 hours'
-        """)
+        # Templates Sent 24h - filter by internal users
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            templates_24h_df = run_query(f"""
+                SELECT COUNT(*) as count
+                FROM recovery_logs r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
+                  {internal_filter_join}
+            """)
+        else:
+            templates_24h_df = run_query("""
+                SELECT COUNT(*) as count
+                FROM recovery_logs
+                WHERE sent_at >= NOW() - INTERVAL '24 hours'
+            """)
         templates_24h = templates_24h_df['count'].iloc[0] if not templates_24h_df.empty else 0
         col6.metric("Templates Sent 24h", templates_24h)
     except:
         col6.metric("Templates Sent 24h", "—")
     
     try:
+        # Users with Activities Scheduled Today - filter by internal users
         today_day = datetime.utcnow().strftime("%A")
-        activity_today_df = run_query(f"""
-            SELECT COUNT(DISTINCT user_id) as count
-            FROM user_activities
-            WHERE days::jsonb ? '{today_day}'
-        """)
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            activity_today_df = run_query(f"""
+                SELECT COUNT(DISTINCT ua.user_id) as count
+                FROM user_activities ua
+                JOIN users u ON ua.user_id = u.id
+                WHERE ua.days::jsonb ? '{today_day}'
+                  {internal_filter_join}
+            """)
+        else:
+            activity_today_df = run_query(f"""
+                SELECT COUNT(DISTINCT user_id) as count
+                FROM user_activities
+                WHERE days::jsonb ? '{today_day}'
+            """)
         activity_today = activity_today_df['count'].iloc[0] if not activity_today_df.empty else 0
         col7.metric("Users with Activities Scheduled Today", activity_today, today_day)
     except:
@@ -611,12 +727,14 @@ with tab1:
     
     # Expandable simple lists for key metrics
     try:
-        new_today_list = run_query("""
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        where_clause = "WHERE created_at >= CURRENT_DATE" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE"
+        new_today_list = run_query(f"""
             SELECT COALESCE(full_name, 'Unknown') AS name
             FROM (
                 SELECT DISTINCT ON (waid) full_name, created_at
                 FROM users
-                WHERE created_at >= CURRENT_DATE
+                {where_clause}
                 ORDER BY waid, created_at DESC
             ) unique_users
             ORDER BY created_at DESC
@@ -632,13 +750,15 @@ with tab1:
         st.warning("Could not load New Today list")
     
     try:
-        active_today_list = run_query("""
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        active_today_list = run_query(f"""
             SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name
             FROM messages m
             JOIN users u ON m.user_id = u.id
             WHERE m.sent_at >= CURRENT_DATE 
               AND m.user_id IS NOT NULL
               AND m.sender = 'user'
+              {internal_filter_join}
             ORDER BY name
             LIMIT 200
         """)
@@ -652,13 +772,15 @@ with tab1:
         st.warning("Could not load Active Today list")
     
     try:
-        templates_24h_list = run_query("""
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        templates_24h_list = run_query(f"""
             SELECT 
                 COALESCE(u.full_name, 'Unknown') AS name,
                 COALESCE(r.template_name, 'Unknown') AS template_name
             FROM recovery_logs r
             JOIN users u ON r.user_id = u.id
             WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
+              {internal_filter_join}
             ORDER BY name, template_name
             LIMIT 200
         """)
@@ -676,19 +798,34 @@ with tab1:
     
     try:
         # Get total unique users count (deduplicated by waid)
-        total_users_result = run_query("SELECT COUNT(DISTINCT waid) as total FROM users")
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        total_users_query = f"SELECT COUNT(DISTINCT waid) as total FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as total FROM users"
+        total_users_result = run_query(total_users_query)
         total_users = total_users_result['total'].iloc[0] if not total_users_result.empty else 0
         
         if total_users > 0:
             # Get counts for each journey milestone from events table (unique users per event_type)
-            journey_stats = run_query("""
-                SELECT 
-                    event_type,
-                    COUNT(DISTINCT user_id) as user_count
-                FROM events
-                WHERE event_type IN ('onboarding_completed', 'settings_updated')
-                GROUP BY event_type
-            """)
+            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            if exclude_internal and internal_filter_join:
+                journey_stats = run_query(f"""
+                    SELECT 
+                        e.event_type,
+                        COUNT(DISTINCT e.user_id) as user_count
+                    FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type IN ('onboarding_completed', 'settings_updated')
+                      {internal_filter_join}
+                    GROUP BY e.event_type
+                """)
+            else:
+                journey_stats = run_query("""
+                    SELECT 
+                        event_type,
+                        COUNT(DISTINCT user_id) as user_count
+                    FROM events
+                    WHERE event_type IN ('onboarding_completed', 'settings_updated')
+                    GROUP BY event_type
+                """)
             
             # Convert to dict for easy lookup
             stats_dict = {}
@@ -697,40 +834,85 @@ with tab1:
                     stats_dict[row['event_type']] = row['user_count']
             
             # Get unique users who have added a slogan (from post_onboarding flow)
-            added_slogan_result = run_query("""
-                SELECT COUNT(DISTINCT user_id) as count
-                FROM ai_companion_flows
-                WHERE type = 'post_onboarding'
-                  AND content->>'slogan' IS NOT NULL
-            """)
+            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            if exclude_internal and internal_filter_join:
+                added_slogan_result = run_query(f"""
+                    SELECT COUNT(DISTINCT acf.user_id) as count
+                    FROM ai_companion_flows acf
+                    JOIN users u ON acf.user_id = u.id
+                    WHERE acf.type = 'post_onboarding'
+                      AND acf.content->>'slogan' IS NOT NULL
+                      {internal_filter_join}
+                """)
+            else:
+                added_slogan_result = run_query("""
+                    SELECT COUNT(DISTINCT user_id) as count
+                    FROM ai_companion_flows
+                    WHERE type = 'post_onboarding'
+                      AND content->>'slogan' IS NOT NULL
+                """)
             added_slogan_count = added_slogan_result['count'].iloc[0] if not added_slogan_result.empty else 0
             
             # Get unique users who completed at least one activity
-            completed_activities_result = run_query("""
-                SELECT COUNT(DISTINCT user_id) as count
-                FROM user_activities_history
-                WHERE completed_at IS NOT NULL
-            """)
+            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            if exclude_internal and internal_filter_join:
+                completed_activities_result = run_query(f"""
+                    SELECT COUNT(DISTINCT uah.user_id) as count
+                    FROM user_activities_history uah
+                    JOIN users u ON uah.user_id = u.id
+                    WHERE uah.completed_at IS NOT NULL
+                      {internal_filter_join}
+                """)
+            else:
+                completed_activities_result = run_query("""
+                    SELECT COUNT(DISTINCT user_id) as count
+                    FROM user_activities_history
+                    WHERE completed_at IS NOT NULL
+                """)
             completed_activities_count = completed_activities_result['count'].iloc[0] if not completed_activities_result.empty else 0
 
             # Get unique users who have sent at least one audio message
-            audio_users_result = run_query("""
-                SELECT COUNT(DISTINCT user_id) as count
-                FROM messages
-                WHERE sender = 'user'
-                  AND user_id IS NOT NULL
-                  AND type = 'audio'
-            """)
+            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            if exclude_internal and internal_filter_join:
+                audio_users_result = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as count
+                    FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user'
+                      AND m.user_id IS NOT NULL
+                      AND m.type = 'audio'
+                      {internal_filter_join}
+                """)
+            else:
+                audio_users_result = run_query("""
+                    SELECT COUNT(DISTINCT user_id) as count
+                    FROM messages
+                    WHERE sender = 'user'
+                      AND user_id IS NOT NULL
+                      AND type = 'audio'
+                """)
             audio_users_count = audio_users_result['count'].iloc[0] if not audio_users_result.empty else 0
 
             # Get unique users who have sent at least one picture/image message
-            image_users_result = run_query("""
-                SELECT COUNT(DISTINCT user_id) as count
-                FROM messages
-                WHERE sender = 'user'
-                  AND user_id IS NOT NULL
-                  AND type IN ('image', 'photo')
-            """)
+            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            if exclude_internal and internal_filter_join:
+                image_users_result = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as count
+                    FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user'
+                      AND m.user_id IS NOT NULL
+                      AND m.type IN ('image', 'photo')
+                      {internal_filter_join}
+                """)
+            else:
+                image_users_result = run_query("""
+                    SELECT COUNT(DISTINCT user_id) as count
+                    FROM messages
+                    WHERE sender = 'user'
+                      AND user_id IS NOT NULL
+                      AND type IN ('image', 'photo')
+                """)
             image_users_count = image_users_result['count'].iloc[0] if not image_users_result.empty else 0
             
             # Calculate percentages
@@ -782,31 +964,66 @@ with tab1:
     st.markdown("### 🪜 Recovery Ladder")
     try:
         # Conversion rates 24h / 72h
-        conversion_df = run_query("""
-            WITH sent AS (
-                SELECT DISTINCT user_id FROM recovery_logs
-            ),
-            conv24 AS (
-                SELECT DISTINCT r.user_id
-                FROM recovery_logs r
-                JOIN messages m ON m.user_id = r.user_id
-                WHERE m.sender = 'user'
-                  AND m.sent_at > r.sent_at
-                  AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-            ),
-            conv72 AS (
-                SELECT DISTINCT r.user_id
-                FROM recovery_logs r
-                JOIN messages m ON m.user_id = r.user_id
-                WHERE m.sender = 'user'
-                  AND m.sent_at > r.sent_at
-                  AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-            )
-            SELECT 
-                (SELECT COUNT(*) FROM sent) AS total_users,
-                (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                (SELECT COUNT(*) FROM conv72) AS conv72_users
-        """)
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            conversion_df = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id 
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE 1=1 {internal_filter_join}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE m.sender = 'user'
+                      AND m.sent_at > r.sent_at
+                      AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                      {internal_filter_join}
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE m.sender = 'user'
+                      AND m.sent_at > r.sent_at
+                      AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                      {internal_filter_join}
+                )
+                SELECT 
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+        else:
+            conversion_df = run_query("""
+                WITH sent AS (
+                    SELECT DISTINCT user_id FROM recovery_logs
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE m.sender = 'user'
+                      AND m.sent_at > r.sent_at
+                      AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE m.sender = 'user'
+                      AND m.sent_at > r.sent_at
+                      AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                )
+                SELECT 
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
         total_sent_users = conversion_df['total_users'].iloc[0] if not conversion_df.empty else 0
         conv24_users = conversion_df['conv24_users'].iloc[0] if not conversion_df.empty else 0
         conv72_users = conversion_df['conv72_users'].iloc[0] if not conversion_df.empty else 0
@@ -814,67 +1031,137 @@ with tab1:
         conv72_pct = round(100 * conv72_users / total_sent_users, 1) if total_sent_users else 0
 
         # Ladder drop-off by step and template
-        dropoff_df = run_query("""
-            WITH recovery_sends AS (
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            dropoff_df = run_query(f"""
+                WITH recovery_sends AS (
+                    SELECT 
+                        r.id,
+                        COALESCE(r.ladder_step, 0) AS ladder_step,
+                        COALESCE(r.template_name, 'Unknown') AS template_name,
+                        r.user_id,
+                        r.sent_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE 1=1 {internal_filter_join}
+                ),
+                conversions AS (
+                    SELECT DISTINCT r.id
+                    FROM recovery_sends r
+                    JOIN messages m ON m.user_id = r.user_id 
+                        AND m.sender = 'user' 
+                        AND m.sent_at > r.sent_at
+                )
                 SELECT 
-                    r.id,
-                    COALESCE(r.ladder_step, 0) AS ladder_step,
-                    COALESCE(r.template_name, 'Unknown') AS template_name,
-                    r.user_id,
-                    r.sent_at
-                FROM recovery_logs r
-            ),
-            conversions AS (
-                SELECT DISTINCT r.id
+                    r.ladder_step,
+                    r.template_name,
+                    COUNT(*) AS sends,
+                    COUNT(c.id) AS conversions,
+                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
                 FROM recovery_sends r
-                JOIN messages m ON m.user_id = r.user_id 
-                    AND m.sender = 'user' 
-                    AND m.sent_at > r.sent_at
-            )
-            SELECT 
-                r.ladder_step,
-                r.template_name,
-                COUNT(*) AS sends,
-                COUNT(c.id) AS conversions,
-                ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
-            FROM recovery_sends r
-            LEFT JOIN conversions c ON r.id = c.id
-            GROUP BY r.ladder_step, r.template_name
-            ORDER BY r.ladder_step, sends DESC
-            LIMIT 50
-        """)
+                LEFT JOIN conversions c ON r.id = c.id
+                GROUP BY r.ladder_step, r.template_name
+                ORDER BY r.ladder_step, sends DESC
+                LIMIT 50
+            """)
+        else:
+            dropoff_df = run_query("""
+                WITH recovery_sends AS (
+                    SELECT 
+                        r.id,
+                        COALESCE(r.ladder_step, 0) AS ladder_step,
+                        COALESCE(r.template_name, 'Unknown') AS template_name,
+                        r.user_id,
+                        r.sent_at
+                    FROM recovery_logs r
+                ),
+                conversions AS (
+                    SELECT DISTINCT r.id
+                    FROM recovery_sends r
+                    JOIN messages m ON m.user_id = r.user_id 
+                        AND m.sender = 'user' 
+                        AND m.sent_at > r.sent_at
+                )
+                SELECT 
+                    r.ladder_step,
+                    r.template_name,
+                    COUNT(*) AS sends,
+                    COUNT(c.id) AS conversions,
+                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
+                FROM recovery_sends r
+                LEFT JOIN conversions c ON r.id = c.id
+                GROUP BY r.ladder_step, r.template_name
+                ORDER BY r.ladder_step, sends DESC
+                LIMIT 50
+            """)
 
         # Time to reactivation (avg/median hours)
-        reactivation_df = run_query("""
-            WITH first_reply AS (
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            reactivation_df = run_query(f"""
+                WITH first_reply AS (
+                    SELECT 
+                        r.id AS rec_id,
+                        r.user_id,
+                        r.sent_at,
+                        MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE 1=1 {internal_filter_join}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
                 SELECT 
-                    r.id AS rec_id,
-                    r.user_id,
-                    r.sent_at,
-                    MIN(m.sent_at) AS reply_at
-                FROM recovery_logs r
-                JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                GROUP BY r.id, r.user_id, r.sent_at
-            )
-            SELECT 
-                AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-            FROM first_reply
-        """)
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+        else:
+            reactivation_df = run_query("""
+                WITH first_reply AS (
+                    SELECT 
+                        r.id AS rec_id,
+                        r.user_id,
+                        r.sent_at,
+                        MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
         avg_hours = round(reactivation_df['avg_hours'].iloc[0], 1) if not reactivation_df.empty and pd.notna(reactivation_df['avg_hours'].iloc[0]) else None
         median_hours = round(reactivation_df['median_hours'].iloc[0], 1) if not reactivation_df.empty and pd.notna(reactivation_df['median_hours'].iloc[0]) else None
 
         # Users with multiple sends (2nd / 3rd+ ladder steps)
-        multi_send_df = run_query("""
-            SELECT 
-                COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
-                COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
-            FROM (
-                SELECT user_id, COUNT(*) AS send_count
-                FROM recovery_logs
-                GROUP BY user_id
-            ) t
-        """)
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            multi_send_df = run_query(f"""
+                SELECT 
+                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
+                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
+                FROM (
+                    SELECT r.user_id, COUNT(*) AS send_count
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE 1=1 {internal_filter_join}
+                    GROUP BY r.user_id
+                ) t
+            """)
+        else:
+            multi_send_df = run_query("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
+                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
+                FROM (
+                    SELECT user_id, COUNT(*) AS send_count
+                    FROM recovery_logs
+                    GROUP BY user_id
+                ) t
+            """)
         users_2_plus = multi_send_df['users_2_plus'].iloc[0] if not multi_send_df.empty else 0
         users_3_plus = multi_send_df['users_3_plus'].iloc[0] if not multi_send_df.empty else 0
 
@@ -897,6 +1184,10 @@ with tab1:
     # Recent messages section
     st.markdown("### 💬 Recent Messages")
     
+    # Show translation status (less intrusive)
+    if GoogleTranslator is None:
+        st.caption("ℹ️ Translation unavailable - install `deep-translator` to enable")
+    
     # Time range selector
     time_range = st.selectbox(
         "Filter by time range:",
@@ -906,8 +1197,10 @@ with tab1:
     
     # Build query based on selected time range
     # Note: Using CURRENT_TIMESTAMP for timezone-aware comparison
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    
     if time_range == "Last 20 messages":
-        query = """
+        query = f"""
             SELECT 
                 m.sent_at as timestamp,
                 u.full_name as user_name,
@@ -917,11 +1210,12 @@ with tab1:
             FROM messages m
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
             LIMIT 20
         """
     elif time_range == "Last 1 hour":
-        query = """
+        query = f"""
             SELECT 
                 m.sent_at as timestamp,
                 u.full_name as user_name,
@@ -932,10 +1226,11 @@ with tab1:
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
               AND m.sent_at >= NOW() - INTERVAL '1 hour'
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
         """
     else:  # Last 24 hours
-        query = """
+        query = f"""
             SELECT 
                 m.sent_at as timestamp,
                 u.full_name as user_name,
@@ -946,6 +1241,7 @@ with tab1:
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
               AND m.sent_at >= NOW() - INTERVAL '24 hours'
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
         """
     
@@ -1048,20 +1344,28 @@ with tab1:
             st.session_state.recent_msg_translations = {}
 
         def translate_to_english(text: str) -> str:
-            if not text:
+            if not text or text.strip() == "":
                 return ""
             # If translator library is unavailable, just return original text
             if GoogleTranslator is None:
-                return text
+                return "[Translation unavailable - deep_translator not installed]"
             cache = st.session_state.recent_msg_translations
             if text in cache:
                 return cache[text]
             try:
-                translated = GoogleTranslator(source="auto", target="en").translate(text)
+                # Limit text length to avoid API issues (Google Translate has limits)
+                text_to_translate = text[:5000] if len(text) > 5000 else text
+                translated = GoogleTranslator(source="auto", target="en").translate(text_to_translate)
                 cache[text] = translated
                 return translated
-            except Exception:
-                # If translation fails, just return original text so the table still renders
+            except Exception as e:
+                # If translation fails, cache the error and return original text
+                # This prevents repeated failed attempts for the same text
+                cache[text] = text
+                # Log error for debugging (only show once per session)
+                if "translation_error_shown" not in st.session_state:
+                    st.session_state.translation_error_shown = True
+                    st.warning(f"Translation error: {str(e)}. Showing original text. Check if deep_translator is properly installed.")
                 return text
         
         # Parse timezone string like "UTC-3", "-3", "America/Sao_Paulo"
@@ -1121,12 +1425,16 @@ with tab1:
                 return str(ts)[:16]
         
         # Build display dataframe
+        # Extract message text first
+        message_texts = recent_messages['raw_message'].apply(extract_message_text)
+        
+        # Build display dataframe
         display_df = pd.DataFrame({
             'Time': recent_messages.apply(format_timestamp_local, axis=1),
             'User': recent_messages['user_name'].fillna('Unknown'),
             'From': recent_messages['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
-            'Message': recent_messages['raw_message'].apply(extract_message_text),
-            'Message (EN)': recent_messages['raw_message'].apply(lambda x: translate_to_english(extract_message_text(x))),
+            'Message': message_texts,
+            'Message (EN)': message_texts.apply(translate_to_english),
             'Template?': recent_messages['raw_message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
         })
         
@@ -1160,18 +1468,35 @@ with tab1:
     
     try:
         # Query message activity by hour for the selected date range (user messages only)
-        activity_by_hour = run_query(f"""
-            SELECT 
-                EXTRACT(HOUR FROM sent_at) as hour,
-                COUNT(*) as message_count
-            FROM messages
-            WHERE sent_at >= '{start_date}'::date
-              AND sent_at < '{end_date}'::date + INTERVAL '1 day'
-              AND sender = 'user'
-              AND sent_at IS NOT NULL
-            GROUP BY EXTRACT(HOUR FROM sent_at)
-            ORDER BY hour
-        """)
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        if exclude_internal and internal_filter_join:
+            activity_by_hour = run_query(f"""
+                SELECT 
+                    EXTRACT(HOUR FROM m.sent_at) as hour,
+                    COUNT(*) as message_count
+                FROM messages m
+                JOIN users u ON m.user_id = u.id
+                WHERE m.sent_at >= '{start_date}'::date
+                  AND m.sent_at < '{end_date}'::date + INTERVAL '1 day'
+                  AND m.sender = 'user'
+                  AND m.sent_at IS NOT NULL
+                  {internal_filter_join}
+                GROUP BY EXTRACT(HOUR FROM m.sent_at)
+                ORDER BY hour
+            """)
+        else:
+            activity_by_hour = run_query(f"""
+                SELECT 
+                    EXTRACT(HOUR FROM sent_at) as hour,
+                    COUNT(*) as message_count
+                FROM messages
+                WHERE sent_at >= '{start_date}'::date
+                  AND sent_at < '{end_date}'::date + INTERVAL '1 day'
+                  AND sender = 'user'
+                  AND sent_at IS NOT NULL
+                GROUP BY EXTRACT(HOUR FROM sent_at)
+                ORDER BY hour
+            """)
         
         if not activity_by_hour.empty:
             # Fill in missing hours with 0
@@ -1236,11 +1561,14 @@ with tab1:
     st.markdown("### 👥 All Users")
     
     # Query users with their last sent/received message times and content
-    all_users = run_query("""
+    internal_filter = get_internal_users_filter_sql(exclude_internal)
+    where_clause = "" if not internal_filter else internal_filter.replace("WHERE", "AND")
+    all_users = run_query(f"""
         WITH unique_users AS (
             SELECT DISTINCT ON (waid) 
-                id, waid, full_name, gender, pillar, level, phase, is_active, timezone, created_at, updated_at
+                id, waid, full_name, gender, age, coach_name, pillar, level, phase, is_active, timezone, created_at, updated_at
             FROM users 
+            {internal_filter if internal_filter else ""}
             ORDER BY waid, created_at DESC
         ),
         last_sent AS (
@@ -1273,6 +1601,8 @@ with tab1:
             u.waid,
             u.full_name,
             u.gender,
+            u.age,
+            u.coach_name,
             u.pillar,
             u.level,
             u.phase,
@@ -1430,6 +1760,9 @@ with tab1:
         display_df = pd.DataFrame({
             'Name': all_users['full_name'].fillna('Unknown'),
             'WhatsApp ID': all_users['waid'],
+            'Age': all_users['age'].fillna('—') if 'age' in all_users.columns else '—',
+            'Gender': all_users['gender'].fillna('—') if 'gender' in all_users.columns else '—',
+            'Coach Name': all_users['coach_name'].fillna('—') if 'coach_name' in all_users.columns else '—',
             'Level': all_users['level'].fillna('—'),
             'XP': all_users['id'].map(xp_map).fillna(0).astype(int) if 'id' in all_users.columns else 0,
             'Signed Up': all_users.apply(lambda r: format_ts(r['created_at'], r['timezone']), axis=1),
@@ -1478,7 +1811,8 @@ with tab2:
                 COALESCE(full_name, 'Unknown') as full_name,
                 waid,
                 timezone,
-                created_at
+                created_at,
+                coach_name
             FROM users
             ORDER BY waid, created_at DESC
         ),
@@ -1488,6 +1822,15 @@ with tab2:
             WHERE sender = 'user'
               AND sent_at >= NOW() - INTERVAL '24 hours'
               AND user_id IS NOT NULL
+        ),
+        user_slogans AS (
+            SELECT DISTINCT ON (user_id)
+                user_id,
+                content->>'slogan' as slogan
+            FROM ai_companion_flows
+            WHERE type = 'post_onboarding'
+              AND content->>'slogan' IS NOT NULL
+            ORDER BY user_id, created_at DESC
         )
         SELECT 
             u.id,
@@ -1495,9 +1838,12 @@ with tab2:
             u.waid,
             u.timezone,
             u.created_at,
+            u.coach_name,
+            us.slogan,
             CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
         FROM unique_users u
         LEFT JOIN active_users a ON u.id = a.user_id
+        LEFT JOIN user_slogans us ON u.id = us.user_id
         ORDER BY u.full_name ASC
         LIMIT 500
     """)
@@ -1510,6 +1856,8 @@ with tab2:
         selected_row = users_df[users_df['label'] == selected_label].iloc[0]
         user_id = int(selected_row['id'])
         user_tz_str = selected_row.get('timezone')
+        user_coach = selected_row.get('coach_name', '—')
+        user_slogan = selected_row.get('slogan', '—')
         
         # Helper: parse timezone strings like "UTC-3", "-3", "America/Sao_Paulo"
         def parse_tz(tz_str):
@@ -1727,6 +2075,163 @@ with tab2:
                             next_activity_name = act_name
                             next_activity_day = week_full[idx]
         
+        # User info row (slogan and coach)
+        info_col1, info_col2 = st.columns(2)
+        with info_col1:
+            st.info(f"**Coach:** {user_coach if user_coach and pd.notna(user_coach) else '—'}")
+        with info_col2:
+            st.info(f"**Slogan:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
+        
+        # Funnel metrics: onboarding completed, slogan set, first activity completed
+        st.markdown("#### 🎯 User Journey Funnel")
+        funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
+        
+        # Check onboarding completed
+        onboarding_check = run_query(f"""
+            SELECT COUNT(*) as count
+            FROM events
+            WHERE user_id = {user_id}
+              AND event_type = 'onboarding_completed'
+        """)
+        onboarding_completed = onboarding_check['count'].iloc[0] > 0 if not onboarding_check.empty else False
+        
+        # Check slogan set
+        slogan_check = run_query(f"""
+            SELECT COUNT(*) as count
+            FROM ai_companion_flows
+            WHERE user_id = {user_id}
+              AND type = 'post_onboarding'
+              AND content->>'slogan' IS NOT NULL
+        """)
+        slogan_set = slogan_check['count'].iloc[0] > 0 if not slogan_check.empty else False
+        
+        # Check first activity completed
+        first_activity_check = run_query(f"""
+            SELECT COUNT(*) as count
+            FROM user_activities_history
+            WHERE user_id = {user_id}
+              AND completed_at IS NOT NULL
+        """)
+        first_activity_completed = first_activity_check['count'].iloc[0] > 0 if not first_activity_check.empty else False
+        
+        with funnel_col1:
+            status_icon = "✅" if onboarding_completed else "❌"
+            st.metric("Onboarding Completed", status_icon, "Step 1")
+        with funnel_col2:
+            status_icon = "✅" if slogan_set else "❌"
+            st.metric("Slogan Set", status_icon, "Step 2")
+        with funnel_col3:
+            status_icon = "✅" if first_activity_completed else "❌"
+            st.metric("First Activity Completed", status_icon, "Step 3")
+        
+        # Most active times analysis (in user's local timezone)
+        st.markdown("#### 📊 Most Active Times")
+        
+        # Get user timezone for conversion
+        user_tz = parse_tz(user_tz_str)
+        tz_name = user_tz_str if user_tz_str else "UTC"
+        
+        # Query messages and convert to user's local timezone
+        messages_for_times = run_query(f"""
+            SELECT sent_at
+            FROM messages
+            WHERE user_id = {user_id}
+              AND sender = 'user'
+              AND sent_at IS NOT NULL
+        """)
+        
+        if not messages_for_times.empty:
+            # Convert timestamps to user's local timezone
+            def convert_to_local_hour(ts):
+                try:
+                    if isinstance(ts, str):
+                        ts = pd.to_datetime(ts)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=pytz.UTC)
+                    
+                    if user_tz:
+                        ts_local = ts.astimezone(user_tz)
+                        return ts_local.hour
+                    else:
+                        return ts.hour
+                except Exception:
+                    return None
+            
+            messages_for_times['local_hour'] = messages_for_times['sent_at'].apply(convert_to_local_hour)
+            messages_for_times = messages_for_times[messages_for_times['local_hour'].notna()]
+            
+            if not messages_for_times.empty:
+                # Count messages per hour
+                hour_counts = messages_for_times['local_hour'].value_counts().sort_index()
+                
+                # Create full 24-hour dataframe
+                all_hours = pd.DataFrame({'hour': range(24)})
+                hour_counts_df = pd.DataFrame({
+                    'hour': hour_counts.index,
+                    'message_count': hour_counts.values
+                })
+                
+                # Merge to get all hours with counts (fill missing with 0)
+                active_times_df = all_hours.merge(hour_counts_df, on='hour', how='left').fillna(0)
+                active_times_df['message_count'] = active_times_df['message_count'].astype(int)
+                
+                # Format hour labels for display
+                def format_hour(h):
+                    h = int(h)
+                    if h == 0:
+                        return "12am"
+                    elif h < 12:
+                        return f"{h}am"
+                    elif h == 12:
+                        return "12pm"
+                    else:
+                        return f"{h-12}pm"
+                
+                active_times_df['hour_label'] = active_times_df['hour'].apply(format_hour)
+                
+                # Create visual chart using Altair
+                import altair as alt
+                
+                chart = alt.Chart(active_times_df).mark_bar(
+                    color='#00d4aa',
+                    cornerRadiusTopLeft=3,
+                    cornerRadiusTopRight=3
+                ).encode(
+                    x=alt.X('hour_label:N', 
+                            sort=list(active_times_df['hour_label']),
+                            title='Hour of Day (Local Time)',
+                            axis=alt.Axis(labelAngle=-45)),
+                    y=alt.Y('message_count:Q', title='Messages'),
+                    tooltip=[
+                        alt.Tooltip('hour_label:N', title='Hour'),
+                        alt.Tooltip('message_count:Q', title='Messages')
+                    ]
+                ).properties(
+                    height=300,
+                    title=f'Message Activity by Hour ({tz_name})'
+                ).configure_axis(
+                    grid=True,
+                    gridColor='#2d3748'
+                ).configure_view(
+                    strokeWidth=0
+                )
+                
+                st.altair_chart(chart, use_container_width=True)
+                
+                # Show peak activity insight
+                peak_hour_row = active_times_df.loc[active_times_df['message_count'].idxmax()]
+                if peak_hour_row['message_count'] > 0:
+                    peak_hour = peak_hour_row['hour_label']
+                    peak_count = int(peak_hour_row['message_count'])
+                    total_messages = int(active_times_df['message_count'].sum())
+                    st.caption(f"**Peak activity:** {peak_hour} ({peak_count} messages, {round(100 * peak_count / total_messages, 1)}% of total)")
+            else:
+                st.caption("No message activity data available")
+        else:
+            st.caption("No message activity data available")
+        
+        st.markdown("---")
+        
         # Metrics row
         m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
         m1.metric("⭐ XP Earned", total_xp)
@@ -1760,6 +2265,7 @@ with tab2:
                         st.caption("—")
         
         st.markdown("#### 💬 Message History")
+        
         messages_df = run_query(f"""
             SELECT sent_at, sender, message
             FROM messages
@@ -1857,30 +2363,41 @@ with tab2:
             st.session_state.user_deepdive_translations = {}
         
         def translate_to_english(text: str) -> str:
-            if not text:
+            if not text or text.strip() == "":
                 return ""
             # If translator library is unavailable, just return original text
             if GoogleTranslator is None:
-                return text
+                return "[Translation unavailable - deep_translator not installed]"
             cache = st.session_state.user_deepdive_translations
             if text in cache:
                 return cache[text]
             try:
-                translated = GoogleTranslator(source="auto", target="en").translate(text)
+                # Limit text length to avoid API issues (Google Translate has limits)
+                text_to_translate = text[:5000] if len(text) > 5000 else text
+                translated = GoogleTranslator(source="auto", target="en").translate(text_to_translate)
                 cache[text] = translated
                 return translated
-            except Exception:
-                # If translation fails, just return original text so the table still renders
+            except Exception as e:
+                # If translation fails, cache the error and return original text
+                # This prevents repeated failed attempts for the same text
+                cache[text] = text
+                # Log error for debugging (only show once per session)
+                if "translation_error_shown_deepdive" not in st.session_state:
+                    st.session_state.translation_error_shown_deepdive = True
+                    st.warning(f"Translation error: {str(e)}. Showing original text. Check if deep_translator is properly installed.")
                 return text
         
         if messages_df.empty:
             st.info("No messages found for this user.")
         else:
+            # Extract message text first
+            message_texts = messages_df['message'].apply(extract_msg_text)
+            
             history_df = pd.DataFrame({
                 "Time": messages_df['sent_at'].apply(format_ts_local),
                 "From": messages_df['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
-                "Message": messages_df['message'].apply(extract_msg_text),
-                "Message (EN)": messages_df['message'].apply(lambda x: translate_to_english(extract_msg_text(x))),
+                "Message": message_texts,
+                "Message (EN)": message_texts.apply(translate_to_english),
                 "Template?": messages_df['message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
             })
             st.dataframe(
