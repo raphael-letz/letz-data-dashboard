@@ -580,6 +580,34 @@ with st.sidebar:
                 with st.expander(f"📋 Schema: {selected_table}"):
                     schema = get_table_schema(selected_table)
                     st.dataframe(schema, use_container_width=True, hide_index=True)
+        
+        # Sample messages for structure deep dive (Sandro, Jan 22)
+        with st.expander("🔍 Sample messages (Sandro, Jan 22)"):
+            sample_df = run_query("""
+                SELECT m.id, m.sent_at, m.sender, m.type, m.message
+                FROM messages m
+                JOIN users u ON (u.id = m.user_id OR u.waid = m.waid)
+                WHERE LOWER(TRIM(u.full_name)) LIKE '%sandro%'
+                  AND m.sent_at >= '2026-01-22'::date
+                  AND m.sent_at <  '2026-01-23'::date
+                ORDER BY m.sent_at
+                LIMIT 15
+            """)
+            if sample_df.empty:
+                sample_df = run_query("""
+                    SELECT m.id, m.sent_at, m.sender, m.type, m.message
+                    FROM messages m
+                    JOIN users u ON (u.id = m.user_id OR u.waid = m.waid)
+                    WHERE LOWER(TRIM(u.full_name)) LIKE '%sandro%'
+                      AND m.sent_at >= '2025-01-22'::date
+                      AND m.sent_at <  '2025-01-23'::date
+                    ORDER BY m.sent_at
+                    LIMIT 15
+                """)
+            if not sample_df.empty:
+                st.dataframe(sample_df, use_container_width=True, hide_index=True, height=400)
+            else:
+                st.caption("No messages found for Sandro on Jan 22 (tried 2026 and 2025). Check name/date.")
                 
     else:
         st.error("✗ Not connected")
@@ -1231,7 +1259,9 @@ with tab1:
     if time_range == "Last 20 messages":
         query = f"""
             SELECT 
+                m.id as msg_id,
                 m.sent_at as timestamp,
+                m.type as msg_type,
                 u.full_name as user_name,
                 u.timezone as user_timezone,
                 m.sender,
@@ -1246,7 +1276,9 @@ with tab1:
     elif time_range == "Last 1 hour":
         query = f"""
             SELECT 
+                m.id as msg_id,
                 m.sent_at as timestamp,
+                m.type as msg_type,
                 u.full_name as user_name,
                 u.timezone as user_timezone,
                 m.sender,
@@ -1261,7 +1293,9 @@ with tab1:
     else:  # Last 24 hours
         query = f"""
             SELECT 
+                m.id as msg_id,
                 m.sent_at as timestamp,
+                m.type as msg_type,
                 u.full_name as user_name,
                 u.timezone as user_timezone,
                 m.sender,
@@ -1453,19 +1487,137 @@ with tab1:
             except Exception as e:
                 return str(ts)[:16]
         
-        # Build display dataframe
-        # Extract message text first
-        message_texts = recent_messages['raw_message'].apply(extract_message_text)
-        
-        # Build display dataframe
-        display_df = pd.DataFrame({
-            'Time': recent_messages.apply(format_timestamp_local, axis=1),
-            'User': recent_messages['user_name'].fillna('Unknown'),
-            'From': recent_messages['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
-            'Message': message_texts,
-            'Message (EN)': message_texts.apply(translate_to_english),
-            'Template?': recent_messages['raw_message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
-        })
+        # Detect audio messages: type='audio' or MIME like audio/ogg; codecs=opus, or message body
+        def is_audio_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            return (
+                t == "audio"
+                or "audio/" in t
+                or "audio/ogg" in raw_str
+                or ("opus" in raw_str and "audio" in raw_str.lower())
+            )
+
+        # Detect image messages: type image/photo or MIME like image/jpeg
+        def is_image_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            return (
+                t in ("image", "photo")
+                or "image/" in t
+                or "image/" in raw_str
+            )
+
+        # Merge audio + transcript: transcript is a separate row (same user, within 120s).
+        skip_idx = set()
+        transcript_for_audio = {}
+        for i in range(len(recent_messages)):
+            row = recent_messages.iloc[i]
+            if not is_audio_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            for candidate_idx in [i - 1, i + 1]:
+                if candidate_idx < 0 or candidate_idx >= len(recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"] or is_audio_message(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        transcript_for_audio[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        # Merge image + interpretation: same as audio+transcript (same user, within 120s).
+        interpretation_for_image = {}
+        for i in range(len(recent_messages)):
+            row = recent_messages.iloc[i]
+            if not is_image_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            for candidate_idx in [i - 1, i + 1]:
+                if candidate_idx < 0 or candidate_idx >= len(recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"] or is_image_message(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        interpretation_for_image[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        # Type label: template, then icon for audio/image, else db type (text, interactive, quickReply, flows, etc.)
+        def get_type_label(msg_type_val, is_audio, is_image, is_tmpl):
+            if is_tmpl:
+                return "template"
+            if is_audio:
+                return "🎧"
+            if is_image:
+                return "📷"
+            t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
+            return str(t).strip() or "—"
+
+        # Build display rows: one per message, with type column and merged transcript/interpretation text
+        def get_display_text(idx):
+            if idx in skip_idx:
+                return ""
+            row = recent_messages.iloc[idx]
+            raw = row.get("raw_message")
+            if is_audio_message(row.get("msg_type"), raw):
+                if idx in transcript_for_audio:
+                    trans_idx = transcript_for_audio[idx]
+                    prev = recent_messages.iloc[trans_idx]
+                    return extract_message_text(prev.get("raw_message")) or "[Audio]"
+                return "[Audio]"
+            if is_image_message(row.get("msg_type"), raw):
+                if idx in interpretation_for_image:
+                    interp_idx = interpretation_for_image[idx]
+                    prev = recent_messages.iloc[interp_idx]
+                    return extract_message_text(prev.get("raw_message")) or "[Image]"
+                return "[Image]"
+            return extract_message_text(raw)
+
+        rows_display = []
+        for i in range(len(recent_messages)):
+            if i in skip_idx:
+                continue
+            row = recent_messages.iloc[i]
+            msg_type_val = row.get("msg_type")
+            raw_msg = row.get("raw_message")
+            is_audio = is_audio_message(msg_type_val, raw_msg)
+            is_image = is_image_message(msg_type_val, raw_msg)
+            text = get_display_text(i)
+            rows_display.append({
+                "Time": format_timestamp_local(row),
+                "User": row["user_name"] if pd.notna(row["user_name"]) else "Unknown",
+                "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
+                "Type": get_type_label(msg_type_val, is_audio, is_image, is_template(raw_msg)),
+                "Message": text,
+                "Message (EN)": translate_to_english(text),
+            })
+
+        display_df = pd.DataFrame(rows_display)
         
         st.dataframe(
             display_df, 
@@ -1475,6 +1627,7 @@ with tab1:
                 "Time": st.column_config.TextColumn(width="small"),
                 "User": st.column_config.TextColumn(width="medium"),
                 "From": st.column_config.TextColumn(width="small"),
+                "Type": st.column_config.TextColumn(width="small"),
                 "Message": st.column_config.TextColumn(width="large"),
                 "Message (EN)": st.column_config.TextColumn(width="large"),
             }
@@ -2296,7 +2449,7 @@ with tab2:
         st.markdown("#### 💬 Message History")
         
         messages_df = run_query(f"""
-            SELECT sent_at, sender, message
+            SELECT id as msg_id, sent_at, sender, type as msg_type, message
             FROM messages
             WHERE user_id = {user_id} AND sent_at IS NOT NULL
             ORDER BY sent_at DESC
@@ -2419,16 +2572,134 @@ with tab2:
         if messages_df.empty:
             st.info("No messages found for this user.")
         else:
-            # Extract message text first
-            message_texts = messages_df['message'].apply(extract_msg_text)
-            
-            history_df = pd.DataFrame({
-                "Time": messages_df['sent_at'].apply(format_ts_local),
-                "From": messages_df['sender'].apply(lambda x: '👤 User' if x == 'user' else '🤖 Bot'),
-                "Message": message_texts,
-                "Message (EN)": message_texts.apply(translate_to_english),
-                "Template?": messages_df['message'].apply(lambda x: 'Yes' if is_template(x) else 'No')
-            })
+            # Detect audio: type='audio' or MIME like audio/ogg; codecs=opus, or message body
+            def is_audio_msg(msg_type, raw_msg):
+                if pd.isna(msg_type):
+                    msg_type = ""
+                t = str(msg_type).strip().lower()
+                raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+                return (
+                    t == "audio"
+                    or "audio/" in t
+                    or "audio/ogg" in raw_str
+                    or ("opus" in raw_str and "audio" in raw_str.lower())
+                )
+
+            # Detect image: type image/photo or MIME like image/jpeg
+            def is_image_msg(msg_type, raw_msg):
+                if pd.isna(msg_type):
+                    msg_type = ""
+                t = str(msg_type).strip().lower()
+                raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+                return (
+                    t in ("image", "photo")
+                    or "image/" in t
+                    or "image/" in raw_str
+                )
+
+            # Merge audio + transcript (same user, within 120s).
+            skip_idx_dd = set()
+            transcript_for_audio_dd = {}
+            for i in range(len(messages_df)):
+                row = messages_df.iloc[i]
+                if not is_audio_msg(row.get("msg_type"), row.get("message")):
+                    continue
+                try:
+                    ts_cur = pd.to_datetime(row["sent_at"])
+                except Exception:
+                    continue
+                for candidate_idx in [i - 1, i + 1]:
+                    if candidate_idx < 0 or candidate_idx >= len(messages_df):
+                        continue
+                    if candidate_idx in skip_idx_dd:
+                        continue
+                    other = messages_df.iloc[candidate_idx]
+                    if other["sender"] != row["sender"] or is_audio_msg(other.get("msg_type"), other.get("message")):
+                        continue
+                    try:
+                        ts_other = pd.to_datetime(other["sent_at"])
+                        if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                            transcript_for_audio_dd[i] = candidate_idx
+                            skip_idx_dd.add(candidate_idx)
+                            break
+                    except Exception:
+                        pass
+
+            # Merge image + interpretation (same user, within 120s).
+            interpretation_for_image_dd = {}
+            for i in range(len(messages_df)):
+                row = messages_df.iloc[i]
+                if not is_image_msg(row.get("msg_type"), row.get("message")):
+                    continue
+                try:
+                    ts_cur = pd.to_datetime(row["sent_at"])
+                except Exception:
+                    continue
+                for candidate_idx in [i - 1, i + 1]:
+                    if candidate_idx < 0 or candidate_idx >= len(messages_df):
+                        continue
+                    if candidate_idx in skip_idx_dd:
+                        continue
+                    other = messages_df.iloc[candidate_idx]
+                    if other["sender"] != row["sender"] or is_image_msg(other.get("msg_type"), other.get("message")):
+                        continue
+                    try:
+                        ts_other = pd.to_datetime(other["sent_at"])
+                        if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                            interpretation_for_image_dd[i] = candidate_idx
+                            skip_idx_dd.add(candidate_idx)
+                            break
+                    except Exception:
+                        pass
+
+            # Type label: template, then icon for audio/image, else db type (text, interactive, quickReply, flows, etc.)
+            def get_type_label_dd(msg_type_val, is_audio, is_image, is_tmpl):
+                if is_tmpl:
+                    return "template"
+                if is_audio:
+                    return "🎧"
+                if is_image:
+                    return "📷"
+                t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
+                return str(t).strip() or "—"
+
+            def get_msg_display_text(idx):
+                if idx in skip_idx_dd:
+                    return ""
+                row = messages_df.iloc[idx]
+                raw = row.get("message")
+                if is_audio_msg(row.get("msg_type"), raw):
+                    if idx in transcript_for_audio_dd:
+                        trans_idx = transcript_for_audio_dd[idx]
+                        prev = messages_df.iloc[trans_idx]
+                        return extract_msg_text(prev.get("message")) or "[Audio]"
+                    return "[Audio]"
+                if is_image_msg(row.get("msg_type"), raw):
+                    if idx in interpretation_for_image_dd:
+                        interp_idx = interpretation_for_image_dd[idx]
+                        prev = messages_df.iloc[interp_idx]
+                        return extract_msg_text(prev.get("message")) or "[Image]"
+                    return "[Image]"
+                return extract_msg_text(raw)
+
+            rows_history = []
+            for i in range(len(messages_df)):
+                if i in skip_idx_dd:
+                    continue
+                row = messages_df.iloc[i]
+                is_audio = is_audio_msg(row.get("msg_type"), row.get("message"))
+                is_image = is_image_msg(row.get("msg_type"), row.get("message"))
+                text = get_msg_display_text(i)
+                msg_type_val = row.get("msg_type")
+                rows_history.append({
+                    "Time": format_ts_local(row["sent_at"]),
+                    "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
+                    "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_template(row.get("message"))),
+                    "Message": text,
+                    "Message (EN)": translate_to_english(text),
+                })
+
+            history_df = pd.DataFrame(rows_history)
             st.dataframe(
                 history_df,
                 use_container_width=True,
@@ -2437,9 +2708,9 @@ with tab2:
                 column_config={
                     "Time": st.column_config.TextColumn(width="small"),
                     "From": st.column_config.TextColumn(width="small"),
+                    "Type": st.column_config.TextColumn(width="small"),
                     "Message": st.column_config.TextColumn(width="large"),
                     "Message (EN)": st.column_config.TextColumn(width="large"),
-                    "Template?": st.column_config.TextColumn(width="small"),
                 }
             )
 
