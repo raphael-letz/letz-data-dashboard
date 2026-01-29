@@ -569,46 +569,6 @@ with st.sidebar:
     conn = get_connection()
     if conn:
         st.success("✓ Connected to database")
-        
-        # Table explorer
-        tables = get_table_list()
-        if tables:
-            st.markdown("**Tables:**")
-            selected_table = st.selectbox("Select table", tables, label_visibility="collapsed")
-            
-            if selected_table:
-                with st.expander(f"📋 Schema: {selected_table}"):
-                    schema = get_table_schema(selected_table)
-                    st.dataframe(schema, use_container_width=True, hide_index=True)
-        
-        # Sample messages for structure deep dive (Sandro, Jan 22)
-        with st.expander("🔍 Sample messages (Sandro, Jan 22)"):
-            sample_df = run_query("""
-                SELECT m.id, m.sent_at, m.sender, m.type, m.message
-                FROM messages m
-                JOIN users u ON (u.id = m.user_id OR u.waid = m.waid)
-                WHERE LOWER(TRIM(u.full_name)) LIKE '%sandro%'
-                  AND m.sent_at >= '2026-01-22'::date
-                  AND m.sent_at <  '2026-01-23'::date
-                ORDER BY m.sent_at
-                LIMIT 15
-            """)
-            if sample_df.empty:
-                sample_df = run_query("""
-                    SELECT m.id, m.sent_at, m.sender, m.type, m.message
-                    FROM messages m
-                    JOIN users u ON (u.id = m.user_id OR u.waid = m.waid)
-                    WHERE LOWER(TRIM(u.full_name)) LIKE '%sandro%'
-                      AND m.sent_at >= '2025-01-22'::date
-                      AND m.sent_at <  '2025-01-23'::date
-                    ORDER BY m.sent_at
-                    LIMIT 15
-                """)
-            if not sample_df.empty:
-                st.dataframe(sample_df, use_container_width=True, hide_index=True, height=400)
-            else:
-                st.caption("No messages found for Sandro on Jan 22 (tried 2026 and 2025). Check name/date.")
-                
     else:
         st.error("✗ Not connected")
         st.info("Check your .env file")
@@ -1500,17 +1460,34 @@ with tab1:
                 or ("opus" in raw_str and "audio" in raw_str.lower())
             )
 
-        # Detect image messages: type image/photo or MIME like image/jpeg
+        # Detect sticker messages: check for "sticker" key in JSON and webp mime type
+        def is_sticker_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            # Check if type is "sticker" or if message JSON contains "sticker" key with webp
+            if t == "sticker":
+                return True
+            if '"sticker"' in raw_str and "image/webp" in raw_str:
+                return True
+            return False
+
+        # Detect image messages: type image/photo or MIME like image/jpeg (excluding stickers)
         def is_image_message(msg_type, raw_msg):
             if pd.isna(msg_type):
                 msg_type = ""
             t = str(msg_type).strip().lower()
             raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
-            return (
-                t in ("image", "photo")
-                or "image/" in t
-                or "image/" in raw_str
-            )
+            # Exclude stickers from images
+            if is_sticker_message(msg_type, raw_msg):
+                return False
+            # Check for image type or MIME
+            if t in ("image", "photo"):
+                return True
+            if "image/" in t or ('"image"' in raw_str and "image/jpeg" in raw_str):
+                return True
+            return False
 
         # Merge audio + transcript: transcript is a separate row (same user, within 120s).
         skip_idx = set()
@@ -1540,7 +1517,8 @@ with tab1:
                 except Exception:
                     pass
 
-        # Merge image + interpretation: same as audio+transcript (same user, within 120s).
+        # Merge image + description: description is stored in message immediately before (same user, within 120s).
+        # Look backward first (i-1), as that's the typical pattern per user's description.
         interpretation_for_image = {}
         for i in range(len(recent_messages)):
             row = recent_messages.iloc[i]
@@ -1550,6 +1528,7 @@ with tab1:
                 ts_cur = pd.to_datetime(row["timestamp"])
             except Exception:
                 continue
+            # Check i-1 first (message before image), then i+1 as fallback
             for candidate_idx in [i - 1, i + 1]:
                 if candidate_idx < 0 or candidate_idx >= len(recent_messages):
                     continue
@@ -1567,18 +1546,48 @@ with tab1:
                 except Exception:
                     pass
 
-        # Type label: template, then icon for audio/image, else db type (text, interactive, quickReply, flows, etc.)
-        def get_type_label(msg_type_val, is_audio, is_image, is_tmpl):
+        # Merge sticker + description: same pattern as images (message before sticker)
+        description_for_sticker = {}
+        for i in range(len(recent_messages)):
+            row = recent_messages.iloc[i]
+            if not is_sticker_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            # Check i-1 first (message before sticker), then i+1 as fallback
+            for candidate_idx in [i - 1, i + 1]:
+                if candidate_idx < 0 or candidate_idx >= len(recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"] or is_sticker_message(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        description_for_sticker[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        # Type label: template, then icon for audio/image/sticker, else db type (text, interactive, quickReply, flows, etc.)
+        def get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_tmpl):
             if is_tmpl:
                 return "template"
             if is_audio:
                 return "🎧"
+            if is_sticker:
+                return "sticker"
             if is_image:
                 return "📷"
             t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
             return str(t).strip() or "—"
 
-        # Build display rows: one per message, with type column and merged transcript/interpretation text
+        # Build display rows: one per message, with type column and merged transcript/interpretation/description text
         def get_display_text(idx):
             if idx in skip_idx:
                 return ""
@@ -1590,6 +1599,12 @@ with tab1:
                     prev = recent_messages.iloc[trans_idx]
                     return extract_message_text(prev.get("raw_message")) or "[Audio]"
                 return "[Audio]"
+            if is_sticker_message(row.get("msg_type"), raw):
+                if idx in description_for_sticker:
+                    desc_idx = description_for_sticker[idx]
+                    prev = recent_messages.iloc[desc_idx]
+                    return extract_message_text(prev.get("raw_message")) or "[Sticker]"
+                return "[Sticker]"
             if is_image_message(row.get("msg_type"), raw):
                 if idx in interpretation_for_image:
                     interp_idx = interpretation_for_image[idx]
@@ -1606,13 +1621,14 @@ with tab1:
             msg_type_val = row.get("msg_type")
             raw_msg = row.get("raw_message")
             is_audio = is_audio_message(msg_type_val, raw_msg)
+            is_sticker = is_sticker_message(msg_type_val, raw_msg)
             is_image = is_image_message(msg_type_val, raw_msg)
             text = get_display_text(i)
             rows_display.append({
                 "Time": format_timestamp_local(row),
                 "User": row["user_name"] if pd.notna(row["user_name"]) else "Unknown",
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
-                "Type": get_type_label(msg_type_val, is_audio, is_image, is_template(raw_msg)),
+                "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
                 "Message": text,
                 "Message (EN)": translate_to_english(text),
             })
@@ -2585,17 +2601,32 @@ with tab2:
                     or ("opus" in raw_str and "audio" in raw_str.lower())
                 )
 
-            # Detect image: type image/photo or MIME like image/jpeg
+            # Detect sticker: check for "sticker" key in JSON and webp mime type
+            def is_sticker_msg(msg_type, raw_msg):
+                if pd.isna(msg_type):
+                    msg_type = ""
+                t = str(msg_type).strip().lower()
+                raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+                if t == "sticker":
+                    return True
+                if '"sticker"' in raw_str and "image/webp" in raw_str:
+                    return True
+                return False
+
+            # Detect image: type image/photo or MIME like image/jpeg (excluding stickers)
             def is_image_msg(msg_type, raw_msg):
                 if pd.isna(msg_type):
                     msg_type = ""
                 t = str(msg_type).strip().lower()
                 raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
-                return (
-                    t in ("image", "photo")
-                    or "image/" in t
-                    or "image/" in raw_str
-                )
+                # Exclude stickers from images
+                if is_sticker_msg(msg_type, raw_msg):
+                    return False
+                if t in ("image", "photo"):
+                    return True
+                if "image/" in t or ('"image"' in raw_str and "image/jpeg" in raw_str):
+                    return True
+                return False
 
             # Merge audio + transcript (same user, within 120s).
             skip_idx_dd = set()
@@ -2625,7 +2656,8 @@ with tab2:
                     except Exception:
                         pass
 
-            # Merge image + interpretation (same user, within 120s).
+            # Merge image + description: description is stored in message before (same user, within 120s).
+            # Check i-1 first as that's the typical pattern.
             interpretation_for_image_dd = {}
             for i in range(len(messages_df)):
                 row = messages_df.iloc[i]
@@ -2652,12 +2684,41 @@ with tab2:
                     except Exception:
                         pass
 
-            # Type label: template, then icon for audio/image, else db type (text, interactive, quickReply, flows, etc.)
-            def get_type_label_dd(msg_type_val, is_audio, is_image, is_tmpl):
+            # Merge sticker + description: same pattern as images (message before sticker)
+            description_for_sticker_dd = {}
+            for i in range(len(messages_df)):
+                row = messages_df.iloc[i]
+                if not is_sticker_msg(row.get("msg_type"), row.get("message")):
+                    continue
+                try:
+                    ts_cur = pd.to_datetime(row["sent_at"])
+                except Exception:
+                    continue
+                for candidate_idx in [i - 1, i + 1]:
+                    if candidate_idx < 0 or candidate_idx >= len(messages_df):
+                        continue
+                    if candidate_idx in skip_idx_dd:
+                        continue
+                    other = messages_df.iloc[candidate_idx]
+                    if other["sender"] != row["sender"] or is_sticker_msg(other.get("msg_type"), other.get("message")):
+                        continue
+                    try:
+                        ts_other = pd.to_datetime(other["sent_at"])
+                        if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                            description_for_sticker_dd[i] = candidate_idx
+                            skip_idx_dd.add(candidate_idx)
+                            break
+                    except Exception:
+                        pass
+
+            # Type label: template, then icon for audio/image/sticker, else db type (text, interactive, quickReply, flows, etc.)
+            def get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_tmpl):
                 if is_tmpl:
                     return "template"
                 if is_audio:
                     return "🎧"
+                if is_sticker:
+                    return "sticker"
                 if is_image:
                     return "📷"
                 t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
@@ -2674,6 +2735,12 @@ with tab2:
                         prev = messages_df.iloc[trans_idx]
                         return extract_msg_text(prev.get("message")) or "[Audio]"
                     return "[Audio]"
+                if is_sticker_msg(row.get("msg_type"), raw):
+                    if idx in description_for_sticker_dd:
+                        desc_idx = description_for_sticker_dd[idx]
+                        prev = messages_df.iloc[desc_idx]
+                        return extract_msg_text(prev.get("message")) or "[Sticker]"
+                    return "[Sticker]"
                 if is_image_msg(row.get("msg_type"), raw):
                     if idx in interpretation_for_image_dd:
                         interp_idx = interpretation_for_image_dd[idx]
@@ -2688,13 +2755,14 @@ with tab2:
                     continue
                 row = messages_df.iloc[i]
                 is_audio = is_audio_msg(row.get("msg_type"), row.get("message"))
+                is_sticker = is_sticker_msg(row.get("msg_type"), row.get("message"))
                 is_image = is_image_msg(row.get("msg_type"), row.get("message"))
                 text = get_msg_display_text(i)
                 msg_type_val = row.get("msg_type")
                 rows_history.append({
                     "Time": format_ts_local(row["sent_at"]),
                     "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
-                    "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_template(row.get("message"))),
+                    "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_template(row.get("message"))),
                     "Message": text,
                     "Message (EN)": translate_to_english(text),
                 })
