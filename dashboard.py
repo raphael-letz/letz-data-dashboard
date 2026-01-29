@@ -2718,8 +2718,6 @@ with tab2:
 # Tab 3: User Retention
 with tab3:
     st.markdown("### 📈 User Retention by Weekly Cohort")
-    st.caption("Track how many users from each weekly cohort remain active over time. Retention is calculated as active users divided by the original cohort size.")
-    st.info("ℹ️ **Note:** This data excludes internal users for accurate user behavior metrics.")
     
     # Load internal users from JSON file
     try:
@@ -2743,7 +2741,7 @@ with tab3:
     
     # Build the retention query
     internal_waids_str = "', '".join(internal_waids)
-    
+
     retention_query = f"""
 WITH internal_waids AS (
   SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
@@ -3024,6 +3022,76 @@ FROM user_days_active
             col3.metric("Avg 7d Retention", f"{avg_7d_retention:.1f}%" if avg_7d_retention is not None and not pd.isna(avg_7d_retention) else "N/A")
             col4.metric("Avg Days Active", f"{avg_days_active_summary:.1f}" if avg_days_active_summary is not None and not pd.isna(avg_days_active_summary) else "N/A")
             col5.metric("Median Days Active", f"{median_days_active_summary:.1f}" if median_days_active_summary is not None and not pd.isna(median_days_active_summary) else "N/A")
+            
+            # Quick overview: three tables (most active / most inactive / new users)
+            try:
+                overview_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+product_users AS (
+  SELECT id, full_name, waid
+  FROM users
+  WHERE waid NOT IN (SELECT waid FROM internal_waids)
+),
+user_messages AS (
+  SELECT
+    u.id AS user_id,
+    u.full_name,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
+  WHERE m.sender = 'user'
+),
+user_first_last AS (
+  SELECT
+    user_id,
+    full_name,
+    MIN(local_date) AS first_active_date,
+    MAX(local_date) AS last_active_date
+  FROM user_messages
+  GROUP BY user_id, full_name
+),
+user_days_count AS (
+  SELECT user_id, COUNT(DISTINCT local_date)::int AS active_days
+  FROM user_messages
+  GROUP BY user_id
+),
+user_stats AS (
+  SELECT
+    ufl.user_id,
+    ufl.full_name,
+    (ufl.last_active_date - ufl.first_active_date) + 1 AS lifetime,
+    udc.active_days
+  FROM user_first_last ufl
+  JOIN user_days_count udc ON udc.user_id = ufl.user_id
+)
+SELECT user_id, full_name, lifetime, active_days FROM user_stats ORDER BY full_name
+"""
+                overview_df = run_query(overview_query)
+                if not overview_df.empty:
+                    established = overview_df[overview_df['lifetime'] >= 7].copy()
+                    new_users = overview_df[overview_df['lifetime'] < 7].copy()
+                    most_active = established.sort_values('active_days', ascending=False)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_active.columns = ['Name', 'Active days', 'Lifetime (days)']
+                    most_inactive = established.sort_values('active_days', ascending=True)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_inactive.columns = ['Name', 'Active days', 'Lifetime (days)']
+                    new_users_display = new_users.sort_values('active_days', ascending=False)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
+                    new_users_display.columns = ['Name', 'Active days', 'Lifetime (days)']
+                    st.markdown("#### Quick overview")
+                    st.caption("Established = in product 7+ days.")
+                    t1, t2, t3 = st.columns(3)
+                    with t1:
+                        st.markdown("**Most active** (established)")
+                        st.dataframe(most_active, use_container_width=True, hide_index=True)
+                    with t2:
+                        st.markdown("**Most inactive** (established)")
+                        st.dataframe(most_inactive, use_container_width=True, hide_index=True)
+                    with t3:
+                        st.markdown("**New users** (< 7 days)")
+                        st.dataframe(new_users_display, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
             
             st.markdown("---")
             
