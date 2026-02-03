@@ -299,6 +299,225 @@ def get_internal_users_filter_join_sql(exclude_internal: bool = True, table_alia
     return f"AND {table_alias}.waid NOT IN ('{internal_waids_str}')"
 
 
+@st.cache_data(ttl=300)
+def get_message_delivery_detail() -> pd.DataFrame:
+    """
+    Message delivery (due vs received) for today, yesterday, day-before in America/Sao_Paulo.
+    One row per (user, ref_date) with due_morning/evening, received_morning/evening, missed_morning/evening.
+    Follows analysis/.context/dashboard-message-delivery-instructions.md.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+
+    query = f"""
+WITH ref_dates AS (
+  SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) AS ref_date, 'today' AS period
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 1, 'yesterday'
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 2, 'day_before'
+),
+internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+grid AS (
+  SELECT u.id, u.waid, u.full_name, u.check_in_time, u.daily_digest_time, u.timezone, u.skip_check_in, u.skip_daily_digest,
+    r.ref_date, r.period,
+    ((r.ref_date + u.check_in_time)::timestamp AT TIME ZONE COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC')) AS check_in_utc,
+    ((r.ref_date + u.daily_digest_time)::timestamp AT TIME ZONE COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC')) AS digest_utc
+  FROM users u
+  CROSS JOIN ref_dates r
+  WHERE u.is_active = true AND u.onboarding_timestamp IS NOT NULL
+  AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  AND NOT EXISTS (
+    SELECT 1 FROM reschedule rs
+    WHERE rs.user_id = u.id
+    AND rs.start_time < ((r.ref_date + 1)::timestamp AT TIME ZONE COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC'))
+    AND rs.end_time > (r.ref_date::timestamp AT TIME ZONE COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC'))
+  )
+),
+last_user AS (
+  SELECT g.*,
+    (SELECT MAX(m.sent_at) FROM messages m WHERE (m.user_id = g.id OR m.waid = g.waid) AND m.sender = 'user' AND m.sent_at <= g.check_in_utc) AS last_user_checkin,
+    (SELECT MAX(m.sent_at) FROM messages m WHERE (m.user_id = g.id OR m.waid = g.waid) AND m.sender = 'user' AND m.sent_at <= g.digest_utc) AS last_user_digest
+  FROM grid g
+),
+activity AS (
+  SELECT lu.*,
+    EXISTS (
+      SELECT 1 FROM user_activities ua
+      WHERE ua.user_id = lu.id AND ua.in_progress = true
+      AND ua.days @> to_jsonb(trim(to_char(lu.ref_date, 'Day'))::text)
+    ) AS has_activity
+  FROM last_user lu
+),
+afk AS (
+  SELECT a.*,
+    (a.last_user_checkin IS NULL OR a.last_user_checkin < a.check_in_utc - interval '24 hours') AS afk_24h_checkin,
+    (a.last_user_digest IS NULL OR a.last_user_digest < a.digest_utc - interval '24 hours') AS afk_24h_digest,
+    (a.last_user_checkin >= a.check_in_utc - interval '48 hours' AND a.last_user_checkin < a.check_in_utc - interval '24 hours') AS in_24_48h_checkin
+  FROM activity a
+),
+due_flags AS (
+  SELECT af.*,
+    (af.has_activity AND NOT COALESCE(af.skip_check_in, false) AND ( (NOT af.afk_24h_checkin) OR (af.afk_24h_checkin AND af.in_24_48h_checkin) )) AS due_morning,
+    (af.has_activity AND NOT COALESCE(af.skip_daily_digest, false) AND NOT (af.afk_24h_checkin AND af.in_24_48h_checkin) AND NOT af.afk_24h_digest) AS due_evening
+  FROM afk af
+),
+received AS (
+  SELECT d.*,
+    EXISTS (SELECT 1 FROM messages m WHERE (m.user_id = d.id OR m.waid = d.waid) AND m.sender = 'companion' AND m.sent_at >= d.check_in_utc - interval '1 hour' AND m.sent_at < d.check_in_utc + interval '1 hour') AS received_morning,
+    EXISTS (SELECT 1 FROM messages m WHERE (m.user_id = d.id OR m.waid = d.waid) AND m.sender = 'companion' AND m.sent_at >= d.digest_utc - interval '1 hour' AND m.sent_at < d.digest_utc + interval '1 hour') AS received_evening
+  FROM due_flags d
+)
+SELECT
+  TO_CHAR(r.ref_date, 'YYYY-MM-DD') AS ref_date,
+  r.period,
+  r.check_in_time,
+  r.daily_digest_time,
+  r.id AS user_id,
+  r.waid,
+  r.full_name,
+  r.due_morning,
+  r.due_evening,
+  r.received_morning,
+  r.received_evening,
+  (r.due_morning AND NOT r.received_morning AND (r.period <> 'today' OR CURRENT_TIMESTAMP > r.check_in_utc + interval '10 minutes')) AS missed_morning,
+  (r.due_evening AND NOT r.received_evening AND (r.period <> 'today' OR CURRENT_TIMESTAMP > r.digest_utc + interval '10 minutes')) AS missed_evening
+FROM received r
+ORDER BY r.ref_date, r.check_in_time, r.full_name;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_onboarding_dropoff_detail() -> pd.DataFrame:
+    """
+    Onboarding drop-off for today, yesterday, day_before in America/Sao_Paulo.
+    Two issue types: dropped_off_onboarding (messaged but no onboarding_completed), no_slogan (onboarded but no slogan set).
+    Returns ref_date, period, waid, full_name (null for drop-off), issue_type. Excludes internal users.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+
+    query = f"""
+WITH ref_dates AS (
+  SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) AS ref_date, 'today' AS period
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 1, 'yesterday'
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 2, 'day_before'
+),
+internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+-- Dropped off at onboarding: messaged on ref_date but (no user row or onboarding_timestamp IS NULL); onboarding_started = first user message
+dropped_off AS (
+  SELECT
+    r.ref_date,
+    r.period,
+    m.waid,
+    NULL::varchar AS full_name,
+    'dropped_off_onboarding' AS issue_type,
+    (SELECT MIN(m2.sent_at) FROM messages m2 WHERE m2.waid = m.waid AND m2.sender = 'user') AS onboarding_started_at,
+    NULL::timestamptz AS onboarding_completed_at,
+    COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC') AS user_timezone
+  FROM messages m
+  CROSS JOIN ref_dates r
+  LEFT JOIN users u ON (u.waid = m.waid OR (m.user_id IS NOT NULL AND u.id = m.user_id))
+  WHERE m.sender = 'user'
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = r.ref_date
+    AND (u.id IS NULL OR u.onboarding_timestamp IS NULL)
+    AND m.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY r.ref_date, r.period, m.waid, u.timezone
+),
+-- No slogan: onboarded (onboarding_timestamp IS NOT NULL) but no post_onboarding slogan set; messaged on ref_date
+no_slogan AS (
+  SELECT DISTINCT
+    r.ref_date,
+    r.period,
+    u.waid,
+    u.full_name,
+    'no_slogan' AS issue_type,
+    NULL::timestamptz AS onboarding_started_at,
+    u.onboarding_timestamp AS onboarding_completed_at,
+    COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC') AS user_timezone
+  FROM users u
+  CROSS JOIN ref_dates r
+  WHERE u.onboarding_timestamp IS NOT NULL
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+    AND NOT EXISTS (
+      SELECT 1 FROM ai_companion_flows acf
+      WHERE acf.user_id = u.id AND acf.type = 'post_onboarding'
+        AND acf.content->>'slogan' IS NOT NULL
+    )
+    AND EXISTS (
+      SELECT 1 FROM messages m
+      WHERE (m.user_id = u.id OR m.waid = u.waid)
+        AND m.sender = 'user'
+        AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = r.ref_date
+    )
+)
+SELECT TO_CHAR(d.ref_date, 'YYYY-MM-DD') AS ref_date, d.period, d.waid, d.full_name, d.issue_type,
+  d.onboarding_started_at,
+  d.onboarding_completed_at,
+  d.user_timezone
+FROM dropped_off d
+UNION ALL
+SELECT TO_CHAR(n.ref_date, 'YYYY-MM-DD') AS ref_date, n.period, n.waid, n.full_name, n.issue_type,
+  n.onboarding_started_at,
+  n.onboarding_completed_at,
+  n.user_timezone
+FROM no_slogan n
+ORDER BY ref_date, issue_type, waid;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_pending_reply_detail() -> pd.DataFrame:
+    """
+    Users whose last message has not received a companion reply within 1 hour.
+    Once they receive a reply, they drop off this list. Returns waid, full_name, last_sent_at, last_message (raw).
+    Excludes internal users.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+last_user_msg AS (
+  SELECT DISTINCT ON (m.waid)
+    m.waid,
+    m.user_id,
+    m.sent_at AS last_sent_at,
+    m.message AS last_message
+  FROM messages m
+  WHERE m.sender = 'user'
+    AND m.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  ORDER BY m.waid, m.sent_at DESC
+),
+no_reply_after AS (
+  SELECT lum.waid, lum.user_id, lum.last_sent_at, lum.last_message
+  FROM last_user_msg lum
+  WHERE NOT EXISTS (
+    SELECT 1 FROM messages m2
+    WHERE m2.sender = 'companion'
+      AND (m2.waid = lum.waid OR (lum.user_id IS NOT NULL AND m2.user_id = lum.user_id))
+      AND m2.sent_at > lum.last_sent_at
+  )
+  AND (CURRENT_TIMESTAMP - lum.last_sent_at) > interval '1 hour'
+)
+SELECT
+  n.waid,
+  COALESCE(u.full_name, '—') AS full_name,
+  n.last_sent_at,
+  n.last_message
+FROM no_reply_after n
+LEFT JOIN users u ON (u.waid = n.waid OR (n.user_id IS NOT NULL AND u.id = n.user_id))
+ORDER BY n.last_sent_at ASC;
+"""
+    return run_query(query)
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -327,6 +546,123 @@ def is_template(raw_msg) -> bool:
     except Exception:
         return False
     return False
+
+
+def _extract_message_text_snippet(raw_msg, max_len=120):
+    """Extract readable text from message JSON for display; return truncated snippet."""
+    if pd.isna(raw_msg) or raw_msg is None:
+        return ""
+    msg_str = str(raw_msg).strip()
+    try:
+        data = json.loads(msg_str)
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                pass
+    except Exception:
+        return (msg_str[:max_len] + "…") if len(msg_str) > max_len else msg_str
+
+    def find_text(obj, depth=0):
+        if depth > 8 or obj is None:
+            return None
+        if isinstance(obj, str) and len(obj) > 2:
+            return obj
+        if isinstance(obj, dict):
+            for key in ["text", "body", "title", "message", "content", "caption", "label", "description", "value"]:
+                if key in obj:
+                    val = obj[key]
+                    if isinstance(val, str) and len(val) > 2:
+                        return val
+                    found = find_text(val, depth + 1)
+                    if found:
+                        return found
+            for val in obj.values():
+                if isinstance(val, (dict, list, str)):
+                    found = find_text(val, depth + 1)
+                    if found:
+                        return found
+        if isinstance(obj, list):
+            for item in obj:
+                found = find_text(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    found = None
+    if isinstance(data, dict):
+        for key in ["interactive", "postback", "template", "flows", "quickReply"]:
+            if key in data:
+                found = find_text(data[key])
+                if found:
+                    break
+        if not found:
+            found = find_text(data)
+    else:
+        found = find_text(data) if data is not None else None
+    if not found and isinstance(data, str) and len(data) > 2:
+        found = data
+    text = (found or msg_str).strip()
+    return (text[:max_len] + "…") if len(text) > max_len else text
+
+
+def _parse_timezone(tz_str):
+    """Parse timezone string like 'UTC-3', '-3', 'America/Sao_Paulo' to a tzinfo."""
+    if not tz_str or pd.isna(tz_str):
+        return None
+    tz_str = str(tz_str).strip()
+    try:
+        return pytz.timezone(tz_str)
+    except Exception:
+        pass
+    match = re.search(r"([+-]?)(\d{1,2})(?::(\d{2}))?", tz_str)
+    if match:
+        if "UTC-" in tz_str or "GMT-" in tz_str or tz_str.startswith("-"):
+            sign = -1
+        elif "UTC+" in tz_str or "GMT+" in tz_str or tz_str.startswith("+"):
+            sign = 1
+        else:
+            sign = -1 if match.group(1) == "-" else 1
+        hours = int(match.group(2)) * sign
+        minutes = int(match.group(3) or 0)
+        return timezone(timedelta(hours=hours, minutes=minutes))
+    return None
+
+
+def _format_ts_local(ts, tz_str, fmt="%Y-%m-%d %H:%M"):
+    """Format a UTC timestamp in the user's local timezone."""
+    if pd.isna(ts):
+        return "—"
+    try:
+        t = pd.to_datetime(ts, utc=True)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        user_tz = _parse_timezone(tz_str)
+        if user_tz is not None:
+            t = t.tz_convert(user_tz)
+            return t.strftime(fmt)
+        return t.strftime(fmt) + " UTC"
+    except Exception:
+        return str(ts)[:16] if ts is not None else "—"
+
+
+def _format_pending_duration(delta):
+    """Format a timedelta as e.g. '2h 15m' or '45m' for reply-pending display."""
+    if delta is None or (hasattr(delta, "total_seconds") and delta.total_seconds() <= 0):
+        return "—"
+    total_secs = int(delta.total_seconds()) if hasattr(delta, "total_seconds") else int(delta)
+    if total_secs < 60:
+        return "<1m"
+    mins, secs = divmod(total_secs, 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hrs:
+        parts.append(f"{hrs}h")
+    parts.append(f"{mins}m")
+    return " ".join(parts)
 
 
 # =============================================================================
@@ -575,14 +911,31 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
-    auto_refresh = st.checkbox("Auto-refresh (60s)", value=False)
-    
-    if auto_refresh:
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
         st.cache_resource.clear()
+        st.rerun()
 
+
+# Alerts badge: count users with missed morning/evening today (message delivery)
+try:
+    _delivery_df = get_message_delivery_detail()
+    _today_missed = _delivery_df[
+        (_delivery_df["period"] == "today")
+        & (_delivery_df["missed_morning"] | _delivery_df["missed_evening"])
+    ]
+    _alert_count = len(_today_missed)
+except Exception:
+    _alert_count = 0
+_alert_label = "🔔 Alerts" + (f" ({_alert_count})" if _alert_count else "")
 
 # Main content tabs
-tab1, tab2, tab3 = st.tabs(["📊 Quick Insights", "🔍 User Deep Dive", "📈 User Retention"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Quick Insights",
+    "🔍 User Deep Dive",
+    "📈 User Retention",
+    _alert_label,
+])
 
 
 # Tab 1: Quick Insights
@@ -3422,6 +3775,174 @@ ORDER BY cohort_week_start DESC
     except Exception as e:
         st.error(f"Error loading retention data: {e}")
         st.exception(e)
+
+
+# Tab 4: Alerts (message delivery + future: onboarding drop-off)
+with tab4:
+    st.markdown("### 🔔 Alerts")
+
+    try:
+        delivery_df = get_message_delivery_detail()
+    except Exception as e:
+        delivery_df = pd.DataFrame()
+        st.error(f"Could not load message delivery data: {e}")
+
+    if not delivery_df.empty:
+        # Load onboarding drop-off for alert counts in date selector
+        try:
+            _onboarding_df = get_onboarding_dropoff_detail()
+        except Exception:
+            _onboarding_df = pd.DataFrame()
+
+        # Date selector: today / yesterday / day_before (with alert count per date)
+        periods = [
+            ("today", "Today"),
+            ("yesterday", "Yesterday"),
+            ("day_before", "Day before yesterday"),
+        ]
+        period_options = [p[1] for p in periods]
+        period_keys = [p[0] for p in periods]
+        ref_dates_in_df = delivery_df.groupby("period").agg({"ref_date": "first"}).to_dict().get("ref_date", {})
+        labels_date_only = []  # e.g. "Today (2026-02-03)" — used in body text
+        labels_with_dates = []  # same + " — N alerts" — used in radio only
+        for key, label in periods:
+            d = ref_dates_in_df.get(key, "")
+            date_only_str = f"{label}" + (f" ({d})" if d else "")
+            labels_date_only.append(date_only_str)
+            msg_missed = int(
+                delivery_df.loc[delivery_df["period"] == key, "missed_morning"].sum()
+                + delivery_df.loc[delivery_df["period"] == key, "missed_evening"].sum()
+            )
+            onb_count = len(_onboarding_df[_onboarding_df["period"] == key]) if not _onboarding_df.empty else 0
+            total_alerts = msg_missed + onb_count
+            labels_with_dates.append(date_only_str + f" — {total_alerts} alert{'s' if total_alerts != 1 else ''}")
+        selected_idx = st.radio(
+            "**Select date**",
+            range(len(labels_with_dates)),
+            format_func=lambda i: labels_with_dates[i],
+            horizontal=True,
+            key="alerts_date_radio",
+        )
+        selected_period = period_keys[selected_idx]
+        selected_ref_date = ref_dates_in_df.get(selected_period, "")
+
+        df_day = delivery_df[delivery_df["period"] == selected_period].copy()
+        missed_count = int(df_day["missed_morning"].sum() + df_day["missed_evening"].sum())
+        date_label = labels_date_only[selected_idx]  # date only, no alert count (for body text)
+
+        if missed_count == 0:
+            st.success(f"✅ No missed messages for **{date_label}**.")
+        else:
+            st.info(f"**{missed_count} message(s) missed** for **{date_label}**.")
+
+        st.markdown(f"#### 📬 Message delivery — {date_label}")
+        # One row per (time, slot): Time | Slot | Due | Missed | Users (always show table for verification)
+        df_day["time_morning"] = df_day["check_in_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
+        df_day["time_evening"] = df_day["daily_digest_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
+        morning = df_day.groupby("time_morning").agg(
+            due=("due_morning", "sum"),
+            missed=("missed_morning", "sum"),
+        ).reset_index()
+        morning["slot"] = "Morning"
+        morning_names = df_day[df_day["missed_morning"]].groupby("time_morning")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        morning_names.columns = ["time_morning", "users"]
+        morning = morning.merge(morning_names, on="time_morning", how="left")
+        morning["users"] = morning["users"].fillna("").astype(str)
+        evening = df_day.groupby("time_evening").agg(
+            due=("due_evening", "sum"),
+            missed=("missed_evening", "sum"),
+        ).reset_index()
+        evening["slot"] = "Evening"
+        evening_names = df_day[df_day["missed_evening"]].groupby("time_evening")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        evening_names.columns = ["time_evening", "users"]
+        evening = evening.merge(evening_names, on="time_evening", how="left")
+        evening["users"] = evening["users"].fillna("").astype(str)
+        table = pd.concat([
+            morning.rename(columns={"time_morning": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
+            evening.rename(columns={"time_evening": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
+        ], ignore_index=True)
+        table = table.sort_values(["check-in time", "slot"])
+        st.markdown("**By check-in time**")
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+        # Reply pending > 1hr: users whose last message has no companion reply and > 1hr ago
+        st.markdown("---")
+        st.markdown("### ⏳ Reply pending > 1hr")
+        st.caption("Users who sent a message and have not received a reply within 1 hour. Resets once they get a reply.")
+
+        try:
+            pending_df = get_pending_reply_detail()
+        except Exception as e:
+            pending_df = pd.DataFrame()
+            st.error(f"Could not load pending-reply data: {e}")
+
+        if pending_df.empty:
+            st.success("✅ No users waiting for a reply > 1hr.")
+        else:
+            st.info(f"**{len(pending_df)} user(s)** waiting for a reply > 1hr.")
+        if not pending_df.empty:
+            now_utc = pd.Timestamp.utcnow()
+            pending_display = pending_df[["waid", "full_name", "last_sent_at", "last_message"]].copy()
+            pending_display["last message"] = pending_display["last_message"].apply(
+                lambda m: _extract_message_text_snippet(m, max_len=100)
+            )
+            pending_display["reply pending"] = pd.to_datetime(pending_display["last_sent_at"], utc=True).apply(
+                lambda t: _format_pending_duration(now_utc - t) if pd.notna(t) else "—"
+            )
+            pending_display["last message at"] = pd.to_datetime(pending_display["last_sent_at"], utc=True).apply(
+                lambda t: t.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(t) else "—"
+            )
+            st.dataframe(
+                pending_display[["waid", "full_name", "last message at", "last message", "reply pending"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # Onboarding drop-off (same date selector; reuse _onboarding_df from date selector)
+        st.markdown("---")
+        st.markdown("### 🚪 Onboarding drop-off")
+        st.caption("Users who messaged on the selected date but dropped off at onboarding (WAID only), or completed onboarding but didn't set a slogan.")
+
+        onboarding_df = _onboarding_df if not _onboarding_df.empty else pd.DataFrame()
+        if not onboarding_df.empty:
+            od_day = onboarding_df[onboarding_df["period"] == selected_period].copy()
+            dropped = od_day[od_day["issue_type"] == "dropped_off_onboarding"]
+            no_slogan = od_day[od_day["issue_type"] == "no_slogan"]
+            n_dropped = len(dropped)
+            n_slogan = len(no_slogan)
+
+            if n_dropped == 0:
+                st.success(f"✅ No users dropped off at onboarding for **{date_label}**.")
+            else:
+                st.info(f"**{n_dropped} user(s) dropped off at onboarding** for **{date_label}** (messaged but did not complete onboarding).")
+            st.markdown("**Dropped off at onboarding** (WAID, onboarding started = first user message)")
+            if dropped.empty:
+                st.caption("None")
+            else:
+                dropped_display = dropped[["waid", "onboarding_started_at", "user_timezone"]].copy()
+                dropped_display["onboarding started"] = dropped_display.apply(
+                    lambda row: _format_ts_local(row["onboarding_started_at"], row["user_timezone"]), axis=1
+                )
+                st.dataframe(dropped_display[["waid", "onboarding started"]], use_container_width=True, hide_index=True)
+
+            if n_slogan == 0:
+                st.success(f"✅ No users without slogan for **{date_label}**.")
+            else:
+                st.info(f"**{n_slogan} user(s) without slogan** for **{date_label}**.")
+            st.markdown("**Didn't set slogan** (onboarded but no slogan in post_onboarding flow)")
+            if no_slogan.empty:
+                st.caption("None")
+            else:
+                slogan_display = no_slogan[["waid", "full_name", "onboarding_completed_at", "user_timezone"]].copy()
+                slogan_display["onboarding completed"] = slogan_display.apply(
+                    lambda row: _format_ts_local(row["onboarding_completed_at"], row["user_timezone"]), axis=1
+                )
+                st.dataframe(slogan_display[["waid", "full_name", "onboarding completed"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("No onboarding drop-off data available.")
+
+    else:
+        st.info("No message delivery data available. Check database connection and that users/messages/reschedule tables exist.")
 
 
 # Footer

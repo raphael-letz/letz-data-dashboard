@@ -139,14 +139,12 @@ headless = true                 # Required for cloud deployment
 
 ### Authentication
 
-The dashboard has basic password protection (session-based). Credentials are hardcoded in `dashboard.py`:
+The dashboard has basic password protection (session-based). Credentials are **not** stored in code. Set them via:
 
-```python
-AUTH_USERNAME = "admin"
-AUTH_PASSWORD = "letzdoit2026!"
-```
+- **Streamlit Cloud:** App settings → Secrets → add `AUTH_USERNAME` and `AUTH_PASSWORD`
+- **Local:** add `AUTH_USERNAME` and `AUTH_PASSWORD` to your `.env` file
 
-To change, edit these values directly. For production, consider moving to `st.secrets` or environment variables.
+Never commit credentials to the repo.
 
 ---
 
@@ -231,7 +229,7 @@ Users may have duplicate rows in the database. All queries use `COUNT(DISTINCT w
 
 - **Never commit `.env` or `.streamlit/secrets.toml`** — both are in `.gitignore`
 - Database credentials should only be stored in environment variables or Streamlit secrets
-- The hardcoded auth credentials in `dashboard.py` are for basic access control; consider stronger auth for sensitive data
+- Auth is loaded from Streamlit secrets or `.env` only (never hardcoded); consider stronger auth for sensitive data
 
 ---
 
