@@ -3482,6 +3482,10 @@ user_first_last AS (
   FROM user_messages
   GROUP BY user_id, full_name
 ),
+-- "Today" in same timezone as local_date (America/Sao_Paulo) for consistent lifetime
+today_local AS (
+  SELECT ((NOW() AT TIME ZONE 'America/Sao_Paulo')::date) AS d
+),
 user_days_count AS (
   SELECT user_id, COUNT(DISTINCT local_date)::int AS active_days
   FROM user_messages
@@ -3491,9 +3495,10 @@ user_stats AS (
   SELECT
     ufl.user_id,
     ufl.full_name,
-    (ufl.last_active_date - ufl.first_active_date) + 1 AS lifetime,
+    (tl.d - ufl.first_active_date) AS lifetime,
     udc.active_days
   FROM user_first_last ufl
+  CROSS JOIN today_local tl
   JOIN user_days_count udc ON udc.user_id = ufl.user_id
 )
 SELECT user_id, full_name, lifetime, active_days FROM user_stats ORDER BY full_name
@@ -3509,7 +3514,7 @@ SELECT user_id, full_name, lifetime, active_days FROM user_stats ORDER BY full_n
                     new_users_display = new_users.sort_values('active_days', ascending=False)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
                     new_users_display.columns = ['Name', 'Active days', 'Lifetime (days)']
                     st.markdown("#### Quick overview")
-                    st.caption("Established = in product 7+ days.")
+                    st.caption("Lifetime (days) = days since first activity through today (São Paulo). Established = 7+ days; New users = under 7 days.")
                     t1, t2, t3 = st.columns(3)
                     with t1:
                         st.markdown("**Most active** (established)")

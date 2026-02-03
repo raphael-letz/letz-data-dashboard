@@ -223,6 +223,12 @@ The `messages.message` column contains nested JSON payloads. The dashboard recur
 ### User Deduplication
 Users may have duplicate rows in the database. All queries use `COUNT(DISTINCT waid)` or `DISTINCT ON (waid)` to ensure accurate counts.
 
+### User Retention tab — Lifetime and New users
+In the **User Retention** tab, **Lifetime (days)** is **days since first activity through today** (in São Paulo time), not the calendar span between first and last activity. So:
+- **New users (&lt; 7 days)**: users whose first message was fewer than 7 calendar days ago.
+- **Established (7+ days)**: users whose first message was at least 7 days ago.
+Spot checks: compute `today - first_active_date` in the same timezone (America/Sao_Paulo) and it should match the dashboard.
+
 ---
 
 ## Security Notes
