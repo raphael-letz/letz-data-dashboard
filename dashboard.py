@@ -392,7 +392,7 @@ ORDER BY r.ref_date, r.check_in_time, r.full_name;
 def get_onboarding_dropoff_detail() -> pd.DataFrame:
     """
     Onboarding drop-off for today, yesterday, day_before in America/Sao_Paulo.
-    Two issue types: dropped_off_onboarding (messaged but no onboarding_completed), no_slogan (onboarded but no slogan set).
+    Two issue types: dropped_off_onboarding (messaged but no onboarding_completed), no_slogan (completed onboarding on ref_date but no slogan set).
     Returns ref_date, period, waid, full_name (null for drop-off), issue_type. Excludes internal users.
     """
     internal_waids = load_internal_users()
@@ -427,7 +427,7 @@ dropped_off AS (
     AND m.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
   GROUP BY r.ref_date, r.period, m.waid, u.timezone
 ),
--- No slogan: onboarded (onboarding_timestamp IS NOT NULL) but no post_onboarding slogan set; messaged on ref_date
+-- No slogan: completed onboarding on ref_date but no post_onboarding slogan set (not just active on ref_date)
 no_slogan AS (
   SELECT DISTINCT
     r.ref_date,
@@ -441,17 +441,12 @@ no_slogan AS (
   FROM users u
   CROSS JOIN ref_dates r
   WHERE u.onboarding_timestamp IS NOT NULL
+    AND (u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo')::date = r.ref_date
     AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
     AND NOT EXISTS (
       SELECT 1 FROM ai_companion_flows acf
       WHERE acf.user_id = u.id AND acf.type = 'post_onboarding'
         AND acf.content->>'slogan' IS NOT NULL
-    )
-    AND EXISTS (
-      SELECT 1 FROM messages m
-      WHERE (m.user_id = u.id OR m.waid = u.waid)
-        AND m.sender = 'user'
-        AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = r.ref_date
     )
 )
 SELECT TO_CHAR(d.ref_date, 'YYYY-MM-DD') AS ref_date, d.period, d.waid, d.full_name, d.issue_type,
@@ -1167,13 +1162,27 @@ with tab1:
     st.markdown("### 🎯 User Journey Progress")
     
     try:
-        # Get total unique users count (deduplicated by waid)
+        # Get total unique users count (deduplicated by waid) — used for slogan, activity, settings, etc.
         internal_filter = get_internal_users_filter_sql(exclude_internal)
         total_users_query = f"SELECT COUNT(DISTINCT waid) as total FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as total FROM users"
         total_users_result = run_query(total_users_query)
         total_users = total_users_result['total'].iloc[0] if not total_users_result.empty else 0
+
+        # All known WAIDs (messages OR users) — used for "Completed Onboarding %" so we include users who only exist in messages (not yet onboarded)
+        all_waids_query = """
+            WITH all_waids AS (
+                SELECT waid FROM messages WHERE sender = 'user'
+                UNION
+                SELECT waid FROM users
+            )
+            SELECT COUNT(DISTINCT waid) AS total FROM all_waids
+        """
+        if internal_filter:
+            all_waids_query = all_waids_query.rstrip() + " " + internal_filter
+        total_known_waids_result = run_query(all_waids_query)
+        total_known_waids = total_known_waids_result['total'].iloc[0] if not total_known_waids_result.empty else 0
         
-        if total_users > 0:
+        if total_users > 0 or total_known_waids > 0:
             # Get counts for each journey milestone from events table (unique users per event_type)
             internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
             if exclude_internal and internal_filter_join:
@@ -1285,11 +1294,11 @@ with tab1:
                 """)
             image_users_count = image_users_result['count'].iloc[0] if not image_users_result.empty else 0
             
-            # Calculate percentages
-            onboarding_pct = round(100 * stats_dict.get('onboarding_completed', 0) / total_users, 1)
-            slogan_pct = round(100 * added_slogan_count / total_users, 1)
-            activity_pct = round(100 * completed_activities_count / total_users, 1)
-            settings_pct = round(100 * stats_dict.get('settings_updated', 0) / total_users, 1)
+            # Calculate percentages (onboarding % uses all known WAIDs so it can be < 100%; others use users table)
+            onboarding_pct = round(100 * stats_dict.get('onboarding_completed', 0) / total_known_waids, 1) if total_known_waids else 0
+            slogan_pct = round(100 * added_slogan_count / total_users, 1) if total_users else 0
+            activity_pct = round(100 * completed_activities_count / total_users, 1) if total_users else 0
+            settings_pct = round(100 * stats_dict.get('settings_updated', 0) / total_users, 1) if total_users else 0
             audio_pct = round(100 * audio_users_count / total_users, 1) if total_users else 0
             image_pct = round(100 * image_users_count / total_users, 1) if total_users else 0
             
@@ -1298,7 +1307,7 @@ with tab1:
             jcol1.metric(
                 "✅ Completed Onboarding", 
                 f"{onboarding_pct}%",
-                f"{stats_dict.get('onboarding_completed', 0)} users"
+                f"{stats_dict.get('onboarding_completed', 0)} of {total_known_waids} users"
             )
             jcol2.metric(
                 "💬 Added Slogan", 
@@ -3929,7 +3938,7 @@ with tab4:
                 st.success(f"✅ No users without slogan for **{date_label}**.")
             else:
                 st.info(f"**{n_slogan} user(s) without slogan** for **{date_label}**.")
-            st.markdown("**Didn't set slogan** (onboarded but no slogan in post_onboarding flow)")
+            st.markdown("**Didn't set slogan** (completed onboarding on selected day but no slogan in post_onboarding flow)")
             if no_slogan.empty:
                 st.caption("None")
             else:
