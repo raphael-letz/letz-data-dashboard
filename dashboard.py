@@ -956,140 +956,79 @@ with tab1:
     
     st.markdown("---")
     
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-    
-    # Try to get quick stats (all deduplicated by waid)
+    # Headline: Total / Alive / Inactive (all by waid, with internal filter)
+    internal_filter = get_internal_users_filter_sql(exclude_internal)
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    extra = (" " + internal_filter.replace("WHERE ", "AND ", 1)) if internal_filter else ""
     try:
-        # User count (unique waids)
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        user_count_query = f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users"
-        user_count_df = run_query(user_count_query)
-        total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
-        if user_count_df is not None and not user_count_df.empty:
-            col1.metric("Total Users", total_users_count)
-        else:
-            col1.metric("Total Users", "—")
-    except:
-        col1.metric("Total Users", "—")
-    
+        total_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users")
+        total_users_count = total_df['count'].iloc[0] if not total_df.empty else 0
+        alive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = true{extra}")
+        alive_count = alive_df['count'].iloc[0] if not alive_df.empty else 0
+        inactive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = false{extra}")
+        inactive_count = inactive_df['count'].iloc[0] if not inactive_df.empty else 0
+    except Exception:
+        total_users_count = alive_count = inactive_count = 0
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total users", total_users_count if total_users_count else "—")
+    col2.metric("Alive users", alive_count if alive_count is not None else "—")
+    col3.metric("Inactive users", inactive_count if inactive_count is not None else "—")
+
+    # Row 2: Inside 24h, Messaged today, Active today — percentages only
+    today_day = datetime.utcnow().strftime("%A")
     try:
-        # Today's users (unique waids)
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        where_clause = "WHERE created_at >= CURRENT_DATE" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE"
-        today_users = run_query(f"""
-            SELECT COUNT(DISTINCT waid) as count FROM users 
-            {where_clause}
-        """)
-        if not today_users.empty:
-            col2.metric("New Today", today_users['count'].iloc[0])
-        else:
-            col2.metric("New Today", "—")
-    except:
-        col2.metric("New Today", "—")
-    
-    try:
-        # New users in rolling past 7 days (unique waids)
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        where_clause = "WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE - INTERVAL '7 days'"
-        week_users = run_query(f"""
-            SELECT COUNT(DISTINCT waid) as count FROM users 
-            {where_clause}
-        """)
-        if not week_users.empty:
-            col3.metric("New (past 7 days)", week_users['count'].iloc[0])
-        else:
-            col3.metric("New (past 7 days)", "—")
-    except:
-        col3.metric("New (past 7 days)", "—")
-    
-    try:
-        # Active today (unique waids who SENT a message today)
-        internal_filter = get_internal_users_filter_join_sql(exclude_internal, "u")
-        active_today = run_query(f"""
-            SELECT COUNT(DISTINCT u.waid) as count 
-            FROM messages m
-            JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at >= CURRENT_DATE 
-              AND m.user_id IS NOT NULL
-              AND m.sender = 'user'
-              {internal_filter}
-        """)
-        if not active_today.empty:
-            col4.metric("Active Today", active_today['count'].iloc[0])
-        else:
-            col4.metric("Active Today", "—")
-    except:
-        col4.metric("Active Today", "—")
-    
-    try:
-        # Users outside the 24h window based on last user message (sender='user')
-        if 'total_users_count' not in locals():
-            internal_filter = get_internal_users_filter_sql(exclude_internal)
-            user_count_query = f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users"
-            user_count_df = run_query(user_count_query)
-            total_users_count = user_count_df['count'].iloc[0] if not user_count_df.empty else 0
-        
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        active_24h_df = run_query(f"""
+        inside_24h_df = run_query(f"""
             SELECT COUNT(DISTINCT u.waid) as count
             FROM messages m
             JOIN users u ON m.user_id = u.id
-            WHERE m.sender = 'user'
+            WHERE u.is_active = true AND m.sender = 'user'
               AND m.sent_at >= NOW() - INTERVAL '24 hours'
               {internal_filter_join}
         """)
-        active_24h = active_24h_df['count'].iloc[0] if not active_24h_df.empty else 0
-        outside = max(total_users_count - active_24h, 0)
-        outside_pct = round(100 * outside / total_users_count, 1) if total_users_count > 0 else 0
-        col5.metric("% Outside 24h", f"{outside_pct}%", f"{outside} users")
-    except:
-        col5.metric("% Outside 24h", "—")
-    
+        inside_24h = inside_24h_df['count'].iloc[0] if not inside_24h_df.empty else 0
+        pct_inside_24h = round(100 * inside_24h / alive_count, 1) if alive_count else 0
+    except Exception:
+        pct_inside_24h = 0
     try:
-        # Templates Sent 24h - filter by internal users
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        if exclude_internal and internal_filter_join:
-            templates_24h_df = run_query(f"""
-                SELECT COUNT(*) as count
-                FROM recovery_logs r
-                JOIN users u ON r.user_id = u.id
-                WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
-                  {internal_filter_join}
-            """)
-        else:
-            templates_24h_df = run_query("""
-                SELECT COUNT(*) as count
-                FROM recovery_logs
-                WHERE sent_at >= NOW() - INTERVAL '24 hours'
-            """)
-        templates_24h = templates_24h_df['count'].iloc[0] if not templates_24h_df.empty else 0
-        col6.metric("Templates Sent 24h", templates_24h)
-    except:
-        col6.metric("Templates Sent 24h", "—")
-    
+        messaged_today_df = run_query(f"""
+            SELECT COUNT(DISTINCT u.waid) as count
+            FROM messages m
+            JOIN users u ON m.user_id = u.id
+            WHERE u.is_active = true AND m.sent_at >= CURRENT_DATE
+              AND m.user_id IS NOT NULL AND m.sender = 'user'
+              {internal_filter_join}
+        """)
+        messaged_today = messaged_today_df['count'].iloc[0] if not messaged_today_df.empty else 0
+        pct_messaged_today = round(100 * messaged_today / alive_count, 1) if alive_count else 0
+    except Exception:
+        pct_messaged_today = 0
     try:
-        # Users with Activities Scheduled Today - filter by internal users
-        today_day = datetime.utcnow().strftime("%A")
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        if exclude_internal and internal_filter_join:
-            activity_today_df = run_query(f"""
-                SELECT COUNT(DISTINCT ua.user_id) as count
-                FROM user_activities ua
-                JOIN users u ON ua.user_id = u.id
-                WHERE ua.days::jsonb ? '{today_day}'
-                  {internal_filter_join}
-            """)
-        else:
-            activity_today_df = run_query(f"""
-                SELECT COUNT(DISTINCT user_id) as count
-                FROM user_activities
-                WHERE days::jsonb ? '{today_day}'
-            """)
-        activity_today = activity_today_df['count'].iloc[0] if not activity_today_df.empty else 0
-        col7.metric("Users with Activities Scheduled Today", activity_today, today_day)
-    except:
-        col7.metric("Users with Activities Scheduled Today", "—")
-    
+        completed_today_df = run_query(f"""
+            SELECT COUNT(DISTINCT uah.user_id) as count
+            FROM user_activities_history uah
+            JOIN users u ON uah.user_id = u.id
+            WHERE uah.completed_at >= CURRENT_DATE AND uah.completed_at < CURRENT_DATE + INTERVAL '1 day'
+              {internal_filter_join}
+        """)
+        completed_today = completed_today_df['count'].iloc[0] if not completed_today_df.empty else 0
+        has_activity_today_df = run_query(f"""
+            SELECT COUNT(DISTINCT ua.user_id) as count
+            FROM user_activities ua
+            JOIN users u ON ua.user_id = u.id
+            WHERE ua.days::jsonb ? '{today_day}'
+              {internal_filter_join}
+        """)
+        has_activity_today = has_activity_today_df['count'].iloc[0] if not has_activity_today_df.empty else 0
+        pct_activity_complete = round(100 * completed_today / has_activity_today, 1) if has_activity_today else 0
+    except Exception:
+        pct_activity_complete = 0
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("% inside 24h", f"{pct_inside_24h}%")
+    c5.metric("Messaged today", f"{pct_messaged_today}%")
+    c6.metric("Active today", f"{pct_activity_complete}%")
+
     # Expandable simple lists for key metrics
     try:
         internal_filter = get_internal_users_filter_sql(exclude_internal)
@@ -1127,14 +1066,85 @@ with tab1:
             ORDER BY name
             LIMIT 200
         """)
-        with st.expander("Active Today - names"):
+        with st.expander("Messaged today"):
             if active_today_list.empty:
                 st.caption("No users")
             else:
                 for n in active_today_list['name']:
                     st.caption(f"• {n}")
     except:
-        st.warning("Could not load Active Today list")
+        st.warning("Could not load Messaged today list")
+    
+    # LLM pushes = proactive companion messages today (no user message in 2 min before, no template)
+    # Templates sent today = recovery_logs today
+    try:
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        llm_proactive_sub = """
+            AND NOT EXISTS (
+                SELECT 1 FROM messages m2
+                WHERE m2.sender = 'user'
+                  AND m2.sent_at < m.sent_at
+                  AND m2.sent_at >= m.sent_at - INTERVAL '2 minutes'
+                  AND (m2.user_id = m.user_id OR m2.waid = m.waid)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM recovery_logs r
+                WHERE r.user_id = m.user_id
+                  AND r.sent_at >= m.sent_at - INTERVAL '30 seconds'
+                  AND r.sent_at <= m.sent_at + INTERVAL '30 seconds'
+            )
+        """
+        if exclude_internal and internal_filter_join:
+            llm_pushes_today_df = run_query(f"""
+                SELECT COUNT(*) as count
+                FROM messages m
+                JOIN users u ON m.user_id = u.id
+                WHERE m.sender = 'companion'
+                  AND m.sent_at >= CURRENT_DATE AND m.sent_at < CURRENT_DATE + INTERVAL '1 day'
+                  {llm_proactive_sub}
+                  {internal_filter_join}
+            """)
+            templates_today_df = run_query(f"""
+                SELECT COUNT(*) as count
+                FROM recovery_logs r
+                JOIN users u ON r.user_id = u.id
+                WHERE r.sent_at >= CURRENT_DATE AND r.sent_at < CURRENT_DATE + INTERVAL '1 day'
+                  {internal_filter_join}
+            """)
+        else:
+            llm_pushes_today_df = run_query(f"""
+                SELECT COUNT(*) as count
+                FROM messages m
+                WHERE m.sender = 'companion'
+                  AND m.sent_at >= CURRENT_DATE AND m.sent_at < CURRENT_DATE + INTERVAL '1 day'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM messages m2
+                    WHERE m2.sender = 'user'
+                      AND m2.sent_at < m.sent_at
+                      AND m2.sent_at >= m.sent_at - INTERVAL '2 minutes'
+                      AND (m2.user_id = m.user_id OR m2.waid = m.waid)
+                  )
+                  AND (m.user_id IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM recovery_logs r
+                    WHERE r.user_id = m.user_id
+                      AND r.sent_at >= m.sent_at - INTERVAL '30 seconds'
+                      AND r.sent_at <= m.sent_at + INTERVAL '30 seconds'
+                  ))
+            """)
+            templates_today_df = run_query("""
+                SELECT COUNT(*) as count
+                FROM recovery_logs
+                WHERE sent_at >= CURRENT_DATE AND sent_at < CURRENT_DATE + INTERVAL '1 day'
+            """)
+        llm_pushes_today = llm_pushes_today_df['count'].iloc[0] if not llm_pushes_today_df.empty else 0
+        templates_today = templates_today_df['count'].iloc[0] if not templates_today_df.empty else 0
+        mcol1, mcol2 = st.columns(2)
+        mcol1.metric("LLM pushes sent today", llm_pushes_today)
+        mcol2.metric("Templates sent today", templates_today)
+    except Exception:
+        mcol1, mcol2 = st.columns(2)
+        mcol1.metric("LLM pushes sent today", "—")
+        mcol2.metric("Templates sent today", "—")
     
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
@@ -1158,17 +1168,25 @@ with tab1:
     except:
         st.warning("Could not load Templates 24h list")
     
-    # User Journey Stats
+    # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
     st.markdown("### 🎯 User Journey Progress")
-    
-    try:
-        # Get total unique users count (deduplicated by waid) — used for slogan, activity, settings, etc.
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        total_users_query = f"SELECT COUNT(DISTINCT waid) as total FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as total FROM users"
-        total_users_result = run_query(total_users_query)
-        total_users = total_users_result['total'].iloc[0] if not total_users_result.empty else 0
+    journey_7d = ">= NOW() - INTERVAL '7 days'"
+    journey_prev_7d_ev = ">= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days'"
 
-        # All known WAIDs (messages OR users) — used for "Completed Onboarding %" so we include users who only exist in messages (not yet onboarded)
+    try:
+        internal_filter = get_internal_users_filter_sql(exclude_internal)
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        # Denominators: period-specific so "last 7d" and "prev 7d" are comparable
+        # Users who existed at start of last 7d (had full 7 days to do the step)
+        extra_where = (" " + internal_filter.replace("WHERE ", "AND ", 1)) if internal_filter else ""
+        users_7d_ago_query = f"SELECT COUNT(DISTINCT waid) as total FROM users WHERE created_at < NOW() - INTERVAL '7 days'{extra_where}"
+        users_7d_ago_result = run_query(users_7d_ago_query)
+        total_users_7d_ago = users_7d_ago_result['total'].iloc[0] if not users_7d_ago_result.empty else 0
+        # Users who existed at start of prev 7d (had full 7 days in that window)
+        users_14d_ago_query = f"SELECT COUNT(DISTINCT waid) as total FROM users WHERE created_at < NOW() - INTERVAL '14 days'{extra_where}"
+        users_14d_ago_result = run_query(users_14d_ago_query)
+        total_users_14d_ago = users_14d_ago_result['total'].iloc[0] if not users_14d_ago_result.empty else 0
+        # Onboarding: use all-known waids (same for both periods so comparison is fair)
         all_waids_query = """
             WITH all_waids AS (
                 SELECT waid FROM messages WHERE sender = 'user'
@@ -1181,185 +1199,198 @@ with tab1:
             all_waids_query = all_waids_query.rstrip() + " " + internal_filter
         total_known_waids_result = run_query(all_waids_query)
         total_known_waids = total_known_waids_result['total'].iloc[0] if not total_known_waids_result.empty else 0
-        
-        if total_users > 0 or total_known_waids > 0:
-            # Get counts for each journey milestone from events table (unique users per event_type)
-            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+
+        def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
+            if better:
+                color = "#0d7d0d"
+            elif worse:
+                color = "#c52222"
+            else:
+                color = "#6b7280"
+            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
+
+        if (total_users_7d_ago > 0 or total_users_14d_ago > 0 or total_known_waids > 0):
+            # Onboarding (events.executed_at); denominator = total_known_waids
             if exclude_internal and internal_filter_join:
-                journey_stats = run_query(f"""
-                    SELECT 
-                        e.event_type,
-                        COUNT(DISTINCT e.user_id) as user_count
-                    FROM events e
+                ob_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
                     JOIN users u ON e.user_id = u.id
-                    WHERE e.event_type IN ('onboarding_completed', 'settings_updated')
-                      {internal_filter_join}
-                    GROUP BY e.event_type
+                    WHERE e.event_type = 'onboarding_completed' AND e.executed_at {journey_7d} {internal_filter_join}
+                """)
+                ob_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type = 'onboarding_completed' AND e.executed_at {journey_prev_7d_ev} {internal_filter_join}
                 """)
             else:
-                journey_stats = run_query("""
-                    SELECT 
-                        event_type,
-                        COUNT(DISTINCT user_id) as user_count
-                    FROM events
-                    WHERE event_type IN ('onboarding_completed', 'settings_updated')
-                    GROUP BY event_type
-                """)
-            
-            # Convert to dict for easy lookup
-            stats_dict = {}
-            if not journey_stats.empty:
-                for _, row in journey_stats.iterrows():
-                    stats_dict[row['event_type']] = row['user_count']
-            
-            # Get unique users who have added a slogan (from post_onboarding flow)
-            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+                ob_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'onboarding_completed' AND executed_at {journey_7d}")
+                ob_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'onboarding_completed' AND executed_at >= NOW() - INTERVAL '14 days' AND executed_at < NOW() - INTERVAL '7 days'")
+            o7 = ob_7d['c'].iloc[0] if not ob_7d.empty else 0
+            o_prev = ob_prev['c'].iloc[0] if not ob_prev.empty else 0
+            onboarding_pct_7d = round(100 * o7 / total_known_waids, 1) if total_known_waids else 0
+            onboarding_pct_prev = round(100 * o_prev / total_known_waids, 1) if total_known_waids else 0
+            ob_better = onboarding_pct_7d > onboarding_pct_prev
+            ob_worse = onboarding_pct_7d < onboarding_pct_prev
+
+            # Slogan (ai_companion_flows.created_at)
+            acf_7d_filter = "acf.created_at >= NOW() - INTERVAL '7 days'"
             if exclude_internal and internal_filter_join:
-                added_slogan_result = run_query(f"""
-                    SELECT COUNT(DISTINCT acf.user_id) as count
-                    FROM ai_companion_flows acf
+                sl_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
                     JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding'
-                      AND acf.content->>'slogan' IS NOT NULL
-                      {internal_filter_join}
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND {acf_7d_filter} {internal_filter_join}
+                """)
+                sl_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
+                    JOIN users u ON acf.user_id = u.id
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' {internal_filter_join}
                 """)
             else:
-                added_slogan_result = run_query("""
-                    SELECT COUNT(DISTINCT user_id) as count
-                    FROM ai_companion_flows
-                    WHERE type = 'post_onboarding'
-                      AND content->>'slogan' IS NOT NULL
+                sl_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT user_id) as c FROM ai_companion_flows
+                    WHERE type = 'post_onboarding' AND content->>'slogan' IS NOT NULL AND created_at >= NOW() - INTERVAL '7 days'
                 """)
-            added_slogan_count = added_slogan_result['count'].iloc[0] if not added_slogan_result.empty else 0
-            
-            # Get unique users who completed at least one activity
-            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+                sl_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT user_id) as c FROM ai_companion_flows
+                    WHERE type = 'post_onboarding' AND content->>'slogan' IS NOT NULL AND created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days'
+                """)
+            s7 = sl_7d['c'].iloc[0] if not sl_7d.empty else 0
+            s_prev = sl_prev['c'].iloc[0] if not sl_prev.empty else 0
+            slogan_pct_7d = round(100 * s7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
+            slogan_pct_prev = round(100 * s_prev / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            sl_better = slogan_pct_7d > slogan_pct_prev
+            sl_worse = slogan_pct_7d < slogan_pct_prev
+
+            # Completed activity (user_activities_history.completed_at)
+            uah_7d = "uah.completed_at >= NOW() - INTERVAL '7 days'"
             if exclude_internal and internal_filter_join:
-                completed_activities_result = run_query(f"""
-                    SELECT COUNT(DISTINCT uah.user_id) as count
-                    FROM user_activities_history uah
+                act_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
                     JOIN users u ON uah.user_id = u.id
-                    WHERE uah.completed_at IS NOT NULL
-                      {internal_filter_join}
+                    WHERE {uah_7d} {internal_filter_join}
+                """)
+                act_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
+                    JOIN users u ON uah.user_id = u.id
+                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' {internal_filter_join}
                 """)
             else:
-                completed_activities_result = run_query("""
-                    SELECT COUNT(DISTINCT user_id) as count
-                    FROM user_activities_history
-                    WHERE completed_at IS NOT NULL
-                """)
-            completed_activities_count = completed_activities_result['count'].iloc[0] if not completed_activities_result.empty else 0
+                act_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM user_activities_history WHERE completed_at >= NOW() - INTERVAL '7 days'")
+                act_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM user_activities_history WHERE completed_at >= NOW() - INTERVAL '14 days' AND completed_at < NOW() - INTERVAL '7 days'")
+            a7 = act_7d['c'].iloc[0] if not act_7d.empty else 0
+            a_prev = act_prev['c'].iloc[0] if not act_prev.empty else 0
+            activity_pct_7d = round(100 * a7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
+            activity_pct_prev = round(100 * a_prev / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            act_better = activity_pct_7d > activity_pct_prev
+            act_worse = activity_pct_7d < activity_pct_prev
 
-            # Get unique users who have sent at least one audio message
-            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            # Settings updated (events.executed_at)
             if exclude_internal and internal_filter_join:
-                audio_users_result = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as count
-                    FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user'
-                      AND m.user_id IS NOT NULL
-                      AND m.type = 'audio'
-                      {internal_filter_join}
+                set_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
+                """)
+                set_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days' {internal_filter_join}
                 """)
             else:
-                audio_users_result = run_query("""
-                    SELECT COUNT(DISTINCT user_id) as count
-                    FROM messages
-                    WHERE sender = 'user'
-                      AND user_id IS NOT NULL
-                      AND type = 'audio'
-                """)
-            audio_users_count = audio_users_result['count'].iloc[0] if not audio_users_result.empty else 0
+                set_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'settings_updated' AND executed_at >= NOW() - INTERVAL '7 days'")
+                set_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'settings_updated' AND executed_at >= NOW() - INTERVAL '14 days' AND executed_at < NOW() - INTERVAL '7 days'")
+            set7 = set_7d['c'].iloc[0] if not set_7d.empty else 0
+            set_prev_v = set_prev['c'].iloc[0] if not set_prev.empty else 0
+            settings_pct_7d = round(100 * set7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
+            settings_pct_prev = round(100 * set_prev_v / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            set_better = settings_pct_7d > settings_pct_prev
+            set_worse = settings_pct_7d < settings_pct_prev
 
-            # Get unique users who have sent at least one picture/image message
-            internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+            # Sent audio (messages.sent_at)
             if exclude_internal and internal_filter_join:
-                image_users_result = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as count
-                    FROM messages m
+                aud_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
                     JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user'
-                      AND m.user_id IS NOT NULL
-                      AND m.type IN ('image', 'photo')
-                      {internal_filter_join}
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
+                """)
+                aud_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' {internal_filter_join}
                 """)
             else:
-                image_users_result = run_query("""
-                    SELECT COUNT(DISTINCT user_id) as count
-                    FROM messages
-                    WHERE sender = 'user'
-                      AND user_id IS NOT NULL
-                      AND type IN ('image', 'photo')
+                aud_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type = 'audio' AND sent_at >= NOW() - INTERVAL '7 days'")
+                aud_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type = 'audio' AND sent_at >= NOW() - INTERVAL '14 days' AND sent_at < NOW() - INTERVAL '7 days'")
+            aud7 = aud_7d['c'].iloc[0] if not aud_7d.empty else 0
+            aud_prev_v = aud_prev['c'].iloc[0] if not aud_prev.empty else 0
+            audio_pct_7d = round(100 * aud7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
+            audio_pct_prev = round(100 * aud_prev_v / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            aud_better = audio_pct_7d > audio_pct_prev
+            aud_worse = audio_pct_7d < audio_pct_prev
+
+            # Sent picture (messages.sent_at)
+            if exclude_internal and internal_filter_join:
+                img_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
                 """)
-            image_users_count = image_users_result['count'].iloc[0] if not image_users_result.empty else 0
-            
-            # Calculate percentages (onboarding % uses all known WAIDs so it can be < 100%; others use users table)
-            onboarding_pct = round(100 * stats_dict.get('onboarding_completed', 0) / total_known_waids, 1) if total_known_waids else 0
-            slogan_pct = round(100 * added_slogan_count / total_users, 1) if total_users else 0
-            activity_pct = round(100 * completed_activities_count / total_users, 1) if total_users else 0
-            settings_pct = round(100 * stats_dict.get('settings_updated', 0) / total_users, 1) if total_users else 0
-            audio_pct = round(100 * audio_users_count / total_users, 1) if total_users else 0
-            image_pct = round(100 * image_users_count / total_users, 1) if total_users else 0
-            
-            # Display as metrics (all based on unique users)
+                img_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                """)
+            else:
+                img_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type IN ('image', 'photo') AND sent_at >= NOW() - INTERVAL '7 days'")
+                img_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type IN ('image', 'photo') AND sent_at >= NOW() - INTERVAL '14 days' AND sent_at < NOW() - INTERVAL '7 days'")
+            img7 = img_7d['c'].iloc[0] if not img_7d.empty else 0
+            img_prev_v = img_prev['c'].iloc[0] if not img_prev.empty else 0
+            image_pct_7d = round(100 * img7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
+            image_pct_prev = round(100 * img_prev_v / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            img_better = image_pct_7d > image_pct_prev
+            img_worse = image_pct_7d < image_pct_prev
+
             jcol1, jcol2, jcol3, jcol4, jcol5, jcol6 = st.columns(6)
-            jcol1.metric(
-                "✅ Completed Onboarding", 
-                f"{onboarding_pct}%",
-                f"{stats_dict.get('onboarding_completed', 0)} of {total_known_waids} users"
-            )
-            jcol2.metric(
-                "💬 Added Slogan", 
-                f"{slogan_pct}%",
-                f"{added_slogan_count} users"
-            )
-            jcol3.metric(
-                "🏃 Completed Activity", 
-                f"{activity_pct}%",
-                f"{completed_activities_count} users"
-            )
-            jcol4.metric(
-                "⚙️ Updated Settings", 
-                f"{settings_pct}%",
-                f"{stats_dict.get('settings_updated', 0)} users"
-            )
-            jcol5.metric(
-                "🎧 Sent Audio", 
-                f"{audio_pct}%",
-                f"{audio_users_count} users"
-            )
-            jcol6.metric(
-                "📷 Sent Picture", 
-                f"{image_pct}%",
-                f"{image_users_count} users"
-            )
-            
+            jcol1.metric("✅ Completed Onboarding", f"{onboarding_pct_7d}%")
+            jcol1.markdown(_journey_blob(onboarding_pct_prev, ob_better, ob_worse), unsafe_allow_html=True)
+            jcol2.metric("💬 Added Slogan", f"{slogan_pct_7d}%")
+            jcol2.markdown(_journey_blob(slogan_pct_prev, sl_better, sl_worse), unsafe_allow_html=True)
+            jcol3.metric("🏃 Completed Activity", f"{activity_pct_7d}%")
+            jcol3.markdown(_journey_blob(activity_pct_prev, act_better, act_worse), unsafe_allow_html=True)
+            jcol4.metric("⚙️ Updated Settings", f"{settings_pct_7d}%")
+            jcol4.markdown(_journey_blob(settings_pct_prev, set_better, set_worse), unsafe_allow_html=True)
+            jcol5.metric("🎧 Sent Audio", f"{audio_pct_7d}%")
+            jcol5.markdown(_journey_blob(audio_pct_prev, aud_better, aud_worse), unsafe_allow_html=True)
+            jcol6.metric("📷 Sent Picture", f"{image_pct_7d}%")
+            jcol6.markdown(_journey_blob(image_pct_prev, img_better, img_worse), unsafe_allow_html=True)
         else:
             st.info("No users found")
     except Exception as e:
         st.warning(f"Could not load journey stats: {e}")
     
-    st.markdown("### 🪜 Recovery Ladder")
+    st.markdown("### 🪜 Recovery Ladder & Template Sends")
     try:
-        # Conversion rates 24h / 72h
+        # Time windows: last 7d, prev 7d
+        rec_7d_filter = "r.sent_at >= NOW() - INTERVAL '7 days'"
+        rec_prev_7d_filter = "r.sent_at >= NOW() - INTERVAL '14 days' AND r.sent_at < NOW() - INTERVAL '7 days'"
+
+        # Conversion rates 24h / 72h — last 7d (conv72 uses 72h window so conv72 >= conv24; same value = all replies within 24h)
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
         if exclude_internal and internal_filter_join:
-            conversion_df = run_query(f"""
+            conversion_7d = run_query(f"""
                 WITH sent AS (
-                    SELECT DISTINCT r.user_id 
+                    SELECT DISTINCT r.user_id
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
-                    WHERE 1=1 {internal_filter_join}
+                    WHERE {rec_7d_filter} {internal_filter_join}
                 ),
                 conv24 AS (
                     SELECT DISTINCT r.user_id
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
                     JOIN messages m ON m.user_id = r.user_id
-                    WHERE m.sender = 'user'
-                      AND m.sent_at > r.sent_at
-                      AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
                       {internal_filter_join}
                 ),
                 conv72 AS (
@@ -1367,62 +1398,120 @@ with tab1:
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
                     JOIN messages m ON m.user_id = r.user_id
-                    WHERE m.sender = 'user'
-                      AND m.sent_at > r.sent_at
-                      AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
                       {internal_filter_join}
                 )
-                SELECT 
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+            conversion_prev = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE {rec_prev_7d_filter} {internal_filter_join}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                      {internal_filter_join}
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                      {internal_filter_join}
+                )
+                SELECT
                     (SELECT COUNT(*) FROM sent) AS total_users,
                     (SELECT COUNT(*) FROM conv24) AS conv24_users,
                     (SELECT COUNT(*) FROM conv72) AS conv72_users
             """)
         else:
-            conversion_df = run_query("""
+            conversion_7d = run_query(f"""
                 WITH sent AS (
-                    SELECT DISTINCT user_id FROM recovery_logs
+                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_7d_filter}
                 ),
                 conv24 AS (
                     SELECT DISTINCT r.user_id
                     FROM recovery_logs r
                     JOIN messages m ON m.user_id = r.user_id
-                    WHERE m.sender = 'user'
-                      AND m.sent_at > r.sent_at
-                      AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
                 ),
                 conv72 AS (
                     SELECT DISTINCT r.user_id
                     FROM recovery_logs r
                     JOIN messages m ON m.user_id = r.user_id
-                    WHERE m.sender = 'user'
-                      AND m.sent_at > r.sent_at
-                      AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
                 )
-                SELECT 
+                SELECT
                     (SELECT COUNT(*) FROM sent) AS total_users,
                     (SELECT COUNT(*) FROM conv24) AS conv24_users,
                     (SELECT COUNT(*) FROM conv72) AS conv72_users
             """)
-        total_sent_users = conversion_df['total_users'].iloc[0] if not conversion_df.empty else 0
-        conv24_users = conversion_df['conv24_users'].iloc[0] if not conversion_df.empty else 0
-        conv72_users = conversion_df['conv72_users'].iloc[0] if not conversion_df.empty else 0
-        conv24_pct = round(100 * conv24_users / total_sent_users, 1) if total_sent_users else 0
-        conv72_pct = round(100 * conv72_users / total_sent_users, 1) if total_sent_users else 0
+            conversion_prev = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_prev_7d_filter}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+        t_7d = conversion_7d['total_users'].iloc[0] if not conversion_7d.empty else 0
+        c24_7d = conversion_7d['conv24_users'].iloc[0] if not conversion_7d.empty else 0
+        c72_7d = conversion_7d['conv72_users'].iloc[0] if not conversion_7d.empty else 0
+        conv24_pct = round(100 * c24_7d / t_7d, 1) if t_7d else 0
+        conv72_pct = round(100 * c72_7d / t_7d, 1) if t_7d else 0
+        t_prev = conversion_prev['total_users'].iloc[0] if not conversion_prev.empty else 0
+        c24_prev = conversion_prev['conv24_users'].iloc[0] if not conversion_prev.empty else 0
+        c72_prev = conversion_prev['conv72_users'].iloc[0] if not conversion_prev.empty else 0
+        conv24_prev_pct = round(100 * c24_prev / t_prev, 1) if t_prev else 0
+        conv72_prev_pct = round(100 * c72_prev / t_prev, 1) if t_prev else 0
+        # Better/worse vs prev 7d (for blob color): higher % = better
+        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
+        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
 
-        # Ladder drop-off by step and template
+        # Ladder drop-off by step and template (last 7d only)
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
         if exclude_internal and internal_filter_join:
             dropoff_df = run_query(f"""
                 WITH recovery_sends AS (
                     SELECT 
                         r.id,
-                        COALESCE(r.ladder_step, 0) AS ladder_step,
+                        r.ladder_step,
                         COALESCE(r.template_name, 'Unknown') AS template_name,
                         r.user_id,
                         r.sent_at
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
-                    WHERE 1=1 {internal_filter_join}
+                    WHERE {rec_7d_filter} {internal_filter_join}
                 ),
                 conversions AS (
                     SELECT DISTINCT r.id
@@ -1444,15 +1533,16 @@ with tab1:
                 LIMIT 50
             """)
         else:
-            dropoff_df = run_query("""
+            dropoff_df = run_query(f"""
                 WITH recovery_sends AS (
                     SELECT 
                         r.id,
-                        COALESCE(r.ladder_step, 0) AS ladder_step,
+                        r.ladder_step,
                         COALESCE(r.template_name, 'Unknown') AS template_name,
                         r.user_id,
                         r.sent_at
                     FROM recovery_logs r
+                    WHERE {rec_7d_filter}
                 ),
                 conversions AS (
                     SELECT DISTINCT r.id
@@ -1474,20 +1564,29 @@ with tab1:
                 LIMIT 50
             """)
 
-        # Time to reactivation (avg/median hours)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        # Time to reactivation (avg/median hours) — last 7d and prev 7d
         if exclude_internal and internal_filter_join:
-            reactivation_df = run_query(f"""
+            reactivation_7d = run_query(f"""
                 WITH first_reply AS (
-                    SELECT 
-                        r.id AS rec_id,
-                        r.user_id,
-                        r.sent_at,
-                        MIN(m.sent_at) AS reply_at
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
                     JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE 1=1 {internal_filter_join}
+                    WHERE {rec_7d_filter} {internal_filter_join}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+            reactivation_prev = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_prev_7d_filter} {internal_filter_join}
                     GROUP BY r.id, r.user_id, r.sent_at
                 )
                 SELECT 
@@ -1496,15 +1595,12 @@ with tab1:
                 FROM first_reply
             """)
         else:
-            reactivation_df = run_query("""
+            reactivation_7d = run_query(f"""
                 WITH first_reply AS (
-                    SELECT 
-                        r.id AS rec_id,
-                        r.user_id,
-                        r.sent_at,
-                        MIN(m.sent_at) AS reply_at
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
                     FROM recovery_logs r
                     JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_7d_filter}
                     GROUP BY r.id, r.user_id, r.sent_at
                 )
                 SELECT 
@@ -1512,13 +1608,30 @@ with tab1:
                     percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
                 FROM first_reply
             """)
-        avg_hours = round(reactivation_df['avg_hours'].iloc[0], 1) if not reactivation_df.empty and pd.notna(reactivation_df['avg_hours'].iloc[0]) else None
-        median_hours = round(reactivation_df['median_hours'].iloc[0], 1) if not reactivation_df.empty and pd.notna(reactivation_df['median_hours'].iloc[0]) else None
+            reactivation_prev = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_prev_7d_filter}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+        avg_hours = round(reactivation_7d['avg_hours'].iloc[0], 1) if not reactivation_7d.empty and pd.notna(reactivation_7d['avg_hours'].iloc[0]) else None
+        median_hours = round(reactivation_7d['median_hours'].iloc[0], 1) if not reactivation_7d.empty and pd.notna(reactivation_7d['median_hours'].iloc[0]) else None
+        avg_prev = round(reactivation_prev['avg_hours'].iloc[0], 1) if not reactivation_prev.empty and pd.notna(reactivation_prev['avg_hours'].iloc[0]) else None
+        median_prev = round(reactivation_prev['median_hours'].iloc[0], 1) if not reactivation_prev.empty and pd.notna(reactivation_prev['median_hours'].iloc[0]) else None
+        # Better = lower hours (faster reactivation)
+        better_react = avg_hours is not None and avg_prev is not None and avg_hours < avg_prev
+        worse_react = avg_hours is not None and avg_prev is not None and avg_hours > avg_prev
 
-        # Users with multiple sends (2nd / 3rd+ ladder steps)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        # Users with 2+ / 3+ sends in last 7d and prev 7d
         if exclude_internal and internal_filter_join:
-            multi_send_df = run_query(f"""
+            multi_7d = run_query(f"""
                 SELECT 
                     COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
                     COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
@@ -1526,33 +1639,77 @@ with tab1:
                     SELECT r.user_id, COUNT(*) AS send_count
                     FROM recovery_logs r
                     JOIN users u ON r.user_id = u.id
-                    WHERE 1=1 {internal_filter_join}
+                    WHERE {rec_7d_filter} {internal_filter_join}
+                    GROUP BY r.user_id
+                ) t
+            """)
+            multi_prev = run_query(f"""
+                SELECT 
+                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
+                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
+                FROM (
+                    SELECT r.user_id, COUNT(*) AS send_count
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE {rec_prev_7d_filter} {internal_filter_join}
                     GROUP BY r.user_id
                 ) t
             """)
         else:
-            multi_send_df = run_query("""
+            multi_7d = run_query(f"""
                 SELECT 
                     COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
                     COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
                 FROM (
                     SELECT user_id, COUNT(*) AS send_count
                     FROM recovery_logs
+                    WHERE {rec_7d_filter}
                     GROUP BY user_id
                 ) t
             """)
-        users_2_plus = multi_send_df['users_2_plus'].iloc[0] if not multi_send_df.empty else 0
-        users_3_plus = multi_send_df['users_3_plus'].iloc[0] if not multi_send_df.empty else 0
+            multi_prev = run_query(f"""
+                SELECT 
+                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
+                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
+                FROM (
+                    SELECT user_id, COUNT(*) AS send_count
+                    FROM recovery_logs
+                    WHERE {rec_prev_7d_filter}
+                    GROUP BY user_id
+                ) t
+            """)
+        users_2_plus = multi_7d['users_2_plus'].iloc[0] if not multi_7d.empty else 0
+        users_3_plus = multi_7d['users_3_plus'].iloc[0] if not multi_7d.empty else 0
+        u2_prev = multi_prev['users_2_plus'].iloc[0] if not multi_prev.empty else 0
+        u3_prev = multi_prev['users_3_plus'].iloc[0] if not multi_prev.empty else 0
+        # Fewer users needing 2+/3+ pings = better
+        better_multi = (users_2_plus < u2_prev) if (multi_prev is not None and not multi_prev.empty) else None
+        worse_multi = (users_2_plus > u2_prev) if (multi_prev is not None and not multi_prev.empty) else None
+
+        def _blob(prev_text: str, better: bool | None, worse: bool | None) -> str:
+            if better:
+                color = "#0d7d0d"
+            elif worse:
+                color = "#c52222"
+            else:
+                color = "#6b7280"
+            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_text}</span>'
 
         rcol1, rcol2, rcol3, rcol4 = st.columns(4)
-        rcol1.metric("Conv 24h", f"{conv24_pct}%", f"{conv24_users}/{total_sent_users} users")
-        rcol2.metric("Conv 72h", f"{conv72_pct}%", f"{conv72_users}/{total_sent_users} users")
-        rcol3.metric("Avg → Reactivation (h)", avg_hours if avg_hours is not None else "—", f"median {median_hours} h" if median_hours is not None else None)
-        rcol4.metric("Users 2nd/3rd+", f"{users_2_plus} / {users_3_plus}")
+        worse_24 = t_prev and conv24_pct < conv24_prev_pct
+        worse_72 = t_prev and conv72_pct < conv72_prev_pct
+        rcol1.metric("Conv 24h (7d)", f"{conv24_pct}%")
+        rcol1.markdown(_blob(f"{conv24_prev_pct}%" if t_prev else "—", better_24, worse_24), unsafe_allow_html=True)
+        rcol2.metric("Conv 72h (7d)", f"{conv72_pct}%")
+        rcol2.markdown(_blob(f"{conv72_prev_pct}%" if t_prev else "—", better_72, worse_72), unsafe_allow_html=True)
+        rcol3.metric("Avg → Reactivation (7d, h)", f"{avg_hours}h" if avg_hours is not None else "—")
+        rcol3.markdown(_blob(f"{avg_prev}h" if avg_prev is not None else "—", better_react, worse_react), unsafe_allow_html=True)
+        rcol4.metric("Users 2nd/3rd+ (7d)", f"{users_2_plus} / {users_3_plus}")
+        rcol4.markdown(_blob(f"{u2_prev} / {u3_prev}" if (multi_prev is not None and not multi_prev.empty) else "—", better_multi, worse_multi), unsafe_allow_html=True)
 
-        with st.expander("Ladder drop-off by step & template", expanded=False):
+        with st.expander("Ladder drop-off by step & template (last 7 days)", expanded=False):
             if dropoff_df.empty:
-                st.caption("No recovery logs yet")
+                st.caption("No recovery logs in last 7 days")
             else:
                 st.dataframe(dropoff_df, use_container_width=True, hide_index=True)
     except Exception as e:
@@ -3534,30 +3691,39 @@ user_days_count AS (
   FROM user_messages
   GROUP BY user_id
 ),
+activities_completed AS (
+  SELECT uah.user_id, COUNT(*)::int AS activities_completed
+  FROM user_activities_history uah
+  JOIN product_users pu ON pu.id = uah.user_id
+  WHERE uah.completed_at IS NOT NULL
+  GROUP BY uah.user_id
+),
 user_stats AS (
   SELECT
     ufl.user_id,
     ufl.full_name,
     (tl.d - ufl.first_active_date) AS lifetime,
-    udc.active_days
+    udc.active_days,
+    COALESCE(ac.activities_completed, 0)::int AS activities_completed
   FROM user_first_last ufl
   CROSS JOIN today_local tl
   JOIN user_days_count udc ON udc.user_id = ufl.user_id
+  LEFT JOIN activities_completed ac ON ac.user_id = ufl.user_id
 )
-SELECT user_id, full_name, lifetime, active_days FROM user_stats ORDER BY full_name
+SELECT user_id, full_name, lifetime, active_days, activities_completed FROM user_stats ORDER BY full_name
 """
                 overview_df = run_query(overview_query)
                 if not overview_df.empty:
                     established = overview_df[overview_df['lifetime'] >= 7].copy()
                     new_users = overview_df[overview_df['lifetime'] < 7].copy()
-                    most_active = established.sort_values('active_days', ascending=False)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_active.columns = ['Name', 'Active days', 'Lifetime (days)']
-                    most_inactive = established.sort_values('active_days', ascending=True)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_inactive.columns = ['Name', 'Active days', 'Lifetime (days)']
-                    new_users_display = new_users.sort_values('active_days', ascending=False)[['full_name', 'active_days', 'lifetime']].reset_index(drop=True)
-                    new_users_display.columns = ['Name', 'Active days', 'Lifetime (days)']
+                    most_active = established.sort_values('activities_completed', ascending=False)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_active.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
+                    most_inactive = established.sort_values('activities_completed', ascending=True)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_inactive.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
+                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    new_users_display.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
                     st.markdown("#### Quick overview")
-                    st.caption("Lifetime (days) = days since first activity through today (São Paulo). Established = 7+ days; New users = under 7 days.")
+                    st.caption("Active/inactive order by total activities completed. Lifetime (days) = days since first activity (São Paulo). Established = 7+ days; New users = under 7 days.")
                     t1, t2, t3 = st.columns(3)
                     with t1:
                         st.markdown("**Most active** (established)")
@@ -4046,24 +4212,33 @@ with tab4:
         # One row per (time, slot): Time | Slot | Due | Missed | Users (always show table for verification)
         df_day["time_morning"] = df_day["check_in_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
         df_day["time_evening"] = df_day["daily_digest_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
+        # Ensure boolean columns are int so aggregation and display show numbers, not True/False
+        df_day["_due_morning"] = df_day["due_morning"].fillna(False).astype(int)
+        df_day["_missed_morning"] = df_day["missed_morning"].fillna(False).astype(int)
+        df_day["_due_evening"] = df_day["due_evening"].fillna(False).astype(int)
+        df_day["_missed_evening"] = df_day["missed_evening"].fillna(False).astype(int)
         morning = df_day.groupby("time_morning").agg(
-            due=("due_morning", "sum"),
-            missed=("missed_morning", "sum"),
+            due=("_due_morning", "sum"),
+            missed=("_missed_morning", "sum"),
         ).reset_index()
         morning["slot"] = "Morning"
-        morning_names = df_day[df_day["missed_morning"].fillna(False)].groupby("time_morning")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        morning_names = df_day[df_day["_missed_morning"] > 0].groupby("time_morning")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
         morning_names.columns = ["time_morning", "users"]
         morning = morning.merge(morning_names, on="time_morning", how="left")
         morning["users"] = morning["users"].fillna("").astype(str)
+        morning["due"] = morning["due"].astype(int)
+        morning["missed"] = morning["missed"].astype(int)
         evening = df_day.groupby("time_evening").agg(
-            due=("due_evening", "sum"),
-            missed=("missed_evening", "sum"),
+            due=("_due_evening", "sum"),
+            missed=("_missed_evening", "sum"),
         ).reset_index()
         evening["slot"] = "Evening"
-        evening_names = df_day[df_day["missed_evening"].fillna(False)].groupby("time_evening")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        evening_names = df_day[df_day["_missed_evening"] > 0].groupby("time_evening")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
         evening_names.columns = ["time_evening", "users"]
         evening = evening.merge(evening_names, on="time_evening", how="left")
         evening["users"] = evening["users"].fillna("").astype(str)
+        evening["due"] = evening["due"].astype(int)
+        evening["missed"] = evening["missed"].astype(int)
         table = pd.concat([
             morning.rename(columns={"time_morning": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
             evening.rename(columns={"time_evening": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
