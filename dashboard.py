@@ -1186,19 +1186,13 @@ with tab1:
         users_14d_ago_query = f"SELECT COUNT(DISTINCT waid) as total FROM users WHERE created_at < NOW() - INTERVAL '14 days'{extra_where}"
         users_14d_ago_result = run_query(users_14d_ago_query)
         total_users_14d_ago = users_14d_ago_result['total'].iloc[0] if not users_14d_ago_result.empty else 0
-        # Onboarding: use all-known waids (same for both periods so comparison is fair)
-        all_waids_query = """
-            WITH all_waids AS (
-                SELECT waid FROM messages WHERE sender = 'user'
-                UNION
-                SELECT waid FROM users
-            )
-            SELECT COUNT(DISTINCT waid) AS total FROM all_waids
-        """
-        if internal_filter:
-            all_waids_query = all_waids_query.rstrip() + " " + internal_filter
-        total_known_waids_result = run_query(all_waids_query)
-        total_known_waids = total_known_waids_result['total'].iloc[0] if not total_known_waids_result.empty else 0
+        # New users in each window: users table only (created_at in window), include empty full_name / waid-only rows. Exclude message-only (not in users).
+        new_users_7d_query = f"SELECT COUNT(*) as total FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra_where}"
+        new_users_7d_result = run_query(new_users_7d_query)
+        new_users_7d = new_users_7d_result['total'].iloc[0] if not new_users_7d_result.empty else 0
+        new_users_prev_7d_query = f"SELECT COUNT(*) as total FROM users WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days'{extra_where}"
+        new_users_prev_7d_result = run_query(new_users_prev_7d_query)
+        new_users_prev_7d = new_users_prev_7d_result['total'].iloc[0] if not new_users_prev_7d_result.empty else 0
 
         def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
             if better:
@@ -1209,74 +1203,99 @@ with tab1:
                 color = "#6b7280"
             return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
 
-        if (total_users_7d_ago > 0 or total_users_14d_ago > 0 or total_known_waids > 0):
-            # Onboarding (events.executed_at); denominator = total_known_waids
+        if (total_users_7d_ago > 0 or total_users_14d_ago > 0 or new_users_7d > 0 or new_users_prev_7d > 0):
+            user_7d_denom = "u.created_at < NOW() - INTERVAL '7 days'"
+            user_14d_denom = "u.created_at < NOW() - INTERVAL '14 days'"
+            new_user_7d_window = "u.created_at >= NOW() - INTERVAL '7 days'"
+            new_user_prev_7d_window = "u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'"
+
+            # Completed onboarding: denominator = all users rows with created_at in window (users table only; include empty name/waid-only). Numerator = those who have onboarding_completed event in that window.
             if exclude_internal and internal_filter_join:
                 ob_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
-                    JOIN users u ON e.user_id = u.id
-                    WHERE e.event_type = 'onboarding_completed' AND e.executed_at {journey_7d} {internal_filter_join}
+                    SELECT COUNT(*) as c FROM users u
+                    WHERE u.created_at >= NOW() - INTERVAL '7 days'
+                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '7 days')
+                      {internal_filter_join}
                 """)
                 ob_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
-                    JOIN users u ON e.user_id = u.id
-                    WHERE e.event_type = 'onboarding_completed' AND e.executed_at {journey_prev_7d_ev} {internal_filter_join}
+                    SELECT COUNT(*) as c FROM users u
+                    WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
+                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days')
+                      {internal_filter_join}
                 """)
             else:
-                ob_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'onboarding_completed' AND executed_at {journey_7d}")
-                ob_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'onboarding_completed' AND executed_at >= NOW() - INTERVAL '14 days' AND executed_at < NOW() - INTERVAL '7 days'")
+                ob_7d = run_query("""
+                    SELECT COUNT(*) as c FROM users u
+                    WHERE u.created_at >= NOW() - INTERVAL '7 days'
+                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '7 days')
+                """)
+                ob_prev = run_query("""
+                    SELECT COUNT(*) as c FROM users u
+                    WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
+                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days')
+                """)
             o7 = ob_7d['c'].iloc[0] if not ob_7d.empty else 0
             o_prev = ob_prev['c'].iloc[0] if not ob_prev.empty else 0
-            onboarding_pct_7d = round(100 * o7 / total_known_waids, 1) if total_known_waids else 0
-            onboarding_pct_prev = round(100 * o_prev / total_known_waids, 1) if total_known_waids else 0
+            onboarding_pct_7d = round(100 * o7 / new_users_7d, 1) if new_users_7d else 0
+            onboarding_pct_prev = round(100 * o_prev / new_users_prev_7d, 1) if new_users_prev_7d else 0
             ob_better = onboarding_pct_7d > onboarding_pct_prev
             ob_worse = onboarding_pct_7d < onboarding_pct_prev
 
-            # Slogan (ai_companion_flows.created_at)
+            # Added slogan: count only new users in the time window who added slogan in that window; denominator = new users in window
             acf_7d_filter = "acf.created_at >= NOW() - INTERVAL '7 days'"
             if exclude_internal and internal_filter_join:
                 sl_7d = run_query(f"""
                     SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
                     JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND {acf_7d_filter} {internal_filter_join}
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND {acf_7d_filter} AND {new_user_7d_window} {internal_filter_join}
                 """)
                 sl_prev = run_query(f"""
                     SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
                     JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window} {internal_filter_join}
                 """)
             else:
                 sl_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT user_id) as c FROM ai_companion_flows
-                    WHERE type = 'post_onboarding' AND content->>'slogan' IS NOT NULL AND created_at >= NOW() - INTERVAL '7 days'
+                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
+                    JOIN users u ON acf.user_id = u.id
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window}
                 """)
                 sl_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT user_id) as c FROM ai_companion_flows
-                    WHERE type = 'post_onboarding' AND content->>'slogan' IS NOT NULL AND created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days'
+                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
+                    JOIN users u ON acf.user_id = u.id
+                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window}
                 """)
             s7 = sl_7d['c'].iloc[0] if not sl_7d.empty else 0
             s_prev = sl_prev['c'].iloc[0] if not sl_prev.empty else 0
-            slogan_pct_7d = round(100 * s7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
-            slogan_pct_prev = round(100 * s_prev / total_users_14d_ago, 1) if total_users_14d_ago else 0
+            slogan_pct_7d = round(100 * s7 / new_users_7d, 1) if new_users_7d else 0
+            slogan_pct_prev = round(100 * s_prev / new_users_prev_7d, 1) if new_users_prev_7d else 0
             sl_better = slogan_pct_7d > slogan_pct_prev
             sl_worse = slogan_pct_7d < slogan_pct_prev
 
-            # Completed activity (user_activities_history.completed_at)
+            # Completed activity (user_activities_history.completed_at). Restrict to users in denominator.
             uah_7d = "uah.completed_at >= NOW() - INTERVAL '7 days'"
             if exclude_internal and internal_filter_join:
                 act_7d = run_query(f"""
                     SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
                     JOIN users u ON uah.user_id = u.id
-                    WHERE {uah_7d} {internal_filter_join}
+                    WHERE {uah_7d} AND {user_7d_denom} {internal_filter_join}
                 """)
                 act_prev = run_query(f"""
                     SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
                     JOIN users u ON uah.user_id = u.id
-                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' AND {user_14d_denom} {internal_filter_join}
                 """)
             else:
-                act_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM user_activities_history WHERE completed_at >= NOW() - INTERVAL '7 days'")
-                act_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM user_activities_history WHERE completed_at >= NOW() - INTERVAL '14 days' AND completed_at < NOW() - INTERVAL '7 days'")
+                act_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
+                    JOIN users u ON uah.user_id = u.id
+                    WHERE uah.completed_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom}
+                """)
+                act_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
+                    JOIN users u ON uah.user_id = u.id
+                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' AND {user_14d_denom}
+                """)
             a7 = act_7d['c'].iloc[0] if not act_7d.empty else 0
             a_prev = act_prev['c'].iloc[0] if not act_prev.empty else 0
             activity_pct_7d = round(100 * a7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
@@ -1284,21 +1303,29 @@ with tab1:
             act_better = activity_pct_7d > activity_pct_prev
             act_worse = activity_pct_7d < activity_pct_prev
 
-            # Settings updated (events.executed_at)
+            # Settings updated (events.executed_at). Restrict to users in denominator.
             if exclude_internal and internal_filter_join:
                 set_7d = run_query(f"""
                     SELECT COUNT(DISTINCT e.user_id) as c FROM events e
                     JOIN users u ON e.user_id = u.id
-                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom} {internal_filter_join}
                 """)
                 set_prev = run_query(f"""
                     SELECT COUNT(DISTINCT e.user_id) as c FROM events e
                     JOIN users u ON e.user_id = u.id
-                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days' AND {user_14d_denom} {internal_filter_join}
                 """)
             else:
-                set_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'settings_updated' AND executed_at >= NOW() - INTERVAL '7 days'")
-                set_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM events WHERE event_type = 'settings_updated' AND executed_at >= NOW() - INTERVAL '14 days' AND executed_at < NOW() - INTERVAL '7 days'")
+                set_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom}
+                """)
+                set_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT e.user_id) as c FROM events e
+                    JOIN users u ON e.user_id = u.id
+                    WHERE e.event_type = 'settings_updated' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days' AND {user_14d_denom}
+                """)
             set7 = set_7d['c'].iloc[0] if not set_7d.empty else 0
             set_prev_v = set_prev['c'].iloc[0] if not set_prev.empty else 0
             settings_pct_7d = round(100 * set7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
@@ -1306,21 +1333,29 @@ with tab1:
             set_better = settings_pct_7d > settings_pct_prev
             set_worse = settings_pct_7d < settings_pct_prev
 
-            # Sent audio (messages.sent_at)
+            # Sent audio (messages.sent_at). Restrict to users in denominator.
             if exclude_internal and internal_filter_join:
                 aud_7d = run_query(f"""
                     SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
                     JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom} {internal_filter_join}
                 """)
                 aud_prev = run_query(f"""
                     SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
                     JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {user_14d_denom} {internal_filter_join}
                 """)
             else:
-                aud_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type = 'audio' AND sent_at >= NOW() - INTERVAL '7 days'")
-                aud_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type = 'audio' AND sent_at >= NOW() - INTERVAL '14 days' AND sent_at < NOW() - INTERVAL '7 days'")
+                aud_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom}
+                """)
+                aud_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {user_14d_denom}
+                """)
             aud7 = aud_7d['c'].iloc[0] if not aud_7d.empty else 0
             aud_prev_v = aud_prev['c'].iloc[0] if not aud_prev.empty else 0
             audio_pct_7d = round(100 * aud7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
@@ -1328,21 +1363,29 @@ with tab1:
             aud_better = audio_pct_7d > audio_pct_prev
             aud_worse = audio_pct_7d < audio_pct_prev
 
-            # Sent picture (messages.sent_at)
+            # Sent picture (messages.sent_at). Restrict to users in denominator.
             if exclude_internal and internal_filter_join:
                 img_7d = run_query(f"""
                     SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
                     JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom} {internal_filter_join}
                 """)
                 img_prev = run_query(f"""
                     SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
                     JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' {internal_filter_join}
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {user_14d_denom} {internal_filter_join}
                 """)
             else:
-                img_7d = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type IN ('image', 'photo') AND sent_at >= NOW() - INTERVAL '7 days'")
-                img_prev = run_query(f"SELECT COUNT(DISTINCT user_id) as c FROM messages WHERE sender = 'user' AND user_id IS NOT NULL AND type IN ('image', 'photo') AND sent_at >= NOW() - INTERVAL '14 days' AND sent_at < NOW() - INTERVAL '7 days'")
+                img_7d = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' AND {user_7d_denom}
+                """)
+                img_prev = run_query(f"""
+                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
+                    JOIN users u ON m.user_id = u.id
+                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {user_14d_denom}
+                """)
             img7 = img_7d['c'].iloc[0] if not img_7d.empty else 0
             img_prev_v = img_prev['c'].iloc[0] if not img_prev.empty else 0
             image_pct_7d = round(100 * img7 / total_users_7d_ago, 1) if total_users_7d_ago else 0
