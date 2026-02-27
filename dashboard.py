@@ -513,6 +513,109 @@ ORDER BY n.last_sent_at ASC;
     return run_query(query)
 
 
+@st.cache_data(ttl=300)
+def get_recovery_ladder_events(start_date_sp: str = "2026-02-01") -> pd.DataFrame:
+    """
+    Recovery template sends with latest-template attribution windows.
+
+    For each template send, attributes response/activity to that send until next template
+    for the same user (if any), then computes:
+    - replied_before_next_template
+    - activity_12h
+    - activity_24h
+    - response_minutes (first user reply time)
+    Week buckets use Monday starts in America/Sao_Paulo.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+template_sends AS (
+  SELECT
+    r.id AS recovery_log_id,
+    r.user_id,
+    u.waid,
+    COALESCE(u.full_name, 'Unknown') AS full_name,
+    COALESCE(r.template_name, 'Unknown') AS template_name,
+    r.ladder_step,
+    r.sent_at AS template_sent_at_utc,
+    (r.sent_at AT TIME ZONE 'America/Sao_Paulo') AS template_sent_at_sp,
+    date_trunc('week', r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start_sp,
+    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_template_at_utc
+  FROM recovery_logs r
+  JOIN users u ON r.user_id = u.id
+  WHERE (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= DATE '{start_date_sp}'
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+response_events AS (
+  SELECT
+    ts.*,
+    reply.first_reply_at_utc,
+    CASE
+      WHEN reply.first_reply_at_utc IS NOT NULL
+      THEN EXTRACT(EPOCH FROM (reply.first_reply_at_utc - ts.template_sent_at_utc)) / 60.0
+      ELSE NULL
+    END AS response_minutes
+  FROM template_sends ts
+  LEFT JOIN LATERAL (
+    SELECT MIN(m.sent_at) AS first_reply_at_utc
+    FROM messages m
+    WHERE m.sender = 'user'
+      AND (m.user_id = ts.user_id OR m.waid = ts.waid)
+      AND m.sent_at > ts.template_sent_at_utc
+      AND (ts.next_template_at_utc IS NULL OR m.sent_at < ts.next_template_at_utc)
+  ) reply ON true
+),
+conversion_flags AS (
+  SELECT
+    re.*,
+    (re.first_reply_at_utc IS NOT NULL) AS replied_before_next_template,
+    EXISTS (
+      SELECT 1
+      FROM user_activities_history uah
+      WHERE uah.user_id = re.user_id
+        AND uah.completed_at > re.template_sent_at_utc
+        AND uah.completed_at <= LEAST(
+          re.template_sent_at_utc + INTERVAL '12 hours',
+          COALESCE(re.next_template_at_utc, re.template_sent_at_utc + INTERVAL '100 years')
+        )
+    ) AS activity_12h,
+    EXISTS (
+      SELECT 1
+      FROM user_activities_history uah
+      WHERE uah.user_id = re.user_id
+        AND uah.completed_at > re.template_sent_at_utc
+        AND uah.completed_at <= LEAST(
+          re.template_sent_at_utc + INTERVAL '24 hours',
+          COALESCE(re.next_template_at_utc, re.template_sent_at_utc + INTERVAL '100 years')
+        )
+    ) AS activity_24h
+  FROM response_events re
+)
+SELECT
+  TO_CHAR(week_start_sp, 'YYYY-MM-DD') AS week_start_sp,
+  template_name,
+  ladder_step,
+  user_id,
+  waid,
+  full_name,
+  template_sent_at_utc,
+  template_sent_at_sp,
+  next_template_at_utc,
+  first_reply_at_utc,
+  replied_before_next_template,
+  activity_12h,
+  activity_24h,
+  response_minutes
+FROM conversion_flags
+ORDER BY week_start_sp DESC, template_sent_at_utc DESC;
+"""
+    return run_query(query)
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -925,11 +1028,12 @@ except Exception:
 _alert_label = "🔔 Alerts" + (f" ({_alert_count})" if _alert_count else "")
 
 # Main content tabs
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Quick Insights",
     "🔍 User Deep Dive",
     "📈 User Retention",
     _alert_label,
+    "🪜 Recovery Ladder",
 ])
 
 
@@ -967,13 +1071,16 @@ with tab1:
         alive_count = alive_df['count'].iloc[0] if not alive_df.empty else 0
         inactive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = false{extra}")
         inactive_count = inactive_df['count'].iloc[0] if not inactive_df.empty else 0
+        new_7d_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra}")
+        new_7d_count = new_7d_df['count'].iloc[0] if not new_7d_df.empty else 0
     except Exception:
-        total_users_count = alive_count = inactive_count = 0
+        total_users_count = alive_count = inactive_count = new_7d_count = 0
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total users", total_users_count if total_users_count else "—")
     col2.metric("Alive users", alive_count if alive_count is not None else "—")
     col3.metric("Inactive users", inactive_count if inactive_count is not None else "—")
+    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
 
     # Row 2: Inside 24h, Messaged today, Active today — percentages only
     today_day = datetime.utcnow().strftime("%A")
@@ -1032,7 +1139,7 @@ with tab1:
     # Expandable simple lists for key metrics
     try:
         internal_filter = get_internal_users_filter_sql(exclude_internal)
-        where_clause = "WHERE created_at >= CURRENT_DATE" if not internal_filter else f"{internal_filter} AND created_at >= CURRENT_DATE"
+        where_clause = "WHERE created_at >= NOW() - INTERVAL '7 days'" if not internal_filter else f"{internal_filter} AND created_at >= NOW() - INTERVAL '7 days'"
         new_today_list = run_query(f"""
             SELECT COALESCE(full_name, 'Unknown') AS name
             FROM (
@@ -1044,14 +1151,14 @@ with tab1:
             ORDER BY created_at DESC
             LIMIT 200
         """)
-        with st.expander("New Today - names"):
+        with st.expander("New users (past 7d) - names"):
             if new_today_list.empty:
                 st.caption("No users")
             else:
                 for n in new_today_list['name']:
                     st.caption(f"• {n}")
     except:
-        st.warning("Could not load New Today list")
+        st.warning("Could not load new users (past 7d) list")
     
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
@@ -3018,13 +3125,22 @@ with tab2:
                         st.caption("—")
         
         st.markdown("#### 💬 Message History")
+        msg_limit_options = {"Last 20": 20, "Last 50": 50, "Last 100": 100, "All": None}
+        msg_limit_label = st.selectbox(
+            "Messages to show",
+            list(msg_limit_options.keys()),
+            index=0,
+            key="msg_history_limit",
+        )
+        msg_limit = msg_limit_options[msg_limit_label]
+        msg_limit_sql = f"LIMIT {msg_limit}" if msg_limit else ""
         
         messages_df = run_query(f"""
             SELECT id as msg_id, sent_at, sender, type as msg_type, message
             FROM messages
             WHERE user_id = {user_id} AND sent_at IS NOT NULL
             ORDER BY sent_at DESC
-            LIMIT 100
+            {msg_limit_sql}
         """)
         
         def extract_msg_text(raw_msg):
@@ -4368,6 +4484,117 @@ with tab4:
 
     else:
         st.info("No message delivery data available. Check database connection and that users/messages/reschedule tables exist.")
+
+
+# Tab 5: Recovery Ladder
+with tab5:
+    st.markdown("### 🪜 Recovery Ladder")
+    st.caption("Week-by-week template performance (Monday weeks in America/Sao_Paulo), attributed to the latest template sent per user.")
+
+    start_date = st.date_input(
+        "Start date (SP local date)",
+        value=datetime(2026, 2, 1).date(),
+        key="recovery_ladder_start_date",
+    )
+
+    try:
+        recovery_events = get_recovery_ladder_events(start_date.strftime("%Y-%m-%d"))
+    except Exception as e:
+        recovery_events = pd.DataFrame()
+        st.error(f"Could not load recovery ladder data: {e}")
+
+    if recovery_events.empty:
+        st.info("No recovery ladder sends found for the selected start date.")
+    else:
+        df = recovery_events.copy()
+        df["week_start_sp"] = pd.to_datetime(df["week_start_sp"], errors="coerce")
+        df["replied_before_next_template"] = df["replied_before_next_template"].fillna(False).astype(int)
+        df["activity_12h"] = df["activity_12h"].fillna(False).astype(int)
+        df["activity_24h"] = df["activity_24h"].fillna(False).astype(int)
+        df["response_minutes"] = pd.to_numeric(df["response_minutes"], errors="coerce")
+        df["template_sent_at_sp"] = pd.to_datetime(df["template_sent_at_sp"], errors="coerce")
+
+        st.markdown("#### 📊 Weekly Overview (All Templates)")
+        weekly = (
+            df.groupby("week_start_sp")
+            .agg(
+                templates_sent=("user_id", "size"),
+                users_targeted=("user_id", "nunique"),
+                replied_templates=("replied_before_next_template", "sum"),
+                activity_12h_templates=("activity_12h", "sum"),
+                activity_24h_templates=("activity_24h", "sum"),
+                avg_response_min=("response_minutes", "mean"),
+                median_response_min=("response_minutes", "median"),
+            )
+            .reset_index()
+            .sort_values("week_start_sp", ascending=False)
+        )
+        weekly["reply_rate_pct"] = (100.0 * weekly["replied_templates"] / weekly["templates_sent"]).round(1)
+        weekly["activity_12h_rate_pct"] = (100.0 * weekly["activity_12h_templates"] / weekly["templates_sent"]).round(1)
+        weekly["activity_24h_rate_pct"] = (100.0 * weekly["activity_24h_templates"] / weekly["templates_sent"]).round(1)
+        weekly["avg_response_min"] = weekly["avg_response_min"].round(1)
+        weekly["median_response_min"] = weekly["median_response_min"].round(1)
+        weekly["week_start_sp"] = weekly["week_start_sp"].dt.strftime("%Y-%m-%d")
+        st.dataframe(weekly, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 🧩 Weekly Breakdown by Template")
+        by_template = (
+            df.groupby(["week_start_sp", "template_name"])
+            .agg(
+                templates_sent=("user_id", "size"),
+                users_targeted=("user_id", "nunique"),
+                replied_templates=("replied_before_next_template", "sum"),
+                activity_12h_templates=("activity_12h", "sum"),
+                activity_24h_templates=("activity_24h", "sum"),
+                avg_response_min=("response_minutes", "mean"),
+                median_response_min=("response_minutes", "median"),
+            )
+            .reset_index()
+            .sort_values(["week_start_sp", "template_name"], ascending=[False, True])
+        )
+        by_template["reply_rate_pct"] = (100.0 * by_template["replied_templates"] / by_template["templates_sent"]).round(1)
+        by_template["activity_12h_rate_pct"] = (100.0 * by_template["activity_12h_templates"] / by_template["templates_sent"]).round(1)
+        by_template["activity_24h_rate_pct"] = (100.0 * by_template["activity_24h_templates"] / by_template["templates_sent"]).round(1)
+        by_template["avg_response_min"] = by_template["avg_response_min"].round(1)
+        by_template["median_response_min"] = by_template["median_response_min"].round(1)
+        by_template["week_start_sp"] = pd.to_datetime(by_template["week_start_sp"], errors="coerce").dt.strftime("%Y-%m-%d")
+        st.dataframe(by_template, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 👥 User-Level Attribution Detail")
+        week_options = ["All"] + sorted(
+            [w for w in df["week_start_sp"].dropna().dt.strftime("%Y-%m-%d").unique()],
+            reverse=True,
+        )
+        sel_week = st.selectbox("Week start (SP)", week_options, index=0, key="recovery_ladder_week_filter")
+        detail_df = df.copy()
+        if sel_week != "All":
+            detail_df = detail_df[detail_df["week_start_sp"].dt.strftime("%Y-%m-%d") == sel_week]
+
+        template_options = ["All"] + sorted([t for t in detail_df["template_name"].dropna().unique()])
+        sel_template = st.selectbox("Template", template_options, index=0, key="recovery_ladder_template_filter")
+        if sel_template != "All":
+            detail_df = detail_df[detail_df["template_name"] == sel_template]
+
+        detail_df["week_start_sp"] = detail_df["week_start_sp"].dt.strftime("%Y-%m-%d")
+        detail_df["template_sent_at_sp"] = detail_df["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
+        detail_df["replied_before_next_template"] = detail_df["replied_before_next_template"].map({1: "Yes", 0: "No"})
+        detail_df["activity_12h"] = detail_df["activity_12h"].map({1: "Yes", 0: "No"})
+        detail_df["activity_24h"] = detail_df["activity_24h"].map({1: "Yes", 0: "No"})
+        detail_df["response_minutes"] = detail_df["response_minutes"].round(1)
+
+        detail_cols = [
+            "week_start_sp",
+            "template_name",
+            "ladder_step",
+            "full_name",
+            "waid",
+            "template_sent_at_sp",
+            "replied_before_next_template",
+            "activity_12h",
+            "activity_24h",
+            "response_minutes",
+        ]
+        st.dataframe(detail_df[detail_cols], use_container_width=True, hide_index=True)
 
 
 # Footer
