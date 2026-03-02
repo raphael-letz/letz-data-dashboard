@@ -225,7 +225,8 @@ def load_internal_users():
     """
     fallback_internal_waids = [
         '555198161419', '5511988649591', '555195455326',
-        '555397038122', '5511970544995', '6593366209', '555199885544'
+        '555397038122', '5511970544995', '6593366209', '555199885544',
+        '5512981257941'
     ]
 
     try:
@@ -1182,98 +1183,61 @@ with tab1:
     except:
         st.warning("Could not load Messaged today list")
     
-    # LLM pushes = proactive companion messages today (no user message in 2 min before, no template)
-    # Templates sent today = recovery_logs today
+    # Goals: consistency over the last 4 SP Monday-weeks
+    st.markdown("### 🎯 Goals")
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        llm_proactive_sub = """
-            AND NOT EXISTS (
-                SELECT 1 FROM messages m2
-                WHERE m2.sender = 'user'
-                  AND m2.sent_at < m.sent_at
-                  AND m2.sent_at >= m.sent_at - INTERVAL '2 minutes'
-                  AND (m2.user_id = m.user_id OR m2.waid = m.waid)
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM recovery_logs r
-                WHERE r.user_id = m.user_id
-                  AND r.sent_at >= m.sent_at - INTERVAL '30 seconds'
-                  AND r.sent_at <= m.sent_at + INTERVAL '30 seconds'
-            )
-        """
-        if exclude_internal and internal_filter_join:
-            llm_pushes_today_df = run_query(f"""
-                SELECT COUNT(*) as count
-                FROM messages m
-                JOIN users u ON m.user_id = u.id
-                WHERE m.sender = 'companion'
-                  AND m.sent_at >= CURRENT_DATE AND m.sent_at < CURRENT_DATE + INTERVAL '1 day'
-                  {llm_proactive_sub}
+        goals_df = run_query(f"""
+            WITH week_bounds AS (
+                SELECT date_trunc('week', NOW() AT TIME ZONE 'America/Sao_Paulo')::date AS current_week_start
+            ),
+            weekly_activity AS (
+                SELECT
+                    uah.user_id,
+                    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start_sp,
+                    COUNT(*) AS activities_count
+                FROM user_activities_history uah
+                JOIN users u ON uah.user_id = u.id
+                WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date >= (SELECT current_week_start - INTERVAL '3 weeks' FROM week_bounds)
+                  AND (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date < (SELECT current_week_start + INTERVAL '1 week' FROM week_bounds)
                   {internal_filter_join}
-            """)
-            templates_today_df = run_query(f"""
-                SELECT COUNT(*) as count
-                FROM recovery_logs r
-                JOIN users u ON r.user_id = u.id
-                WHERE r.sent_at >= CURRENT_DATE AND r.sent_at < CURRENT_DATE + INTERVAL '1 day'
-                  {internal_filter_join}
-            """)
-        else:
-            llm_pushes_today_df = run_query(f"""
-                SELECT COUNT(*) as count
-                FROM messages m
-                WHERE m.sender = 'companion'
-                  AND m.sent_at >= CURRENT_DATE AND m.sent_at < CURRENT_DATE + INTERVAL '1 day'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM messages m2
-                    WHERE m2.sender = 'user'
-                      AND m2.sent_at < m.sent_at
-                      AND m2.sent_at >= m.sent_at - INTERVAL '2 minutes'
-                      AND (m2.user_id = m.user_id OR m2.waid = m.waid)
-                  )
-                  AND (m.user_id IS NULL OR NOT EXISTS (
-                    SELECT 1 FROM recovery_logs r
-                    WHERE r.user_id = m.user_id
-                      AND r.sent_at >= m.sent_at - INTERVAL '30 seconds'
-                      AND r.sent_at <= m.sent_at + INTERVAL '30 seconds'
-                  ))
-            """)
-            templates_today_df = run_query("""
-                SELECT COUNT(*) as count
-                FROM recovery_logs
-                WHERE sent_at >= CURRENT_DATE AND sent_at < CURRENT_DATE + INTERVAL '1 day'
-            """)
-        llm_pushes_today = llm_pushes_today_df['count'].iloc[0] if not llm_pushes_today_df.empty else 0
-        templates_today = templates_today_df['count'].iloc[0] if not templates_today_df.empty else 0
-        mcol1, mcol2 = st.columns(2)
-        mcol1.metric("LLM pushes sent today", llm_pushes_today)
-        mcol2.metric("Templates sent today", templates_today)
-    except Exception:
-        mcol1, mcol2 = st.columns(2)
-        mcol1.metric("LLM pushes sent today", "—")
-        mcol2.metric("Templates sent today", "—")
-    
-    try:
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        templates_24h_list = run_query(f"""
-            SELECT 
-                COALESCE(u.full_name, 'Unknown') AS name,
-                COALESCE(r.template_name, 'Unknown') AS template_name
-            FROM recovery_logs r
-            JOIN users u ON r.user_id = u.id
-            WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
-              {internal_filter_join}
-            ORDER BY name, template_name
-            LIMIT 200
+                GROUP BY uah.user_id, week_start_sp
+            ),
+            qualified_weeks AS (
+                SELECT user_id, week_start_sp
+                FROM weekly_activity
+                WHERE activities_count >= 3
+            ),
+            two_consecutive AS (
+                SELECT DISTINCT q1.user_id
+                FROM qualified_weeks q1
+                JOIN qualified_weeks q2
+                  ON q2.user_id = q1.user_id
+                 AND q2.week_start_sp = q1.week_start_sp + INTERVAL '7 days'
+            )
+            SELECT
+                (SELECT COUNT(DISTINCT user_id) FROM qualified_weeks) AS users_3plus_1week,
+                (SELECT COUNT(DISTINCT user_id) FROM two_consecutive) AS users_3plus_2consecutive
         """)
-        with st.expander("Templates Sent 24h - recipients"):
-            if templates_24h_list.empty:
-                st.caption("No users")
-            else:
-                for _, row in templates_24h_list.iterrows():
-                    st.caption(f"• {row['name']} ({row['template_name']})")
-    except:
-        st.warning("Could not load Templates 24h list")
+        users_1week = int(goals_df["users_3plus_1week"].iloc[0]) if not goals_df.empty else 0
+        users_2consec = int(goals_df["users_3plus_2consecutive"].iloc[0]) if not goals_df.empty else 0
+
+        goals_table = pd.DataFrame([
+            {
+                "Metric": "Users with 3+ activities for 1 week",
+                "Current (last 4 weeks)": users_1week,
+                "March goal": 50,
+            },
+            {
+                "Metric": "Users with 3+ activities for 2 consecutive weeks",
+                "Current (last 4 weeks)": users_2consec,
+                "March goal": 50,
+            },
+        ])
+        st.dataframe(goals_table, use_container_width=True, hide_index=True)
+        st.caption("Week buckets start on Monday in America/Sao_Paulo.")
+    except Exception as e:
+        st.warning(f"Could not load Goals stats: {e}")
     
     # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
     st.markdown("### 🎯 User Journey Progress")
@@ -2011,6 +1975,21 @@ with tab1:
             data = parse_json(msg_str)
             
             if isinstance(data, dict):
+                # WhatsApp template notifications: prefer body parameter text (actual template content)
+                notification = data.get("notification")
+                if isinstance(notification, dict):
+                    template_texts = []
+                    for comp in notification.get("components", []) or []:
+                        if isinstance(comp, dict) and comp.get("type") == "body":
+                            for param in comp.get("parameters", []) or []:
+                                if isinstance(param, dict):
+                                    txt = param.get("text")
+                                    if isinstance(txt, str) and txt.strip():
+                                        template_texts.append(txt.strip())
+                    if template_texts:
+                        # Usually first parameter is user name; longest text is typically the actual body content.
+                        main_body = max(template_texts, key=len)
+                        return re.sub(r"\s+", " ", main_body).strip()
                 for key in ["interactive", "postback", "template"]:
                     if key in data:
                         found = find_text(data[key])
@@ -3207,6 +3186,20 @@ with tab2:
             
             data = parse_json(msg_str)
             if isinstance(data, dict):
+                # WhatsApp template notifications: prefer body parameter text (actual template content)
+                notification = data.get("notification")
+                if isinstance(notification, dict):
+                    template_texts = []
+                    for comp in notification.get("components", []) or []:
+                        if isinstance(comp, dict) and comp.get("type") == "body":
+                            for param in comp.get("parameters", []) or []:
+                                if isinstance(param, dict):
+                                    txt = param.get("text")
+                                    if isinstance(txt, str) and txt.strip():
+                                        template_texts.append(txt.strip())
+                    if template_texts:
+                        main_body = max(template_texts, key=len)
+                        return re.sub(r"\s+", " ", main_body).strip()
                 for key in ["interactive", "postback", "template"]:
                     if key in data:
                         found = find_text(data[key])
@@ -3457,26 +3450,8 @@ with tab2:
 # Tab 3: User Retention
 with tab3:
     st.markdown("### 📈 User Retention by Weekly Cohort")
-    
-    # Load internal users from JSON file
-    try:
-        internal_users_path = os.path.join(os.path.dirname(__file__), "..", ".context", "internal-users.json")
-        if os.path.exists(internal_users_path):
-            with open(internal_users_path, 'r') as f:
-                internal_users_data = json.load(f)
-                internal_waids = [user['waid'] for user in internal_users_data.get('internal_users', [])]
-        else:
-            # Fallback to hardcoded list if JSON doesn't exist
-            internal_waids = [
-                '555198161419', '5511988649591', '555195455326',
-                '555397038122', '5511970544995', '6593366209', '555199885544'
-            ]
-    except Exception:
-        # Fallback to hardcoded list on any error
-        internal_waids = [
-            '555198161419', '5511988649591', '555195455326',
-            '555397038122', '5511970544995', '6593366209', '555199885544'
-        ]
+    # Use shared loader so all tabs/queries stay in sync with the latest internal-users.json
+    internal_waids = load_internal_users()
     
     # Build the retention query
     internal_waids_str = "', '".join(internal_waids)
@@ -4512,9 +4487,20 @@ with tab5:
         df["activity_12h"] = df["activity_12h"].fillna(False).astype(int)
         df["activity_24h"] = df["activity_24h"].fillna(False).astype(int)
         df["response_minutes"] = pd.to_numeric(df["response_minutes"], errors="coerce")
+        df["template_sent_at_utc"] = pd.to_datetime(df["template_sent_at_utc"], utc=True, errors="coerce")
         df["template_sent_at_sp"] = pd.to_datetime(df["template_sent_at_sp"], errors="coerce")
+        df = df[df["week_start_sp"].notna()].copy()
 
-        st.markdown("#### 📊 Weekly Overview (All Templates)")
+        def _safe_pct(numerator, denominator):
+            return round(100.0 * numerator / denominator, 1) if denominator else 0.0
+
+        def _metric_delta(curr, prev, suffix="", precision=1):
+            if curr is None or pd.isna(curr) or prev is None or pd.isna(prev):
+                return "—"
+            diff = curr - prev
+            sign = "+" if diff >= 0 else ""
+            return f"{sign}{round(diff, precision)}{suffix}"
+
         weekly = (
             df.groupby("week_start_sp")
             .agg(
@@ -4534,67 +4520,201 @@ with tab5:
         weekly["activity_24h_rate_pct"] = (100.0 * weekly["activity_24h_templates"] / weekly["templates_sent"]).round(1)
         weekly["avg_response_min"] = weekly["avg_response_min"].round(1)
         weekly["median_response_min"] = weekly["median_response_min"].round(1)
-        weekly["week_start_sp"] = weekly["week_start_sp"].dt.strftime("%Y-%m-%d")
-        st.dataframe(weekly, use_container_width=True, hide_index=True)
+        week_order = sorted(weekly["week_start_sp"].dropna().unique(), reverse=True)
+        current_week = week_order[0] if len(week_order) >= 1 else None
+        prev_week = week_order[1] if len(week_order) >= 2 else None
+        prev2_week = week_order[2] if len(week_order) >= 3 else None
 
-        st.markdown("#### 🧩 Weekly Breakdown by Template")
-        by_template = (
-            df.groupby(["week_start_sp", "template_name"])
-            .agg(
-                templates_sent=("user_id", "size"),
-                users_targeted=("user_id", "nunique"),
-                replied_templates=("replied_before_next_template", "sum"),
-                activity_12h_templates=("activity_12h", "sum"),
-                activity_24h_templates=("activity_24h", "sum"),
-                avg_response_min=("response_minutes", "mean"),
-                median_response_min=("response_minutes", "median"),
+        def _week_label(dt_obj):
+            return pd.to_datetime(dt_obj).strftime("%Y-%m-%d") if dt_obj is not None else "—"
+
+        st.markdown(
+            f"#### 📊 Week Snapshot — Current: `{_week_label(current_week)}` | Prev: `{_week_label(prev_week)}` | 2w ago: `{_week_label(prev2_week)}`"
+        )
+
+        cw = weekly[weekly["week_start_sp"] == current_week].iloc[0] if current_week is not None and not weekly[weekly["week_start_sp"] == current_week].empty else None
+        pw = weekly[weekly["week_start_sp"] == prev_week].iloc[0] if prev_week is not None and not weekly[weekly["week_start_sp"] == prev_week].empty else None
+
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        if cw is not None:
+            k1.metric(
+                "Templates sent",
+                int(cw["templates_sent"]),
+                _metric_delta(int(cw["templates_sent"]), int(pw["templates_sent"]) if pw is not None else None),
             )
-            .reset_index()
-            .sort_values(["week_start_sp", "template_name"], ascending=[False, True])
-        )
-        by_template["reply_rate_pct"] = (100.0 * by_template["replied_templates"] / by_template["templates_sent"]).round(1)
-        by_template["activity_12h_rate_pct"] = (100.0 * by_template["activity_12h_templates"] / by_template["templates_sent"]).round(1)
-        by_template["activity_24h_rate_pct"] = (100.0 * by_template["activity_24h_templates"] / by_template["templates_sent"]).round(1)
-        by_template["avg_response_min"] = by_template["avg_response_min"].round(1)
-        by_template["median_response_min"] = by_template["median_response_min"].round(1)
-        by_template["week_start_sp"] = pd.to_datetime(by_template["week_start_sp"], errors="coerce").dt.strftime("%Y-%m-%d")
-        st.dataframe(by_template, use_container_width=True, hide_index=True)
+            k2.metric(
+                "Reply rate (% sends)",
+                f"{cw['reply_rate_pct']}%",
+                _metric_delta(float(cw["reply_rate_pct"]), float(pw["reply_rate_pct"]) if pw is not None else None, "pp"),
+            )
+            k3.metric(
+                "Activity 12h (% sends)",
+                f"{cw['activity_12h_rate_pct']}%",
+                _metric_delta(float(cw["activity_12h_rate_pct"]), float(pw["activity_12h_rate_pct"]) if pw is not None else None, "pp"),
+            )
+            k4.metric(
+                "Activity 24h (% sends)",
+                f"{cw['activity_24h_rate_pct']}%",
+                _metric_delta(float(cw["activity_24h_rate_pct"]), float(pw["activity_24h_rate_pct"]) if pw is not None else None, "pp"),
+            )
+            no_reply_curr = round(100.0 - float(cw["reply_rate_pct"]), 1)
+            no_reply_prev = (round(100.0 - float(pw["reply_rate_pct"]), 1) if pw is not None else None)
+            k5.metric(
+                "No-reply rate (% sends)",
+                f"{no_reply_curr}%",
+                _metric_delta(no_reply_curr, no_reply_prev, "pp"),
+            )
+            k6.metric(
+                "Median reply time (min)",
+                f"{cw['median_response_min'] if pd.notna(cw['median_response_min']) else '—'}",
+                _metric_delta(
+                    float(cw["median_response_min"]) if pd.notna(cw["median_response_min"]) else None,
+                    float(pw["median_response_min"]) if pw is not None and pd.notna(pw["median_response_min"]) else None,
+                    "m",
+                ),
+            )
+        else:
+            k1.metric("Templates sent", "—")
+            k2.metric("Reply rate (% sends)", "—")
+            k3.metric("Activity 12h (% sends)", "—")
+            k4.metric("Activity 24h (% sends)", "—")
+            k5.metric("No-reply rate (% sends)", "—")
+            k6.metric("Median reply time (min)", "—")
 
-        st.markdown("#### 👥 User-Level Attribution Detail")
-        week_options = ["All"] + sorted(
-            [w for w in df["week_start_sp"].dropna().dt.strftime("%Y-%m-%d").unique()],
-            reverse=True,
-        )
-        sel_week = st.selectbox("Week start (SP)", week_options, index=0, key="recovery_ladder_week_filter")
-        detail_df = df.copy()
-        if sel_week != "All":
-            detail_df = detail_df[detail_df["week_start_sp"].dt.strftime("%Y-%m-%d") == sel_week]
+        st.markdown("#### 📈 Weekly Timeline — Reply Rate (% sends)")
+        timeline_df = weekly[["week_start_sp", "reply_rate_pct"]].copy().sort_values("week_start_sp")
+        timeline_df = timeline_df.rename(columns={"week_start_sp": "Week", "reply_rate_pct": "Reply rate (%)"})
+        st.line_chart(timeline_df, x="Week", y="Reply rate (%)")
 
-        template_options = ["All"] + sorted([t for t in detail_df["template_name"].dropna().unique()])
-        sel_template = st.selectbox("Template", template_options, index=0, key="recovery_ladder_template_filter")
-        if sel_template != "All":
-            detail_df = detail_df[detail_df["template_name"] == sel_template]
+        def _template_week_summary(week_dt, suffix):
+            if week_dt is None:
+                return pd.DataFrame(columns=["template_name"])
+            t = df[df["week_start_sp"] == week_dt].copy()
+            if t.empty:
+                return pd.DataFrame(columns=["template_name"])
+            out = (
+                t.groupby("template_name")
+                .agg(
+                    sends=("user_id", "size"),
+                    users_targeted=("user_id", "nunique"),
+                    replied=("replied_before_next_template", "sum"),
+                    activity_12h=("activity_12h", "sum"),
+                    activity_24h=("activity_24h", "sum"),
+                    avg_response_min=("response_minutes", "mean"),
+                    median_response_min=("response_minutes", "median"),
+                )
+                .reset_index()
+            )
+            out[f"sends_{suffix}"] = out["sends"].astype(int)
+            out[f"users_{suffix}"] = out["users_targeted"].astype(int)
+            out[f"reply_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["replied"], r["sends"]), axis=1)
+            out[f"act12_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_12h"], r["sends"]), axis=1)
+            out[f"act24_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_24h"], r["sends"]), axis=1)
+            out[f"avg_resp_min_{suffix}"] = out["avg_response_min"].round(1)
+            out[f"median_resp_min_{suffix}"] = out["median_response_min"].round(1)
+            keep = [
+                "template_name",
+                f"sends_{suffix}",
+                f"users_{suffix}",
+                f"reply_pct_{suffix}",
+                f"act12_pct_{suffix}",
+                f"act24_pct_{suffix}",
+                f"avg_resp_min_{suffix}",
+                f"median_resp_min_{suffix}",
+            ]
+            return out[keep]
 
-        detail_df["week_start_sp"] = detail_df["week_start_sp"].dt.strftime("%Y-%m-%d")
-        detail_df["template_sent_at_sp"] = detail_df["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
-        detail_df["replied_before_next_template"] = detail_df["replied_before_next_template"].map({1: "Yes", 0: "No"})
-        detail_df["activity_12h"] = detail_df["activity_12h"].map({1: "Yes", 0: "No"})
-        detail_df["activity_24h"] = detail_df["activity_24h"].map({1: "Yes", 0: "No"})
-        detail_df["response_minutes"] = detail_df["response_minutes"].round(1)
+        st.markdown("#### 🧩 Template Leaderboard — This vs Previous vs 2w Ago")
+        t_curr = _template_week_summary(current_week, "this")
+        t_prev = _template_week_summary(prev_week, "prev")
+        t_prev2 = _template_week_summary(prev2_week, "prev2")
+        template_compare = t_curr.merge(t_prev, on="template_name", how="outer").merge(t_prev2, on="template_name", how="outer")
+        min_sends = st.slider("Minimum sends (this week)", min_value=1, max_value=50, value=10, step=1, key="recovery_template_min_sends")
+        if "sends_this" in template_compare.columns:
+            template_compare["sends_this"] = template_compare["sends_this"].fillna(0).astype(int)
+            template_compare = template_compare[template_compare["sends_this"] >= min_sends]
+        template_compare = template_compare.sort_values("sends_this", ascending=False) if not template_compare.empty and "sends_this" in template_compare.columns else template_compare
+        st.dataframe(template_compare, use_container_width=True, hide_index=True)
 
-        detail_cols = [
-            "week_start_sp",
-            "template_name",
-            "ladder_step",
-            "full_name",
-            "waid",
-            "template_sent_at_sp",
-            "replied_before_next_template",
-            "activity_12h",
-            "activity_24h",
-            "response_minutes",
-        ]
-        st.dataframe(detail_df[detail_cols], use_container_width=True, hide_index=True)
+        st.markdown("#### 🧱 Ladder Step Health — This vs Previous vs 2w Ago")
+        def _step_week_summary(week_dt, suffix):
+            if week_dt is None:
+                return pd.DataFrame(columns=["ladder_step"])
+            s = df[df["week_start_sp"] == week_dt].copy()
+            if s.empty:
+                return pd.DataFrame(columns=["ladder_step"])
+            out = (
+                s.groupby("ladder_step")
+                .agg(
+                    sends=("user_id", "size"),
+                    replied=("replied_before_next_template", "sum"),
+                    activity_12h=("activity_12h", "sum"),
+                    activity_24h=("activity_24h", "sum"),
+                    median_response_min=("response_minutes", "median"),
+                )
+                .reset_index()
+            )
+            out[f"sends_{suffix}"] = out["sends"].astype(int)
+            out[f"reply_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["replied"], r["sends"]), axis=1)
+            out[f"act12_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_12h"], r["sends"]), axis=1)
+            out[f"act24_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_24h"], r["sends"]), axis=1)
+            out[f"median_resp_min_{suffix}"] = out["median_response_min"].round(1)
+            return out[["ladder_step", f"sends_{suffix}", f"reply_pct_{suffix}", f"act12_pct_{suffix}", f"act24_pct_{suffix}", f"median_resp_min_{suffix}"]]
+
+        s_curr = _step_week_summary(current_week, "this")
+        s_prev = _step_week_summary(prev_week, "prev")
+        s_prev2 = _step_week_summary(prev2_week, "prev2")
+        step_compare = s_curr.merge(s_prev, on="ladder_step", how="outer").merge(s_prev2, on="ladder_step", how="outer")
+        if not step_compare.empty and "ladder_step" in step_compare.columns:
+            step_compare = step_compare.sort_values("ladder_step")
+        st.dataframe(step_compare, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 🚨 At-Risk Queue (No reply + no 24h activity)")
+        now_utc = pd.Timestamp.now(tz="UTC")
+        at_risk = df[(df["replied_before_next_template"] == 0) & (df["activity_24h"] == 0)].copy()
+        if at_risk.empty:
+            st.success("✅ No at-risk users right now.")
+        else:
+            # Keep latest template per user for operational follow-up
+            at_risk = at_risk.sort_values("template_sent_at_utc", ascending=False).drop_duplicates(subset=["user_id"], keep="first")
+            at_risk["hours_since_send"] = (
+                (now_utc - at_risk["template_sent_at_utc"]).dt.total_seconds() / 3600.0
+            ).round(1)
+            at_risk["week_start_sp"] = at_risk["week_start_sp"].dt.strftime("%Y-%m-%d")
+            at_risk["template_sent_at_sp"] = at_risk["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
+            at_risk = at_risk.sort_values("hours_since_send", ascending=False)
+            at_risk_cols = [
+                "week_start_sp",
+                "template_name",
+                "ladder_step",
+                "full_name",
+                "waid",
+                "template_sent_at_sp",
+                "hours_since_send",
+            ]
+            st.dataframe(at_risk[at_risk_cols], use_container_width=True, hide_index=True)
+
+        with st.expander("Raw Attribution Detail", expanded=False):
+            detail_df = df.copy()
+            detail_df["week_start_sp"] = detail_df["week_start_sp"].dt.strftime("%Y-%m-%d")
+            detail_df["template_sent_at_sp"] = detail_df["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
+            detail_df["replied_before_next_template"] = detail_df["replied_before_next_template"].map({1: "Yes", 0: "No"})
+            detail_df["activity_12h"] = detail_df["activity_12h"].map({1: "Yes", 0: "No"})
+            detail_df["activity_24h"] = detail_df["activity_24h"].map({1: "Yes", 0: "No"})
+            detail_df["response_minutes"] = detail_df["response_minutes"].round(1)
+            detail_cols = [
+                "week_start_sp",
+                "template_name",
+                "ladder_step",
+                "full_name",
+                "waid",
+                "template_sent_at_sp",
+                "replied_before_next_template",
+                "activity_12h",
+                "activity_24h",
+                "response_minutes",
+            ]
+            st.dataframe(detail_df[detail_cols], use_container_width=True, hide_index=True)
 
 
 # Footer

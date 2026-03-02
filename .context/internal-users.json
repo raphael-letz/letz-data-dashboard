@@ -48,9 +48,16 @@
       "coach_name": "Bia",
       "user_id": 23,
       "notes": "Internal user"
+    },
+    {
+      "waid": "5512981257941",
+      "full_name": "Michel ",
+      "coach_name": "Alex",
+      "user_id": 40,
+      "notes": "Internal user"
     }
   ],
-  "last_updated": "2026-01-23",
+  "last_updated": "2026-02-27",
   "notes": "These users should be excluded from analysis queries to get accurate user behavior metrics. Always filter them out using: WHERE u.waid NOT IN (SELECT waid FROM internal_users list)"
 }
 
