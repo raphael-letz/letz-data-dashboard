@@ -539,6 +539,7 @@ template_sends AS (
     r.id AS recovery_log_id,
     r.user_id,
     u.waid,
+    u.is_active,
     COALESCE(u.full_name, 'Unknown') AS full_name,
     COALESCE(r.template_name, 'Unknown') AS template_name,
     r.ladder_step,
@@ -602,6 +603,7 @@ SELECT
   ladder_step,
   user_id,
   waid,
+  is_active,
   full_name,
   template_sent_at_utc,
   template_sent_at_sp,
@@ -2857,7 +2859,7 @@ with tab2:
         # Activity plan (schedule) from user_activities
         plan_df = run_query(f"""
             SELECT 
-                activity,
+                description,
                 days,
                 created_at
             FROM user_activities
@@ -2901,7 +2903,7 @@ with tab2:
         
         if not plan_df.empty:
             for _, row in plan_df.iterrows():
-                act_name = row.get('activity') or 'Activity'
+                act_name = row.get('description') or 'Activity'
                 days_list = parse_days(row.get('days'))
                 for day in days_list:
                     normalized = day.strip().capitalize()
@@ -4464,22 +4466,16 @@ with tab4:
 # Tab 5: Recovery Ladder
 with tab5:
     st.markdown("### 🪜 Recovery Ladder")
-    st.caption("Week-by-week template performance (Monday weeks in America/Sao_Paulo), attributed to the latest template sent per user.")
 
-    start_date = st.date_input(
-        "Start date (SP local date)",
-        value=datetime(2026, 2, 1).date(),
-        key="recovery_ladder_start_date",
-    )
-
+    default_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
     try:
-        recovery_events = get_recovery_ladder_events(start_date.strftime("%Y-%m-%d"))
+        recovery_events = get_recovery_ladder_events(default_start)
     except Exception as e:
         recovery_events = pd.DataFrame()
         st.error(f"Could not load recovery ladder data: {e}")
 
     if recovery_events.empty:
-        st.info("No recovery ladder sends found for the selected start date.")
+        st.info("No recovery ladder sends found for the date range.")
     else:
         df = recovery_events.copy()
         df["week_start_sp"] = pd.to_datetime(df["week_start_sp"], errors="coerce")
@@ -4563,15 +4559,15 @@ with tab5:
                 "No-reply rate (% sends)",
                 f"{no_reply_curr}%",
                 _metric_delta(no_reply_curr, no_reply_prev, "pp"),
+                delta_color="inverse",
             )
+            median_curr = float(cw["median_response_min"]) if pd.notna(cw["median_response_min"]) else None
+            median_prev = float(pw["median_response_min"]) if pw is not None and pd.notna(pw["median_response_min"]) else None
             k6.metric(
                 "Median reply time (min)",
                 f"{cw['median_response_min'] if pd.notna(cw['median_response_min']) else '—'}",
-                _metric_delta(
-                    float(cw["median_response_min"]) if pd.notna(cw["median_response_min"]) else None,
-                    float(pw["median_response_min"]) if pw is not None and pd.notna(pw["median_response_min"]) else None,
-                    "m",
-                ),
+                _metric_delta(median_curr, median_prev, "m"),
+                delta_color="inverse",
             )
         else:
             k1.metric("Templates sent", "—")
@@ -4584,137 +4580,99 @@ with tab5:
         st.markdown("#### 📈 Weekly Timeline — Reply Rate (% sends)")
         timeline_df = weekly[["week_start_sp", "reply_rate_pct"]].copy().sort_values("week_start_sp")
         timeline_df = timeline_df.rename(columns={"week_start_sp": "Week", "reply_rate_pct": "Reply rate (%)"})
-        st.line_chart(timeline_df, x="Week", y="Reply rate (%)")
+        timeline_df["Week"] = pd.to_datetime(timeline_df["Week"]).dt.strftime("%Y-%m-%d")
+        import altair as alt
+        timeline_chart = (
+            alt.Chart(timeline_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Week:N", sort=None, title="Week"),
+                y=alt.Y("Reply rate (%)", title="Reply rate (%)"),
+                tooltip=[alt.Tooltip("Week:N", title="Week"), alt.Tooltip("Reply rate (%)", title="Reply rate (%)")],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(timeline_chart, use_container_width=True)
 
-        def _template_week_summary(week_dt, suffix):
-            if week_dt is None:
-                return pd.DataFrame(columns=["template_name"])
-            t = df[df["week_start_sp"] == week_dt].copy()
-            if t.empty:
-                return pd.DataFrame(columns=["template_name"])
-            out = (
-                t.groupby("template_name")
+        # Week-by-week: % reply within 72h for active users who went outside 24h window
+        df["is_active"] = df["is_active"].fillna(True).astype(bool)
+        df["outside_24h"] = (df["response_minutes"].isna()) | (df["response_minutes"] > 1440)
+        df["replied_within_72h"] = (df["response_minutes"].notna()) & (df["response_minutes"] <= 4320)
+        outside_24h = df[(df["outside_24h"]) & (df["is_active"])]
+        if not outside_24h.empty:
+            # Per week: count inactive users (in full cohort for that week)
+            week_inactive = (
+                df[~df["is_active"]]
+                .groupby("week_start_sp")["user_id"]
+                .nunique()
+                .reset_index()
+                .rename(columns={"user_id": "inactive_count"})
+            )
+            week_72h = (
+                outside_24h.groupby("week_start_sp")
                 .agg(
-                    sends=("user_id", "size"),
-                    users_targeted=("user_id", "nunique"),
-                    replied=("replied_before_next_template", "sum"),
-                    activity_12h=("activity_12h", "sum"),
-                    activity_24h=("activity_24h", "sum"),
-                    avg_response_min=("response_minutes", "mean"),
-                    median_response_min=("response_minutes", "median"),
+                    outside_24h_count=("user_id", "size"),
+                    replied_within_72h_count=("replied_within_72h", "sum"),
                 )
                 .reset_index()
             )
-            out[f"sends_{suffix}"] = out["sends"].astype(int)
-            out[f"users_{suffix}"] = out["users_targeted"].astype(int)
-            out[f"reply_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["replied"], r["sends"]), axis=1)
-            out[f"act12_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_12h"], r["sends"]), axis=1)
-            out[f"act24_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_24h"], r["sends"]), axis=1)
-            out[f"avg_resp_min_{suffix}"] = out["avg_response_min"].round(1)
-            out[f"median_resp_min_{suffix}"] = out["median_response_min"].round(1)
-            keep = [
-                "template_name",
-                f"sends_{suffix}",
-                f"users_{suffix}",
-                f"reply_pct_{suffix}",
-                f"act12_pct_{suffix}",
-                f"act24_pct_{suffix}",
-                f"avg_resp_min_{suffix}",
-                f"median_resp_min_{suffix}",
-            ]
-            return out[keep]
-
-        st.markdown("#### 🧩 Template Leaderboard — This vs Previous vs 2w Ago")
-        t_curr = _template_week_summary(current_week, "this")
-        t_prev = _template_week_summary(prev_week, "prev")
-        t_prev2 = _template_week_summary(prev2_week, "prev2")
-        template_compare = t_curr.merge(t_prev, on="template_name", how="outer").merge(t_prev2, on="template_name", how="outer")
-        min_sends = st.slider("Minimum sends (this week)", min_value=1, max_value=50, value=10, step=1, key="recovery_template_min_sends")
-        if "sends_this" in template_compare.columns:
-            template_compare["sends_this"] = template_compare["sends_this"].fillna(0).astype(int)
-            template_compare = template_compare[template_compare["sends_this"] >= min_sends]
-        template_compare = template_compare.sort_values("sends_this", ascending=False) if not template_compare.empty and "sends_this" in template_compare.columns else template_compare
-        st.dataframe(template_compare, use_container_width=True, hide_index=True)
-
-        st.markdown("#### 🧱 Ladder Step Health — This vs Previous vs 2w Ago")
-        def _step_week_summary(week_dt, suffix):
-            if week_dt is None:
-                return pd.DataFrame(columns=["ladder_step"])
-            s = df[df["week_start_sp"] == week_dt].copy()
-            if s.empty:
-                return pd.DataFrame(columns=["ladder_step"])
-            out = (
-                s.groupby("ladder_step")
-                .agg(
-                    sends=("user_id", "size"),
-                    replied=("replied_before_next_template", "sum"),
-                    activity_12h=("activity_12h", "sum"),
-                    activity_24h=("activity_24h", "sum"),
-                    median_response_min=("response_minutes", "median"),
-                )
-                .reset_index()
+            week_72h = week_72h.merge(week_inactive, on="week_start_sp", how="left")
+            week_72h["inactive_count"] = week_72h["inactive_count"].fillna(0).astype(int)
+            week_72h["reply_within_72h_pct"] = week_72h.apply(
+                lambda r: round(100.0 * r["replied_within_72h_count"] / r["outside_24h_count"], 1)
+                if r["outside_24h_count"] else 0,
+                axis=1,
             )
-            out[f"sends_{suffix}"] = out["sends"].astype(int)
-            out[f"reply_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["replied"], r["sends"]), axis=1)
-            out[f"act12_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_12h"], r["sends"]), axis=1)
-            out[f"act24_pct_{suffix}"] = out.apply(lambda r: _safe_pct(r["activity_24h"], r["sends"]), axis=1)
-            out[f"median_resp_min_{suffix}"] = out["median_response_min"].round(1)
-            return out[["ladder_step", f"sends_{suffix}", f"reply_pct_{suffix}", f"act12_pct_{suffix}", f"act24_pct_{suffix}", f"median_resp_min_{suffix}"]]
+            week_72h = week_72h.sort_values("week_start_sp", ascending=False)
+            week_72h["week_start_sp"] = week_72h["week_start_sp"].dt.strftime("%Y-%m-%d")
+            st.markdown("#### 📋 Week-by-Week — Reply Within 72h (% of active users outside 24h window)")
+            st.dataframe(
+                week_72h[
+                    ["week_start_sp", "outside_24h_count", "inactive_count", "replied_within_72h_count", "reply_within_72h_pct"]
+                ].rename(
+                    columns={
+                        "week_start_sp": "Week",
+                        "outside_24h_count": "Outside 24h (active)",
+                        "inactive_count": "Users flagged inactive",
+                        "replied_within_72h_count": "Replied within 72h",
+                        "reply_within_72h_pct": "Reply within 72h (%)",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        s_curr = _step_week_summary(current_week, "this")
-        s_prev = _step_week_summary(prev_week, "prev")
-        s_prev2 = _step_week_summary(prev2_week, "prev2")
-        step_compare = s_curr.merge(s_prev, on="ladder_step", how="outer").merge(s_prev2, on="ladder_step", how="outer")
-        if not step_compare.empty and "ladder_step" in step_compare.columns:
-            step_compare = step_compare.sort_values("ladder_step")
-        st.dataframe(step_compare, use_container_width=True, hide_index=True)
-
-        st.markdown("#### 🚨 At-Risk Queue (No reply + no 24h activity)")
-        now_utc = pd.Timestamp.now(tz="UTC")
-        at_risk = df[(df["replied_before_next_template"] == 0) & (df["activity_24h"] == 0)].copy()
-        if at_risk.empty:
-            st.success("✅ No at-risk users right now.")
-        else:
-            # Keep latest template per user for operational follow-up
-            at_risk = at_risk.sort_values("template_sent_at_utc", ascending=False).drop_duplicates(subset=["user_id"], keep="first")
-            at_risk["hours_since_send"] = (
-                (now_utc - at_risk["template_sent_at_utc"]).dt.total_seconds() / 3600.0
-            ).round(1)
-            at_risk["week_start_sp"] = at_risk["week_start_sp"].dt.strftime("%Y-%m-%d")
-            at_risk["template_sent_at_sp"] = at_risk["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
-            at_risk = at_risk.sort_values("hours_since_send", ascending=False)
-            at_risk_cols = [
-                "week_start_sp",
-                "template_name",
-                "ladder_step",
-                "full_name",
-                "waid",
-                "template_sent_at_sp",
-                "hours_since_send",
-            ]
-            st.dataframe(at_risk[at_risk_cols], use_container_width=True, hide_index=True)
-
-        with st.expander("Raw Attribution Detail", expanded=False):
-            detail_df = df.copy()
-            detail_df["week_start_sp"] = detail_df["week_start_sp"].dt.strftime("%Y-%m-%d")
-            detail_df["template_sent_at_sp"] = detail_df["template_sent_at_sp"].dt.strftime("%Y-%m-%d %H:%M")
-            detail_df["replied_before_next_template"] = detail_df["replied_before_next_template"].map({1: "Yes", 0: "No"})
-            detail_df["activity_12h"] = detail_df["activity_12h"].map({1: "Yes", 0: "No"})
-            detail_df["activity_24h"] = detail_df["activity_24h"].map({1: "Yes", 0: "No"})
-            detail_df["response_minutes"] = detail_df["response_minutes"].round(1)
-            detail_cols = [
-                "week_start_sp",
-                "template_name",
-                "ladder_step",
-                "full_name",
-                "waid",
-                "template_sent_at_sp",
-                "replied_before_next_template",
-                "activity_12h",
-                "activity_24h",
-                "response_minutes",
-            ]
-            st.dataframe(detail_df[detail_cols], use_container_width=True, hide_index=True)
+        # Ladder step: % reply within 24h, week-by-week
+        df["replied_within_24h"] = (df["response_minutes"].notna()) & (df["response_minutes"] <= 1440)
+        ladder_weekly = (
+            df.groupby(["ladder_step", "week_start_sp"])
+            .agg(
+                sends=("user_id", "size"),
+                replied_within_24h_count=("replied_within_24h", "sum"),
+            )
+            .reset_index()
+        )
+        ladder_weekly["reply_within_24h_pct"] = ladder_weekly.apply(
+            lambda r: round(100.0 * r["replied_within_24h_count"] / r["sends"], 1) if r["sends"] else 0,
+            axis=1,
+        )
+        # Pivot: ladder_step as rows, weeks as columns
+        week_cols = sorted(ladder_weekly["week_start_sp"].dropna().unique(), reverse=True)
+        pivot_data = []
+        for step in ladder_weekly["ladder_step"].unique():
+            row = {"Ladder step": step}
+            for w in week_cols:
+                w_str = pd.to_datetime(w).strftime("%Y-%m-%d") if hasattr(w, "strftime") else str(w)[:10]
+                r = ladder_weekly[(ladder_weekly["ladder_step"] == step) & (ladder_weekly["week_start_sp"] == w)]
+                if not r.empty:
+                    row[w_str] = f"{r['reply_within_24h_pct'].iloc[0]}%"
+                else:
+                    row[w_str] = "—"
+            pivot_data.append(row)
+        if pivot_data:
+            ladder_pivot_df = pd.DataFrame(pivot_data)
+            st.markdown("#### 📋 Ladder Step — Reply Within 24h (%) by Week")
+            st.dataframe(ladder_pivot_df, use_container_width=True, hide_index=True)
 
 
 # Footer
