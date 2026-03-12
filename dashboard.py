@@ -515,6 +515,45 @@ ORDER BY n.last_sent_at ASC;
 
 
 @st.cache_data(ttl=300)
+def get_recovery_ladder_2_alert_detail() -> pd.DataFrame:
+    """
+    Users on penultimate recovery ladder step (recovery_ladder_2) who received a template
+    on today, yesterday, or day_before (America/Sao_Paulo). One row per (user, period).
+    Excludes internal users.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+
+    query = f"""
+WITH ref_dates AS (
+  SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) AS ref_date, 'today' AS period
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 1, 'yesterday'
+  UNION ALL SELECT ((CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date) - 2, 'day_before'
+),
+internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+)
+SELECT
+  TO_CHAR(rd.ref_date, 'YYYY-MM-DD') AS ref_date,
+  rd.period,
+  r.user_id,
+  u.waid,
+  COALESCE(u.full_name, '—') AS full_name,
+  r.sent_at,
+  COALESCE(r.template_name, 'Unknown') AS template_name,
+  COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC') AS user_timezone
+FROM recovery_logs r
+JOIN users u ON u.id = r.user_id
+CROSS JOIN ref_dates rd
+WHERE r.ladder_step = 'recovery_ladder_2'
+  AND (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = rd.ref_date
+  AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+ORDER BY rd.ref_date DESC, r.sent_at DESC;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
 def get_recovery_ladder_events(start_date_sp: str = "2026-02-01") -> pd.DataFrame:
     """
     Recovery template sends with latest-template attribution windows.
@@ -4297,11 +4336,15 @@ with tab4:
         st.error(f"Could not load message delivery data: {e}")
 
     if not delivery_df.empty:
-        # Load onboarding drop-off for alert counts in date selector
+        # Load onboarding drop-off and recovery ladder 2 for alert counts in date selector
         try:
             _onboarding_df = get_onboarding_dropoff_detail()
         except Exception:
             _onboarding_df = pd.DataFrame()
+        try:
+            _recovery_ladder_2_df = get_recovery_ladder_2_alert_detail()
+        except Exception:
+            _recovery_ladder_2_df = pd.DataFrame()
 
         # Date selector: today / yesterday / day_before (with alert count per date)
         periods = [
@@ -4323,7 +4366,8 @@ with tab4:
                 + delivery_df.loc[delivery_df["period"] == key, "missed_evening"].sum()
             )
             onb_count = len(_onboarding_df[_onboarding_df["period"] == key]) if not _onboarding_df.empty else 0
-            total_alerts = msg_missed + onb_count
+            rl2_count = len(_recovery_ladder_2_df[_recovery_ladder_2_df["period"] == key]) if not _recovery_ladder_2_df.empty else 0
+            total_alerts = msg_missed + onb_count + rl2_count
             labels_with_dates.append(date_only_str + f" — {total_alerts} alert{'s' if total_alerts != 1 else ''}")
         selected_idx = st.radio(
             "**Select date**",
@@ -4412,6 +4456,27 @@ with tab4:
             )
             st.dataframe(
                 pending_display[["waid", "full_name", "last message at", "last message", "reply pending"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # Recovery Ladder 2 — users on penultimate step who received template on selected date
+        st.markdown("---")
+        st.markdown("### 🪜 Recovery Ladder 2 — Received in last 24h")
+        st.caption("Users on the penultimate recovery ladder step (recovery_ladder_2) who received a template on the selected date.")
+
+        rl2_day = _recovery_ladder_2_df[_recovery_ladder_2_df["period"] == selected_period].copy() if not _recovery_ladder_2_df.empty else pd.DataFrame()
+        if rl2_day.empty:
+            st.success(f"✅ No users on recovery ladder 2 for **{date_label}**.")
+        else:
+            st.info(f"**{len(rl2_day)} user(s)** on recovery ladder 2 received a template on **{date_label}**.")
+            rl2_display = rl2_day[["waid", "full_name", "sent_at", "template_name", "user_timezone"]].copy()
+            rl2_display["received at"] = rl2_display.apply(
+                lambda row: _format_ts_local(row["sent_at"], row.get("user_timezone")) if pd.notna(row["sent_at"]) else "—",
+                axis=1,
+            )
+            st.dataframe(
+                rl2_display[["waid", "full_name", "received at", "template_name"]],
                 use_container_width=True,
                 hide_index=True,
             )
