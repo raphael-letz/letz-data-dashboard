@@ -255,6 +255,43 @@ def load_internal_users():
         return fallback_internal_waids
 
 
+def load_investor_waids():
+    """
+    Load investor WAIDs from JSON file. Users with these WAIDs are flagged [investor] in dashboard.
+    File: analysis/.context/special-users.json
+    """
+    try:
+        base_dir = os.path.dirname(__file__)
+        for candidate in [
+            os.path.join(base_dir, ".context", "special-users.json"),
+            os.path.join(base_dir, "..", ".context", "special-users.json"),
+        ]:
+            if os.path.exists(candidate):
+                with open(candidate, "r") as f:
+                    data = json.load(f)
+                    waids = data.get("investor_waids", [])
+                    return [str(w).strip() for w in waids if w]
+        return []
+    except Exception:
+        return []
+
+
+def format_display_name(name, waid=None, tag="investor"):
+    """
+    Append [investor] tag to name if user's WAID is in special-users.json.
+    """
+    if pd.isna(name) or name is None or str(name).strip() == "":
+        return "Unknown"
+    name_str = str(name).strip()
+    investor_waids = load_investor_waids()
+    if not investor_waids or not waid:
+        return name_str
+    waid_str = str(waid).strip() if waid is not None else ""
+    if waid_str and waid_str in investor_waids:
+        return f"{name_str} [{tag}]"
+    return name_str
+
+
 def get_internal_users_filter_sql(exclude_internal: bool = True) -> str:
     """Generate SQL filter clause to exclude internal users.
     
@@ -557,7 +594,7 @@ ORDER BY rd.ref_date DESC, r.sent_at DESC;
 def get_at_risk_users_last_24h() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Users who received Recovery Ladder 1 or 2 in the last 24 hours.
-    Returns (rl2_df, rl1_df) each with columns: full_name, sent_at.
+    Returns (rl2_df, rl1_df) each with columns: waid, full_name, sent_at.
     Excludes internal users.
     """
     internal_waids = load_internal_users()
@@ -568,6 +605,7 @@ WITH internal_waids AS (
 )
 SELECT
   r.ladder_step,
+  u.waid,
   COALESCE(u.full_name, 'Unknown') AS full_name,
   r.sent_at
 FROM recovery_logs r
@@ -579,7 +617,7 @@ ORDER BY r.ladder_step DESC, r.sent_at DESC;
 """
     df = run_query(query)
     if df.empty:
-        return pd.DataFrame(columns=["ladder_step", "full_name", "sent_at"]), pd.DataFrame(columns=["ladder_step", "full_name", "sent_at"])
+        return pd.DataFrame(columns=["ladder_step", "waid", "full_name", "sent_at"]), pd.DataFrame(columns=["ladder_step", "waid", "full_name", "sent_at"])
     rl2 = df[df["ladder_step"] == "recovery_ladder_2"].copy()
     rl1 = df[df["ladder_step"] == "recovery_ladder_1"].copy()
     return rl2, rl1
@@ -1215,9 +1253,9 @@ with tab1:
         internal_filter = get_internal_users_filter_sql(exclude_internal)
         where_clause = "WHERE created_at >= NOW() - INTERVAL '7 days'" if not internal_filter else f"{internal_filter} AND created_at >= NOW() - INTERVAL '7 days'"
         new_today_list = run_query(f"""
-            SELECT COALESCE(full_name, 'Unknown') AS name
+            SELECT COALESCE(full_name, 'Unknown') AS name, waid
             FROM (
-                SELECT DISTINCT ON (waid) full_name, created_at
+                SELECT DISTINCT ON (waid) full_name, waid, created_at
                 FROM users
                 {where_clause}
                 ORDER BY waid, created_at DESC
@@ -1229,15 +1267,15 @@ with tab1:
             if new_today_list.empty:
                 st.caption("No users")
             else:
-                for n in new_today_list['name']:
-                    st.caption(f"• {n}")
+                for _, row in new_today_list.iterrows():
+                    st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
     except:
         st.warning("Could not load new users (past 7d) list")
     
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
         active_today_list = run_query(f"""
-            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name
+            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name, u.waid
             FROM messages m
             JOIN users u ON m.user_id = u.id
             WHERE m.sent_at >= CURRENT_DATE 
@@ -1251,8 +1289,8 @@ with tab1:
             if active_today_list.empty:
                 st.caption("No users")
             else:
-                for n in active_today_list['name']:
-                    st.caption(f"• {n}")
+                for _, row in active_today_list.iterrows():
+                    st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
     except:
         st.warning("Could not load Messaged today list")
 
@@ -1270,7 +1308,7 @@ with tab1:
             else:
                 for _, row in rl2_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    st.caption(f"• {row['full_name']} — {sent_at_sp}")
+                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}")
 
             st.markdown("**Recovery Ladder 1**")
             if rl1_df.empty:
@@ -1278,7 +1316,7 @@ with tab1:
             else:
                 for _, row in rl1_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    st.caption(f"• {row['full_name']} — {sent_at_sp}")
+                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
@@ -1955,6 +1993,7 @@ with tab1:
                 m.sent_at as timestamp,
                 m.type as msg_type,
                 u.full_name as user_name,
+                u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message
@@ -1972,6 +2011,7 @@ with tab1:
                 m.sent_at as timestamp,
                 m.type as msg_type,
                 u.full_name as user_name,
+                u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message
@@ -1989,6 +2029,7 @@ with tab1:
                 m.sent_at as timestamp,
                 m.type as msg_type,
                 u.full_name as user_name,
+                u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message
@@ -2373,7 +2414,7 @@ with tab1:
             text = get_display_text(i)
             rows_display.append({
                 "Time": format_timestamp_local(row),
-                "User": row["user_name"] if pd.notna(row["user_name"]) else "Unknown",
+                "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
                 "Message": text,
@@ -2703,7 +2744,7 @@ with tab1:
             xp_map = dict(zip(xp_df['user_id'], xp_df['total_xp']))
         
         display_df = pd.DataFrame({
-            'Name': all_users['full_name'].fillna('Unknown'),
+            'Name': all_users.apply(lambda r: format_display_name(r['full_name'], r.get('waid')), axis=1),
             'WhatsApp ID': all_users['waid'],
             'Age': all_users['age'].fillna('—') if 'age' in all_users.columns else '—',
             'Gender': all_users['gender'].fillna('—') if 'gender' in all_users.columns else '—',
@@ -2789,7 +2830,7 @@ with tab2:
     if users_df.empty:
         st.info("No users found")
     else:
-        users_df['label'] = users_df.apply(lambda r: f"{r['full_name']}{' *' if r.get('is_active_24h') else ''} ({r['waid']})", axis=1)
+        users_df['label'] = users_df.apply(lambda r: f"{format_display_name(r['full_name'], r['waid'])}{' *' if r.get('is_active_24h') else ''} ({r['waid']})", axis=1)
         selected_label = st.selectbox("Select user", users_df['label'])
         selected_row = users_df[users_df['label'] == selected_label].iloc[0]
         user_id = int(selected_row['id'])
@@ -3902,6 +3943,7 @@ user_messages AS (
   SELECT
     u.id AS user_id,
     u.full_name,
+    u.waid,
     (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
   FROM messages m
   JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
@@ -3911,6 +3953,7 @@ user_first_last AS (
   SELECT
     user_id,
     full_name,
+    MAX(waid) AS waid,
     MIN(local_date) AS first_active_date,
     MAX(local_date) AS last_active_date
   FROM user_messages
@@ -3936,6 +3979,7 @@ user_stats AS (
   SELECT
     ufl.user_id,
     ufl.full_name,
+    ufl.waid,
     (tl.d - ufl.first_active_date) AS lifetime,
     udc.active_days,
     COALESCE(ac.activities_completed, 0)::int AS activities_completed
@@ -3944,17 +3988,23 @@ user_stats AS (
   JOIN user_days_count udc ON udc.user_id = ufl.user_id
   LEFT JOIN activities_completed ac ON ac.user_id = ufl.user_id
 )
-SELECT user_id, full_name, lifetime, active_days, activities_completed FROM user_stats ORDER BY full_name
+SELECT user_id, full_name, waid, lifetime, active_days, activities_completed FROM user_stats ORDER BY full_name
 """
                 overview_df = run_query(overview_query)
                 if not overview_df.empty:
                     established = overview_df[overview_df['lifetime'] >= 7].copy()
                     new_users = overview_df[overview_df['lifetime'] < 7].copy()
-                    most_active = established.sort_values('activities_completed', ascending=False)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_active = established.sort_values('activities_completed', ascending=False)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_active['full_name'] = most_active.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    most_active = most_active[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     most_active.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    most_inactive = established.sort_values('activities_completed', ascending=True)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_inactive = established.sort_values('activities_completed', ascending=True)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_inactive['full_name'] = most_inactive.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    most_inactive = most_inactive[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     most_inactive.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['full_name', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    new_users_display['full_name'] = new_users_display.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    new_users_display = new_users_display[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     new_users_display.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
                     st.markdown("#### Quick overview")
                     st.caption("Active/inactive order by total activities completed. Lifetime (days) = days since first activity (São Paulo). Established = 7+ days; New users = under 7 days.")
@@ -4461,7 +4511,10 @@ with tab4:
             missed=("_missed_morning", "sum"),
         ).reset_index()
         morning["slot"] = "Morning"
-        morning_names = df_day[df_day["_missed_morning"] > 0].groupby("time_morning")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        _morning_grp = df_day[df_day["_missed_morning"] > 0].groupby("time_morning")
+        morning_names = _morning_grp.apply(
+            lambda g: ", ".join(sorted(g.drop_duplicates("waid").apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)))
+        ).reset_index()
         morning_names.columns = ["time_morning", "users"]
         morning = morning.merge(morning_names, on="time_morning", how="left")
         morning["users"] = morning["users"].fillna("").astype(str)
@@ -4472,7 +4525,10 @@ with tab4:
             missed=("_missed_evening", "sum"),
         ).reset_index()
         evening["slot"] = "Evening"
-        evening_names = df_day[df_day["_missed_evening"] > 0].groupby("time_evening")["full_name"].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index()
+        _evening_grp = df_day[df_day["_missed_evening"] > 0].groupby("time_evening")
+        evening_names = _evening_grp.apply(
+            lambda g: ", ".join(sorted(g.drop_duplicates("waid").apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)))
+        ).reset_index()
         evening_names.columns = ["time_evening", "users"]
         evening = evening.merge(evening_names, on="time_evening", how="left")
         evening["users"] = evening["users"].fillna("").astype(str)
@@ -4504,6 +4560,7 @@ with tab4:
         if not pending_df.empty:
             now_utc = pd.Timestamp.utcnow()
             pending_display = pending_df[["waid", "full_name", "last_sent_at", "last_message"]].copy()
+            pending_display["full_name"] = pending_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
             pending_display["last message"] = pending_display["last_message"].apply(
                 lambda m: _extract_message_text_snippet(m, max_len=100)
             )
@@ -4530,6 +4587,7 @@ with tab4:
         else:
             st.info(f"**{len(rl2_day)} user(s)** on recovery ladder 2 received a template on **{date_label}**.")
             rl2_display = rl2_day[["waid", "full_name", "sent_at", "template_name", "user_timezone"]].copy()
+            rl2_display["full_name"] = rl2_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
             rl2_display["received at"] = rl2_display.apply(
                 lambda row: _format_ts_local(row["sent_at"], row.get("user_timezone")) if pd.notna(row["sent_at"]) else "—",
                 axis=1,
@@ -4576,6 +4634,7 @@ with tab4:
                 st.caption("None")
             else:
                 slogan_display = no_slogan[["waid", "full_name", "onboarding_completed_at", "user_timezone"]].copy()
+                slogan_display["full_name"] = slogan_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
                 slogan_display["onboarding completed"] = slogan_display.apply(
                     lambda row: _format_ts_local(row["onboarding_completed_at"], row["user_timezone"]), axis=1
                 )

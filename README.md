@@ -220,6 +220,9 @@ The `messages.message` column contains nested JSON payloads. The dashboard recur
 - `{"postback": {"payload": {"text": "..."}}}`
 - `{"interactive": {"button_reply": {"title": "..."}}}`
 
+### Special Users (Investors)
+Users listed in `analysis/.context/special-users.json` (by WAID) are flagged with an `[investor]` tag throughout the dashboard. Add WAIDs to the `investor_waids` array to identify investors in the database.
+
 ### User Deduplication
 Users may have duplicate rows in the database. All queries use `COUNT(DISTINCT waid)` or `DISTINCT ON (waid)` to ensure accurate counts.
 
