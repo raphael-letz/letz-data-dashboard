@@ -258,7 +258,10 @@ def load_internal_users():
 def load_investor_waids():
     """
     Load investor WAIDs from JSON file. Users with these WAIDs are flagged [investor] in dashboard.
-    File: analysis/.context/special-users.json
+    Primary location (repo-local):
+        .context/special-users.json   (next to dashboard.py)
+    Legacy fallback (older setup):
+        ../.context/special-users.json
     """
     try:
         base_dir = os.path.dirname(__file__)
