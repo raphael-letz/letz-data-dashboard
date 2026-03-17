@@ -554,6 +554,38 @@ ORDER BY rd.ref_date DESC, r.sent_at DESC;
 
 
 @st.cache_data(ttl=300)
+def get_at_risk_users_last_24h() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Users who received Recovery Ladder 1 or 2 in the last 24 hours.
+    Returns (rl2_df, rl1_df) each with columns: full_name, sent_at.
+    Excludes internal users.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+)
+SELECT
+  r.ladder_step,
+  COALESCE(u.full_name, 'Unknown') AS full_name,
+  r.sent_at
+FROM recovery_logs r
+JOIN users u ON u.id = r.user_id
+WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
+  AND r.ladder_step IN ('recovery_ladder_1', 'recovery_ladder_2')
+  AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+ORDER BY r.ladder_step DESC, r.sent_at DESC;
+"""
+    df = run_query(query)
+    if df.empty:
+        return pd.DataFrame(columns=["ladder_step", "full_name", "sent_at"]), pd.DataFrame(columns=["ladder_step", "full_name", "sent_at"])
+    rl2 = df[df["ladder_step"] == "recovery_ladder_2"].copy()
+    rl1 = df[df["ladder_step"] == "recovery_ladder_1"].copy()
+    return rl2, rl1
+
+
+@st.cache_data(ttl=300)
 def get_recovery_ladder_events(start_date_sp: str = "2026-02-01") -> pd.DataFrame:
     """
     Recovery template sends with latest-template attribution windows.
@@ -1223,7 +1255,33 @@ with tab1:
                     st.caption(f"• {n}")
     except:
         st.warning("Could not load Messaged today list")
-    
+
+    # At Risk Users: Recovery Ladder 1 & 2 in last 24h
+    try:
+        rl2_df, rl1_df = get_at_risk_users_last_24h()
+        sp_tz = "America/Sao_Paulo"
+
+        with st.expander("⚠️ At Risk Users"):
+            st.caption("Users who received Recovery Ladder templates in the last 24 hours (times in São Paulo).")
+
+            st.markdown("**Recovery Ladder 2** (penultimate step)")
+            if rl2_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in rl2_df.iterrows():
+                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
+                    st.caption(f"• {row['full_name']} — {sent_at_sp}")
+
+            st.markdown("**Recovery Ladder 1**")
+            if rl1_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in rl1_df.iterrows():
+                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
+                    st.caption(f"• {row['full_name']} — {sent_at_sp}")
+    except Exception as e:
+        st.warning(f"Could not load At Risk Users: {e}")
+
     # Goals: consistency over the last 4 SP Monday-weeks
     st.markdown("### 🎯 Goals")
     try:
@@ -2966,14 +3024,15 @@ with tab2:
         st.markdown("#### 🎯 User Journey Funnel")
         funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
         
-        # Check onboarding completed
+        # Check onboarding completed (use users.onboarding_timestamp as source of truth;
+        # events.onboarding_completed is not reliably emitted for all onboarding paths)
         onboarding_check = run_query(f"""
-            SELECT COUNT(*) as count
-            FROM events
-            WHERE user_id = {user_id}
-              AND event_type = 'onboarding_completed'
+            SELECT (u.onboarding_timestamp IS NOT NULL) OR EXISTS (
+                SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed'
+            ) AS completed
+            FROM users u WHERE u.id = {user_id}
         """)
-        onboarding_completed = onboarding_check['count'].iloc[0] > 0 if not onboarding_check.empty else False
+        onboarding_completed = onboarding_check['completed'].iloc[0] if not onboarding_check.empty else False
         
         # Check slogan set
         slogan_check = run_query(f"""
