@@ -4514,11 +4514,19 @@ with tab4:
             missed=("_missed_morning", "sum"),
         ).reset_index()
         morning["slot"] = "Morning"
-        _morning_grp = df_day[df_day["_missed_morning"] > 0].groupby("time_morning")
-        morning_names = _morning_grp.apply(
-            lambda g: ", ".join(sorted(g.drop_duplicates("waid").apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)))
-        ).reset_index()
-        morning_names.columns = ["time_morning", "users"]
+        morning_names = (
+            df_day[df_day["_missed_morning"] > 0]
+            .copy()
+            .assign(
+                display_name=lambda d: d.apply(
+                    lambda r: format_display_name(r["full_name"], r["waid"]), axis=1
+                )
+            )
+            .drop_duplicates(subset=["time_morning", "waid"])
+            .groupby("time_morning")["display_name"]
+            .apply(lambda s: ", ".join(sorted(s)))
+            .reset_index(name="users")
+        )
         morning = morning.merge(morning_names, on="time_morning", how="left")
         morning["users"] = morning["users"].fillna("").astype(str)
         morning["due"] = morning["due"].astype(int)
@@ -4528,11 +4536,19 @@ with tab4:
             missed=("_missed_evening", "sum"),
         ).reset_index()
         evening["slot"] = "Evening"
-        _evening_grp = df_day[df_day["_missed_evening"] > 0].groupby("time_evening")
-        evening_names = _evening_grp.apply(
-            lambda g: ", ".join(sorted(g.drop_duplicates("waid").apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)))
-        ).reset_index()
-        evening_names.columns = ["time_evening", "users"]
+        evening_names = (
+            df_day[df_day["_missed_evening"] > 0]
+            .copy()
+            .assign(
+                display_name=lambda d: d.apply(
+                    lambda r: format_display_name(r["full_name"], r["waid"]), axis=1
+                )
+            )
+            .drop_duplicates(subset=["time_evening", "waid"])
+            .groupby("time_evening")["display_name"]
+            .apply(lambda s: ", ".join(sorted(s)))
+            .reset_index(name="users")
+        )
         evening = evening.merge(evening_names, on="time_evening", how="left")
         evening["users"] = evening["users"].fillna("").astype(str)
         evening["due"] = evening["due"].astype(int)
