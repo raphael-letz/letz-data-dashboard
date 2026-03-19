@@ -731,6 +731,406 @@ ORDER BY week_start_sp DESC, template_sent_at_utc DESC;
     return run_query(query)
 
 
+@st.cache_data(ttl=300)
+def get_recovery_weekly_message_baseline_metrics(start_date_sp: str) -> pd.DataFrame:
+    """
+    Week-by-week metrics for Recovery Ladder tab (messages table baseline).
+
+    For each Monday-start week (America/Sao_Paulo), at week end (next Monday 00:00 SP):
+    - Count distinct **active** users (`users.is_active` not false) whose last *user* message
+      (any inbound to coach) at or before that instant was more than 24h / 48h / 72h before
+      week end (or never messaged).
+    - Count recovery ladder template rows (RL1/RL2) sent in that week.
+    - Count distinct users who received a farewell template that week (recovery_logs.ladder_step = 'farewell').
+
+    Excludes internal WAIDs.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{start_date_sp}')::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT
+    week_start,
+    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_sp
+  FROM weeks
+),
+user_silence AS (
+  SELECT
+    wb.week_start,
+    wb.week_end_sp,
+    u.id AS user_id,
+    u.is_active,
+    (
+      SELECT MAX(m.sent_at)
+      FROM messages m
+      WHERE m.sender = 'user'
+        AND (m.user_id = u.id OR m.waid = u.waid)
+        AND m.sent_at <= wb.week_end_sp
+    ) AS last_user_msg_at
+  FROM week_bounds wb
+  CROSS JOIN users u
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+agg AS (
+  SELECT
+    week_start,
+    COUNT(DISTINCT user_id) FILTER (
+      WHERE is_active IS NOT FALSE
+        AND (
+          last_user_msg_at IS NULL
+          OR last_user_msg_at < week_end_sp - interval '24 hours'
+        )
+    ) AS unique_no_msg_gt_24h,
+    COUNT(DISTINCT user_id) FILTER (
+      WHERE is_active IS NOT FALSE
+        AND (
+          last_user_msg_at IS NULL
+          OR last_user_msg_at < week_end_sp - interval '48 hours'
+        )
+    ) AS unique_no_msg_gt_48h,
+    COUNT(DISTINCT user_id) FILTER (
+      WHERE is_active IS NOT FALSE
+        AND (
+          last_user_msg_at IS NULL
+          OR last_user_msg_at < week_end_sp - interval '72 hours'
+        )
+    ) AS unique_no_msg_gt_72h
+  FROM user_silence
+  GROUP BY week_start, week_end_sp
+),
+rl_week AS (
+  SELECT
+    date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date AS week_start,
+    COUNT(*)::bigint AS recovery_ladder_sends
+  FROM recovery_logs r
+  JOIN users u ON r.user_id = u.id
+  WHERE r.ladder_step IN ('recovery_ladder_1', 'recovery_ladder_2')
+    AND (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= DATE '{start_date_sp}'
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY 1
+),
+farewell_week AS (
+  SELECT
+    date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date AS week_start,
+    COUNT(DISTINCT r.user_id)::bigint AS unique_users_farewell
+  FROM recovery_logs r
+  JOIN users u ON r.user_id = u.id
+  WHERE r.ladder_step = 'farewell'
+    AND (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= DATE '{start_date_sp}'
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY 1
+)
+SELECT
+  TO_CHAR(a.week_start, 'YYYY-MM-DD') AS week_start,
+  a.unique_no_msg_gt_24h,
+  a.unique_no_msg_gt_48h,
+  a.unique_no_msg_gt_72h,
+  COALESCE(r.recovery_ladder_sends, 0)::bigint AS recovery_ladder_sends,
+  COALESCE(f.unique_users_farewell, 0)::bigint AS unique_users_farewell_week
+FROM agg a
+LEFT JOIN rl_week r ON r.week_start = a.week_start
+LEFT JOIN farewell_week f ON f.week_start = a.week_start
+ORDER BY a.week_start DESC;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_recovery_weekly_waterfall_metrics(start_date_sp: str) -> pd.DataFrame:
+    """
+    Weekly waterfall-style flows for Recovery Ladder monitoring.
+
+    Week definition:
+    - Monday-start weeks in America/Sao_Paulo.
+    - Event inclusion uses [week_start, week_end) boundaries.
+
+    Flow model:
+    - Start active / End active are stock snapshots inferred from farewell/reactivation events.
+      Inactive proxy = user received farewell and has not sent a user message after that farewell yet.
+    - Became inactive = distinct users with >=1 farewell in the week.
+    - Reactivated = distinct users with first inbound user message after a farewell in the week.
+    - New acquired = users.created_at in the week.
+
+    Risk layers (event-based, with carry-over stock):
+    - 24h silence risk episodes from gaps between user inbound messages (active users only).
+    - RL risk episodes from RL1/RL2 sends until next inbound user message (active users only).
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+base_users AS (
+  SELECT
+    u.id,
+    u.waid,
+    u.created_at,
+    u.is_active
+  FROM users u
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{start_date_sp}')::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT
+    week_start,
+    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
+    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
+  FROM weeks
+),
+inbound_msgs AS (
+  SELECT
+    bu.id AS user_id,
+    m.sent_at
+  FROM base_users bu
+  JOIN messages m
+    ON m.sender = 'user'
+   AND (m.user_id = bu.id OR m.waid = bu.waid)
+),
+farewell_events AS (
+  SELECT
+    r.user_id,
+    r.sent_at AS farewell_at,
+    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
+  FROM recovery_logs r
+  JOIN base_users bu ON bu.id = r.user_id
+  WHERE r.ladder_step = 'farewell'
+),
+farewell_cycles AS (
+  SELECT
+    fe.user_id,
+    fe.farewell_at,
+    (
+      SELECT MIN(im.sent_at)
+      FROM inbound_msgs im
+      WHERE im.user_id = fe.user_id
+        AND im.sent_at > fe.farewell_at
+        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
+    ) AS reactivated_at
+  FROM farewell_events fe
+),
+active_stock AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT bu.id) FILTER (
+      WHERE bu.created_at < wb.week_start_ts
+        AND NOT EXISTS (
+          SELECT 1
+          FROM farewell_cycles fc
+          WHERE fc.user_id = bu.id
+            AND fc.farewell_at < wb.week_start_ts
+            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
+        )
+    )::bigint AS start_active_users,
+    COUNT(DISTINCT bu.id) FILTER (
+      WHERE bu.created_at < wb.week_end_ts
+        AND NOT EXISTS (
+          SELECT 1
+          FROM farewell_cycles fc
+          WHERE fc.user_id = bu.id
+            AND fc.farewell_at < wb.week_end_ts
+            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_end_ts)
+        )
+    )::bigint AS end_active_users
+  FROM week_bounds wb
+  CROSS JOIN base_users bu
+  GROUP BY wb.week_start
+),
+weekly_new_acquired AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT bu.id)::bigint AS new_acquired_users
+  FROM week_bounds wb
+  JOIN base_users bu
+    ON bu.created_at >= wb.week_start_ts
+   AND bu.created_at < wb.week_end_ts
+  GROUP BY wb.week_start
+),
+weekly_became_inactive AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT fe.user_id)::bigint AS became_inactive_users
+  FROM week_bounds wb
+  JOIN farewell_events fe
+    ON fe.farewell_at >= wb.week_start_ts
+   AND fe.farewell_at < wb.week_end_ts
+  GROUP BY wb.week_start
+),
+weekly_reactivated AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT fc.user_id)::bigint AS reactivated_users
+  FROM week_bounds wb
+  JOIN farewell_cycles fc
+    ON fc.reactivated_at >= wb.week_start_ts
+   AND fc.reactivated_at < wb.week_end_ts
+  GROUP BY wb.week_start
+),
+weekly_flows AS (
+  SELECT
+    wb.week_start,
+    COALESCE(wn.new_acquired_users, 0)::bigint AS new_acquired_users,
+    COALESCE(wi.became_inactive_users, 0)::bigint AS became_inactive_users,
+    COALESCE(wr.reactivated_users, 0)::bigint AS reactivated_users
+  FROM week_bounds wb
+  LEFT JOIN weekly_new_acquired wn ON wn.week_start = wb.week_start
+  LEFT JOIN weekly_became_inactive wi ON wi.week_start = wb.week_start
+  LEFT JOIN weekly_reactivated wr ON wr.week_start = wb.week_start
+),
+eligible_active_users AS (
+  SELECT id, waid
+  FROM base_users
+  WHERE is_active IS TRUE
+),
+active_inbound_msgs AS (
+  SELECT
+    eau.id AS user_id,
+    m.sent_at
+  FROM eligible_active_users eau
+  JOIN messages m
+    ON m.sender = 'user'
+   AND (m.user_id = eau.id OR m.waid = eau.waid)
+),
+silence_edges AS (
+  SELECT
+    aim.user_id,
+    aim.sent_at AS msg_at,
+    LEAD(aim.sent_at) OVER (PARTITION BY aim.user_id ORDER BY aim.sent_at) AS next_msg_at
+  FROM active_inbound_msgs aim
+),
+risk24_episodes AS (
+  SELECT
+    se.user_id,
+    (se.msg_at + interval '24 hours') AS risk_start_at,
+    se.next_msg_at AS risk_end_at
+  FROM silence_edges se
+  WHERE se.next_msg_at IS NULL
+     OR se.next_msg_at > se.msg_at + interval '24 hours'
+),
+rl_risk_events AS (
+  SELECT
+    r.user_id,
+    r.sent_at AS risk_start_at
+  FROM recovery_logs r
+  JOIN eligible_active_users eau ON eau.id = r.user_id
+  WHERE r.ladder_step IN ('recovery_ladder_1', 'recovery_ladder_2')
+),
+rl_risk_episodes AS (
+  SELECT
+    rre.user_id,
+    rre.risk_start_at,
+    (
+      SELECT MIN(aim.sent_at)
+      FROM active_inbound_msgs aim
+      WHERE aim.user_id = rre.user_id
+        AND aim.sent_at > rre.risk_start_at
+    ) AS risk_end_at
+  FROM rl_risk_events rre
+),
+risk24_week AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at < wb.week_start_ts
+        AND (r.risk_end_at IS NULL OR r.risk_end_at > wb.week_start_ts)
+    )::bigint AS start_risk_24h_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at >= wb.week_start_ts
+        AND r.risk_start_at < wb.week_end_ts
+    )::bigint AS new_risk_24h_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_end_at >= wb.week_start_ts
+        AND r.risk_end_at < wb.week_end_ts
+    )::bigint AS derisked_24h_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at < wb.week_end_ts
+        AND (r.risk_end_at IS NULL OR r.risk_end_at > wb.week_end_ts)
+    )::bigint AS end_risk_24h_users
+  FROM week_bounds wb
+  LEFT JOIN risk24_episodes r ON TRUE
+  GROUP BY wb.week_start
+),
+risk_rl_week AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at < wb.week_start_ts
+        AND (r.risk_end_at IS NULL OR r.risk_end_at > wb.week_start_ts)
+    )::bigint AS start_risk_rl_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at >= wb.week_start_ts
+        AND r.risk_start_at < wb.week_end_ts
+    )::bigint AS new_risk_rl_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_end_at >= wb.week_start_ts
+        AND r.risk_end_at < wb.week_end_ts
+    )::bigint AS derisked_rl_users,
+    COUNT(DISTINCT r.user_id) FILTER (
+      WHERE r.risk_start_at < wb.week_end_ts
+        AND (r.risk_end_at IS NULL OR r.risk_end_at > wb.week_end_ts)
+    )::bigint AS end_risk_rl_users
+  FROM week_bounds wb
+  LEFT JOIN rl_risk_episodes r ON TRUE
+  GROUP BY wb.week_start
+)
+SELECT
+  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
+  COALESCE(ast.start_active_users, 0)::bigint AS start_active_users,
+  COALESCE(wf.new_acquired_users, 0)::bigint AS new_acquired_users,
+  COALESCE(wf.reactivated_users, 0)::bigint AS reactivated_users,
+  COALESCE(wf.became_inactive_users, 0)::bigint AS became_inactive_users,
+  (
+    COALESCE(ast.start_active_users, 0)
+    + COALESCE(wf.new_acquired_users, 0)
+    + COALESCE(wf.reactivated_users, 0)
+    - COALESCE(wf.became_inactive_users, 0)
+  )::bigint AS end_active_users_computed,
+  COALESCE(ast.end_active_users, 0)::bigint AS end_active_users_observed,
+  (
+    COALESCE(ast.end_active_users, 0)
+    - (
+      COALESCE(ast.start_active_users, 0)
+      + COALESCE(wf.new_acquired_users, 0)
+      + COALESCE(wf.reactivated_users, 0)
+      - COALESCE(wf.became_inactive_users, 0)
+    )
+  )::bigint AS active_reconciliation_gap,
+  COALESCE(r24.start_risk_24h_users, 0)::bigint AS start_risk_24h_users,
+  COALESCE(r24.new_risk_24h_users, 0)::bigint AS new_risk_24h_users,
+  COALESCE(r24.derisked_24h_users, 0)::bigint AS derisked_24h_users,
+  COALESCE(r24.end_risk_24h_users, 0)::bigint AS end_risk_24h_users,
+  COALESCE(rrl.start_risk_rl_users, 0)::bigint AS start_risk_rl_users,
+  COALESCE(rrl.new_risk_rl_users, 0)::bigint AS new_risk_rl_users,
+  COALESCE(rrl.derisked_rl_users, 0)::bigint AS derisked_rl_users,
+  COALESCE(rrl.end_risk_rl_users, 0)::bigint AS end_risk_rl_users
+FROM week_bounds wb
+LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
+LEFT JOIN weekly_flows wf ON wf.week_start = wb.week_start
+LEFT JOIN risk24_week r24 ON r24.week_start = wb.week_start
+LEFT JOIN risk_rl_week rrl ON rrl.week_start = wb.week_start
+ORDER BY wb.week_start DESC;
+"""
+    return run_query(query)
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -1130,14 +1530,20 @@ with st.sidebar:
         st.rerun()
 
 
-# Alerts badge: count users with missed morning/evening today (message delivery)
+# Alerts badge: total alerts shown on Alerts page for "today"
+# (message delivery misses + onboarding issues + recovery ladder 2 alerts)
 try:
     _delivery_df = get_message_delivery_detail()
-    _today_missed = _delivery_df[
-        (_delivery_df["period"] == "today")
-        & (_delivery_df["missed_morning"] | _delivery_df["missed_evening"])
-    ]
-    _alert_count = len(_today_missed)
+    _onboarding_df = get_onboarding_dropoff_detail()
+    _recovery_ladder_2_df = get_recovery_ladder_2_alert_detail()
+
+    _msg_missed_count = int(
+        _delivery_df.loc[_delivery_df["period"] == "today", "missed_morning"].sum()
+        + _delivery_df.loc[_delivery_df["period"] == "today", "missed_evening"].sum()
+    ) if not _delivery_df.empty else 0
+    _onboarding_count = len(_onboarding_df[_onboarding_df["period"] == "today"]) if not _onboarding_df.empty else 0
+    _rl2_count = len(_recovery_ladder_2_df[_recovery_ladder_2_df["period"] == "today"]) if not _recovery_ladder_2_df.empty else 0
+    _alert_count = int(_msg_missed_count + _onboarding_count + _rl2_count)
 except Exception:
     _alert_count = 0
 _alert_label = "🔔 Alerts" + (f" ({_alert_count})" if _alert_count else "")
@@ -2784,7 +3190,7 @@ with tab1:
 # Tab 2: User Deep Dive
 with tab2:
     st.markdown("### 🔍 User Deep Dive")
-    st.caption("Select a user to view messages, activity plan, XP, and engagement")
+    st.caption("Select a user to view messages, activity plan, active days, and engagement")
     
     users_df = run_query("""
         WITH unique_users AS (
@@ -2903,12 +3309,19 @@ with tab2:
         """)
         last_active = format_ts_local(last_active_df['sent_at'].iloc[0]) if not last_active_df.empty else "—"
         
-        xp_total_df = run_query(f"""
-            SELECT COALESCE(SUM(xp_earned), 0) as total_xp
-            FROM user_activities_history
-            WHERE user_id = {user_id}
+        # Primary progress: users.active_days / active_days_goal (see analysis/.context/db-dictionary.md)
+        progress_df = run_query(f"""
+            SELECT
+                COALESCE(u.active_days, 0)::int AS active_days,
+                u.active_days_goal::int AS active_days_goal
+            FROM users u
+            WHERE u.id = {user_id}
         """)
-        total_xp = int(xp_total_df['total_xp'].iloc[0]) if not xp_total_df.empty else 0
+        active_days_count = int(progress_df["active_days"].iloc[0]) if not progress_df.empty else 0
+        _goal = progress_df["active_days_goal"].iloc[0] if not progress_df.empty else None
+        active_days_goal_str = (
+            str(int(_goal)) if _goal is not None and pd.notna(_goal) else "—"
+        )
         
         last_completed_df = run_query(f"""
             SELECT activity_type, completed_at
@@ -3215,9 +3628,10 @@ with tab2:
         
         st.markdown("---")
         
-        # Metrics row
-        m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-        m1.metric("⭐ XP Earned", total_xp)
+        # Metrics row (active days + goal from users table per db-dictionary)
+        m1, m1_goal, m2, m3, m4, m5, m6, m7, m8 = st.columns(9)
+        m1.metric("📅 Active Days", active_days_count)
+        m1_goal.metric("🎯 Active Days Goal", active_days_goal_str)
         m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
         m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
         m4.metric("⏱️ Last Active", last_active)
@@ -4727,7 +5141,7 @@ with tab5:
             return pd.to_datetime(dt_obj).strftime("%Y-%m-%d") if dt_obj is not None else "—"
 
         st.markdown(
-            f"#### 📊 Week Snapshot — Current: `{_week_label(current_week)}` | Prev: `{_week_label(prev_week)}` | 2w ago: `{_week_label(prev2_week)}`"
+            f"#### 📊 Week Snapshot — Current: `{_week_label(current_week)}`"
         )
 
         cw = weekly[weekly["week_start_sp"] == current_week].iloc[0] if current_week is not None and not weekly[weekly["week_start_sp"] == current_week].empty else None
@@ -4796,86 +5210,251 @@ with tab5:
         )
         st.altair_chart(timeline_chart, use_container_width=True)
 
-        # Week-by-week: % reply within 72h for active users who went outside 24h window
-        df["is_active"] = df["is_active"].fillna(True).astype(bool)
-        df["outside_24h"] = (df["response_minutes"].isna()) | (df["response_minutes"] > 1440)
-        df["replied_within_72h"] = (df["response_minutes"].notna()) & (df["response_minutes"] <= 4320)
-        outside_24h = df[(df["outside_24h"]) & (df["is_active"])]
-        if not outside_24h.empty:
-            # Per week: count inactive users (in full cohort for that week)
-            week_inactive = (
-                df[~df["is_active"]]
-                .groupby("week_start_sp")["user_id"]
-                .nunique()
-                .reset_index()
-                .rename(columns={"user_id": "inactive_count"})
-            )
-            week_72h = (
-                outside_24h.groupby("week_start_sp")
-                .agg(
-                    outside_24h_count=("user_id", "size"),
-                    replied_within_72h_count=("replied_within_72h", "sum"),
+        # Week-by-week: active/risk waterfall table + visualizations
+        st.markdown("#### 📋 Weekly Waterfall — Active, Inactive, Risk & De-risk")
+
+        wf_default_start_date = (datetime.now() - timedelta(weeks=12)).date()
+        wf_default_end_date = datetime.now().date()
+        use_custom_wf_dates = st.toggle(
+            "Use custom date range for waterfall section",
+            value=False,
+            key="rl_waterfall_custom_dates_toggle",
+            help="When off, uses the last 12 weeks."
+        )
+        wf_start_date = wf_default_start_date
+        wf_end_date = wf_default_end_date
+        if use_custom_wf_dates:
+            d1, d2 = st.columns(2)
+            with d1:
+                wf_start_date = st.date_input(
+                    "Waterfall start date",
+                    value=wf_default_start_date,
+                    key="rl_waterfall_start_date"
                 )
-                .reset_index()
-            )
-            week_72h = week_72h.merge(week_inactive, on="week_start_sp", how="left")
-            week_72h["inactive_count"] = week_72h["inactive_count"].fillna(0).astype(int)
-            week_72h["reply_within_72h_pct"] = week_72h.apply(
-                lambda r: round(100.0 * r["replied_within_72h_count"] / r["outside_24h_count"], 1)
-                if r["outside_24h_count"] else 0,
-                axis=1,
-            )
-            week_72h = week_72h.sort_values("week_start_sp", ascending=False)
-            week_72h["week_start_sp"] = week_72h["week_start_sp"].dt.strftime("%Y-%m-%d")
-            st.markdown("#### 📋 Week-by-Week — Reply Within 72h (% of active users outside 24h window)")
-            st.dataframe(
-                week_72h[
-                    ["week_start_sp", "outside_24h_count", "inactive_count", "replied_within_72h_count", "reply_within_72h_pct"]
-                ].rename(
-                    columns={
-                        "week_start_sp": "Week",
-                        "outside_24h_count": "Outside 24h (active)",
-                        "inactive_count": "Users flagged inactive",
-                        "replied_within_72h_count": "Replied within 72h",
-                        "reply_within_72h_pct": "Reply within 72h (%)",
+            with d2:
+                wf_end_date = st.date_input(
+                    "Waterfall end date",
+                    value=wf_default_end_date,
+                    key="rl_waterfall_end_date"
+                )
+
+        if wf_start_date > wf_end_date:
+            st.warning("Waterfall date range is invalid (`start > end`). Swapping dates automatically.")
+            wf_start_date, wf_end_date = wf_end_date, wf_start_date
+
+        try:
+            waterfall_df = get_recovery_weekly_waterfall_metrics(wf_start_date.strftime("%Y-%m-%d"))
+        except Exception as e:
+            waterfall_df = pd.DataFrame()
+            st.warning(f"Could not load weekly active/risk waterfall metrics: {e}")
+
+        if waterfall_df is not None and not waterfall_df.empty:
+            wf = waterfall_df.copy()
+            wf["week_start_dt"] = pd.to_datetime(wf["week_start"], errors="coerce")
+            wf = wf[
+                (wf["week_start_dt"].notna())
+                & (wf["week_start_dt"] >= pd.to_datetime(wf_start_date))
+                & (wf["week_start_dt"] <= pd.to_datetime(wf_end_date))
+            ].copy()
+            wf = wf.sort_values("week_start", ascending=False)
+
+            if wf.empty:
+                st.info("No weekly waterfall data for the selected date range.")
+            else:
+                def _build_waterfall_steps(steps):
+                    rows = []
+                    running = 0
+                    for step_label, value, step_type in steps:
+                        val = int(value)
+                        if step_type == "total":
+                            y0 = 0
+                            y1 = val
+                            running = val
+                            display_val = val
+                            direction = "total"
+                        else:
+                            y0 = running
+                            y1 = running + val
+                            running = y1
+                            display_val = val
+                            direction = "up" if val >= 0 else "down"
+                        rows.append(
+                            {
+                                "step": step_label,
+                                "start": y0,
+                                "end": y1,
+                                "value": display_val,
+                                "bar_type": direction,
+                            }
+                        )
+                    return pd.DataFrame(rows)
+
+                st.markdown("#### 📈 Weekly Timeline — Active & At-risk Stock")
+                stock_timeline_df = (
+                    wf[["week_start", "start_active_users", "start_risk_24h_users", "start_risk_rl_users"]]
+                    .copy()
+                    .sort_values("week_start")
+                )
+                stock_timeline_long = stock_timeline_df.melt(
+                    id_vars=["week_start"],
+                    value_vars=["start_active_users", "start_risk_24h_users", "start_risk_rl_users"],
+                    var_name="metric",
+                    value_name="users"
+                )
+                stock_timeline_long["metric"] = stock_timeline_long["metric"].map(
+                    {
+                        "start_active_users": "Start active users",
+                        "start_risk_24h_users": "Start at-risk users (24h)",
+                        "start_risk_rl_users": "Start at-risk users (RL)",
                     }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
+                )
+                stock_timeline_chart = (
+                    alt.Chart(stock_timeline_long)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("week_start:N", sort=None, title="Week"),
+                        y=alt.Y("users:Q", title="Users"),
+                        color=alt.Color("metric:N", title="Series"),
+                        tooltip=[
+                            alt.Tooltip("week_start:N", title="Week"),
+                            alt.Tooltip("metric:N", title="Series"),
+                            alt.Tooltip("users:Q", title="Users"),
+                        ],
+                    )
+                    .properties(height=300)
+                )
+                st.altair_chart(stock_timeline_chart, use_container_width=True)
 
-        # Ladder step: % reply within 24h, week-by-week
-        df["replied_within_24h"] = (df["response_minutes"].notna()) & (df["response_minutes"] <= 1440)
-        ladder_weekly = (
-            df.groupby(["ladder_step", "week_start_sp"])
-            .agg(
-                sends=("user_id", "size"),
-                replied_within_24h_count=("replied_within_24h", "sum"),
-            )
-            .reset_index()
-        )
-        ladder_weekly["reply_within_24h_pct"] = ladder_weekly.apply(
-            lambda r: round(100.0 * r["replied_within_24h_count"] / r["sends"], 1) if r["sends"] else 0,
-            axis=1,
-        )
-        # Pivot: ladder_step as rows, weeks as columns
-        week_cols = sorted(ladder_weekly["week_start_sp"].dropna().unique(), reverse=True)
-        pivot_data = []
-        for step in ladder_weekly["ladder_step"].unique():
-            row = {"Ladder step": step}
-            for w in week_cols:
-                w_str = pd.to_datetime(w).strftime("%Y-%m-%d") if hasattr(w, "strftime") else str(w)[:10]
-                r = ladder_weekly[(ladder_weekly["ladder_step"] == step) & (ladder_weekly["week_start_sp"] == w)]
-                if not r.empty:
-                    row[w_str] = f"{r['reply_within_24h_pct'].iloc[0]}%"
-                else:
-                    row[w_str] = "—"
-            pivot_data.append(row)
-        if pivot_data:
-            ladder_pivot_df = pd.DataFrame(pivot_data)
-            st.markdown("#### 📋 Ladder Step — Reply Within 24h (%) by Week")
-            st.dataframe(ladder_pivot_df, use_container_width=True, hide_index=True)
+                selected_week = st.selectbox(
+                    "Select week for waterfall visuals",
+                    options=wf["week_start"].tolist(),
+                    index=0,
+                    key="rl_waterfall_week_select"
+                )
+                wrow = wf[wf["week_start"] == selected_week].iloc[0]
 
+                active_steps_df = _build_waterfall_steps(
+                    [
+                        ("Start active", wrow["start_active_users"], "total"),
+                        ("+ New acquired", wrow["new_acquired_users"], "delta"),
+                        ("+ Reactivated", wrow["reactivated_users"], "delta"),
+                        ("- Became inactive", -int(wrow["became_inactive_users"]), "delta"),
+                        ("End active", wrow["end_active_users_observed"], "total"),
+                    ]
+                )
+
+                risk_24h_steps_df = _build_waterfall_steps(
+                    [
+                        ("Start risk stock", wrow["start_risk_24h_users"], "total"),
+                        ("+ New at risk", wrow["new_risk_24h_users"], "delta"),
+                        ("- De-risked", -int(wrow["derisked_24h_users"]), "delta"),
+                        ("End risk stock", wrow["end_risk_24h_users"], "total"),
+                    ]
+                )
+                risk_rl_steps_df = _build_waterfall_steps(
+                    [
+                        ("Start risk stock", wrow["start_risk_rl_users"], "total"),
+                        ("+ New at risk", wrow["new_risk_rl_users"], "delta"),
+                        ("- De-risked", -int(wrow["derisked_rl_users"]), "delta"),
+                        ("End risk stock", wrow["end_risk_rl_users"], "total"),
+                    ]
+                )
+
+                color_scale = alt.Scale(
+                    domain=["up", "down", "total"],
+                    range=["#22c55e", "#ef4444", "#60a5fa"]
+                )
+
+                active_chart = (
+                    alt.Chart(active_steps_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(height=300, title=f"Active Stock Waterfall ({selected_week})")
+                )
+
+                risk_24h_chart = (
+                    alt.Chart(risk_24h_steps_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(height=300, title=f"At-risk Stock Waterfall (24h No Message) ({selected_week})")
+                )
+
+                risk_rl_chart = (
+                    alt.Chart(risk_rl_steps_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(height=300, title=f"At-risk Stock Waterfall (Recovery Ladder) ({selected_week})")
+                )
+
+                st.altair_chart(active_chart, use_container_width=True)
+                c_risk_24h, c_risk_rl = st.columns(2)
+                with c_risk_24h:
+                    st.altair_chart(risk_24h_chart, use_container_width=True)
+                with c_risk_rl:
+                    st.altair_chart(risk_rl_chart, use_container_width=True)
+
+                st.caption(
+                    f"Active reconciliation gap for `{selected_week}`: "
+                    f"{int(wrow['active_reconciliation_gap'])} "
+                    "(observed end active - computed end active)."
+                )
+
+                waterfall_display = wf.drop(columns=["week_start_dt"]).rename(
+                    columns={
+                        "week_start": "Week",
+                        "start_active_users": "Start active users",
+                        "new_acquired_users": "+ New acquired",
+                        "reactivated_users": "+ Reactivated",
+                        "became_inactive_users": "- Became inactive (farewell)",
+                        "end_active_users_computed": "End active (computed)",
+                        "end_active_users_observed": "End active (observed)",
+                        "active_reconciliation_gap": "Active reconciliation gap",
+                        "start_risk_24h_users": "Start risk 24h stock",
+                        "new_risk_24h_users": "New at-risk 24h",
+                        "derisked_24h_users": "De-risked after 24h",
+                        "end_risk_24h_users": "End risk 24h stock",
+                        "start_risk_rl_users": "Start RL risk stock",
+                        "new_risk_rl_users": "New at-risk RL",
+                        "derisked_rl_users": "De-risked after RL",
+                        "end_risk_rl_users": "End RL risk stock",
+                    }
+                )
+                st.dataframe(waterfall_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("No weekly waterfall data for this date range.")
 
 # Footer
 st.markdown("---")
