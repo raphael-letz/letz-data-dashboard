@@ -4007,6 +4007,394 @@ with tab2:
 
 # Tab 3: User Retention
 with tab3:
+    # Recovery: weekly reply timeline + active/risk waterfall (top of tab)
+    import altair as alt
+
+    _ret_rl_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+    try:
+        _ret_recovery_events = get_recovery_ladder_events(_ret_rl_start)
+    except Exception as e:
+        _ret_recovery_events = pd.DataFrame()
+        st.warning(f"Could not load recovery ladder data for retention tab: {e}")
+
+    if _ret_recovery_events is not None and not _ret_recovery_events.empty:
+        _ret_df = _ret_recovery_events.copy()
+        _ret_df["week_start_sp"] = pd.to_datetime(_ret_df["week_start_sp"], errors="coerce")
+        _ret_df["replied_before_next_template"] = _ret_df["replied_before_next_template"].fillna(False).astype(int)
+        _ret_df = _ret_df[_ret_df["week_start_sp"].notna()].copy()
+        _ret_weekly = (
+            _ret_df.groupby("week_start_sp")
+            .agg(
+                templates_sent=("user_id", "size"),
+                replied_templates=("replied_before_next_template", "sum"),
+            )
+            .reset_index()
+            .sort_values("week_start_sp", ascending=False)
+        )
+        _ret_weekly["reply_rate_pct"] = (
+            100.0 * _ret_weekly["replied_templates"] / _ret_weekly["templates_sent"]
+        ).round(1)
+
+        st.markdown("#### 📈 Weekly Timeline — Reply Rate (% sends)")
+        _timeline_df = _ret_weekly[["week_start_sp", "reply_rate_pct"]].copy().sort_values("week_start_sp")
+        _timeline_df = _timeline_df.rename(
+            columns={"week_start_sp": "Week", "reply_rate_pct": "Reply rate (%)"}
+        )
+        _timeline_df["Week"] = pd.to_datetime(_timeline_df["Week"]).dt.strftime("%Y-%m-%d")
+        _ret_timeline_chart = (
+            alt.Chart(_timeline_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Week:N", sort=None, title="Week"),
+                y=alt.Y("Reply rate (%)", title="Reply rate (%)"),
+                tooltip=[
+                    alt.Tooltip("Week:N", title="Week"),
+                    alt.Tooltip("Reply rate (%)", title="Reply rate (%)"),
+                ],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(_ret_timeline_chart, use_container_width=True)
+
+        st.markdown("#### 📋 Weekly Waterfall — Active, Inactive, Risk & De-risk")
+
+        _ret_wf_default_start = (datetime.now() - timedelta(weeks=12)).date()
+        _ret_wf_default_end = datetime.now().date()
+        _ret_use_custom_wf = st.toggle(
+            "Use custom date range for waterfall section",
+            value=False,
+            key="ret_waterfall_custom_dates_toggle",
+            help="When off, uses the last 12 weeks.",
+        )
+        _ret_wf_start = _ret_wf_default_start
+        _ret_wf_end = _ret_wf_default_end
+        if _ret_use_custom_wf:
+            _rw1, _rw2 = st.columns(2)
+            with _rw1:
+                _ret_wf_start = st.date_input(
+                    "Waterfall start date",
+                    value=_ret_wf_default_start,
+                    key="ret_waterfall_start_date",
+                )
+            with _rw2:
+                _ret_wf_end = st.date_input(
+                    "Waterfall end date",
+                    value=_ret_wf_default_end,
+                    key="ret_waterfall_end_date",
+                )
+
+        if _ret_wf_start > _ret_wf_end:
+            st.warning("Waterfall date range is invalid (`start > end`). Swapping dates automatically.")
+            _ret_wf_start, _ret_wf_end = _ret_wf_end, _ret_wf_start
+
+        try:
+            _ret_waterfall_df = get_recovery_weekly_waterfall_metrics(_ret_wf_start.strftime("%Y-%m-%d"))
+        except Exception as e:
+            _ret_waterfall_df = pd.DataFrame()
+            st.warning(f"Could not load weekly active/risk waterfall metrics: {e}")
+
+        if _ret_waterfall_df is not None and not _ret_waterfall_df.empty:
+            _ret_wf = _ret_waterfall_df.copy()
+            _ret_wf["week_start_dt"] = pd.to_datetime(_ret_wf["week_start"], errors="coerce")
+            _ret_wf = _ret_wf[
+                (_ret_wf["week_start_dt"].notna())
+                & (_ret_wf["week_start_dt"] >= pd.to_datetime(_ret_wf_start))
+                & (_ret_wf["week_start_dt"] <= pd.to_datetime(_ret_wf_end))
+            ].copy()
+            _ret_wf = _ret_wf.sort_values("week_start", ascending=False)
+
+            if _ret_wf.empty:
+                st.info("No weekly waterfall data for the selected date range.")
+            else:
+
+                def _ret_build_waterfall_steps(steps):
+                    rows = []
+                    running = 0
+                    for step_label, value, step_type in steps:
+                        val = int(value)
+                        if step_type == "total":
+                            y0 = 0
+                            y1 = val
+                            running = val
+                            display_val = val
+                            direction = "total"
+                        else:
+                            y0 = running
+                            y1 = running + val
+                            running = y1
+                            display_val = val
+                            direction = "up" if val >= 0 else "down"
+                        rows.append(
+                            {
+                                "step": step_label,
+                                "start": y0,
+                                "end": y1,
+                                "value": display_val,
+                                "bar_type": direction,
+                            }
+                        )
+                    return pd.DataFrame(rows)
+
+                st.markdown("#### 📈 Active user stack (flow per week)")
+                _ret_seg_order = [
+                    "Active (week start)",
+                    "New acquired",
+                    "Reactivated",
+                    "Inactive / churned (farewell)",
+                ]
+                _ret_seg_stack_order = {s: i for i, s in enumerate(_ret_seg_order)}
+                _ret_stack_rows = []
+                for _, _rr in _ret_wf.sort_values("week_start").iterrows():
+                    _ret_stack_rows.extend(
+                        [
+                            {
+                                "week_start": _rr["week_start"],
+                                "segment": "Active (week start)",
+                                "stack_order": _ret_seg_stack_order["Active (week start)"],
+                                "users": int(_rr["start_active_users"]),
+                            },
+                            {
+                                "week_start": _rr["week_start"],
+                                "segment": "New acquired",
+                                "stack_order": _ret_seg_stack_order["New acquired"],
+                                "users": int(_rr["new_acquired_users"]),
+                            },
+                            {
+                                "week_start": _rr["week_start"],
+                                "segment": "Reactivated",
+                                "stack_order": _ret_seg_stack_order["Reactivated"],
+                                "users": int(_rr["reactivated_users"]),
+                            },
+                            {
+                                "week_start": _rr["week_start"],
+                                "segment": "Inactive / churned (farewell)",
+                                "stack_order": _ret_seg_stack_order["Inactive / churned (farewell)"],
+                                "users": -int(_rr["became_inactive_users"]),
+                            },
+                        ]
+                    )
+                _ret_stock_stack_df = pd.DataFrame(_ret_stack_rows)
+                _ret_stock_stack_df["users_abs"] = _ret_stock_stack_df["users"].abs()
+                _ret_stock_chart = (
+                    alt.Chart(_ret_stock_stack_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("week_start:N", sort=None, title="Week"),
+                        y=alt.Y("users:Q", stack="zero", title="Users"),
+                        color=alt.Color(
+                            "segment:N",
+                            title="",
+                            sort=_ret_seg_order,
+                            scale=alt.Scale(
+                                domain=_ret_seg_order,
+                                range=["#60a5fa", "#22c55e", "#a78bfa", "#ef4444"],
+                            ),
+                        ),
+                        order=alt.Order("stack_order:Q"),
+                        tooltip=[
+                            alt.Tooltip("week_start:N", title="Week"),
+                            alt.Tooltip("segment:N", title="Segment"),
+                            alt.Tooltip("users_abs:Q", title="Users (|count|)"),
+                        ],
+                    )
+                    .properties(height=340)
+                )
+                st.altair_chart(_ret_stock_chart, use_container_width=True)
+
+                st.markdown("#### 📈 Inactive / churned — cumulative (farewell sends)")
+                _ret_wf_cum = _ret_wf.sort_values("week_start").copy()
+                _ret_wf_cum["new_inactive"] = _ret_wf_cum["became_inactive_users"].astype(int)
+                _ret_wf_cum["cum_inactive_end"] = _ret_wf_cum["new_inactive"].cumsum()
+                _ret_wf_cum["prior_cumulative"] = _ret_wf_cum["cum_inactive_end"] - _ret_wf_cum["new_inactive"]
+                _ret_cum_stack_rows = []
+                for _, _rcr in _ret_wf_cum.iterrows():
+                    _ret_cum_stack_rows.append(
+                        {
+                            "week_start": _rcr["week_start"],
+                            "segment": "Prior cumulative",
+                            "stack_order": 0,
+                            "users": int(_rcr["prior_cumulative"]),
+                        }
+                    )
+                    _ret_cum_stack_rows.append(
+                        {
+                            "week_start": _rcr["week_start"],
+                            "segment": "New this week",
+                            "stack_order": 1,
+                            "users": int(_rcr["new_inactive"]),
+                        }
+                    )
+                _ret_cum_stack_df = pd.DataFrame(_ret_cum_stack_rows)
+                _ret_cum_seg_order = ["Prior cumulative", "New this week"]
+                _ret_cum_tooltip = _ret_cum_stack_df.merge(
+                    _ret_wf_cum[["week_start", "cum_inactive_end"]], on="week_start", how="left"
+                )
+                _ret_inactive_cum_chart = (
+                    alt.Chart(_ret_cum_tooltip)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("week_start:N", sort=None, title="Week"),
+                        y=alt.Y("users:Q", stack="zero", title="Users (cumulative inactive)"),
+                        color=alt.Color(
+                            "segment:N",
+                            title="",
+                            sort=_ret_cum_seg_order,
+                            scale=alt.Scale(
+                                domain=_ret_cum_seg_order,
+                                range=["#64748b", "#ef4444"],
+                            ),
+                        ),
+                        order=alt.Order("stack_order:Q"),
+                        tooltip=[
+                            alt.Tooltip("week_start:N", title="Week"),
+                            alt.Tooltip("segment:N", title="Segment"),
+                            alt.Tooltip("users:Q", title="Users in segment"),
+                            alt.Tooltip("cum_inactive_end:Q", title="Total cumulative (week end)"),
+                        ],
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(_ret_inactive_cum_chart, use_container_width=True)
+                st.caption(
+                    "Running total of **became inactive (farewell)** counts week over week from the **waterfall start date**. "
+                    "Each bar stacks **prior cumulative** (gray) + **new this week** (red); bar top = cumulative through that week."
+                )
+
+                st.markdown("#### 📈 Weekly Timeline — Active & At-risk Stock")
+                _ret_selected_week = st.selectbox(
+                    "Select week for waterfall visuals",
+                    options=_ret_wf["week_start"].tolist(),
+                    index=0,
+                    key="ret_waterfall_week_select",
+                )
+                _ret_wrow = _ret_wf[_ret_wf["week_start"] == _ret_selected_week].iloc[0]
+
+                _ret_active_steps = _ret_build_waterfall_steps(
+                    [
+                        ("Start active", _ret_wrow["start_active_users"], "total"),
+                        ("+ New acquired", _ret_wrow["new_acquired_users"], "delta"),
+                        ("+ Reactivated", _ret_wrow["reactivated_users"], "delta"),
+                        ("- Became inactive", -int(_ret_wrow["became_inactive_users"]), "delta"),
+                        ("End active", _ret_wrow["end_active_users_observed"], "total"),
+                    ]
+                )
+                _ret_risk_24h_steps = _ret_build_waterfall_steps(
+                    [
+                        ("Start risk stock", _ret_wrow["start_risk_24h_users"], "total"),
+                        ("+ New at risk", _ret_wrow["new_risk_24h_users"], "delta"),
+                        ("- De-risked", -int(_ret_wrow["derisked_24h_users"]), "delta"),
+                        ("End risk stock", _ret_wrow["end_risk_24h_users"], "total"),
+                    ]
+                )
+                _ret_risk_rl_steps = _ret_build_waterfall_steps(
+                    [
+                        ("Start risk stock", _ret_wrow["start_risk_rl_users"], "total"),
+                        ("+ New at risk", _ret_wrow["new_risk_rl_users"], "delta"),
+                        ("- De-risked", -int(_ret_wrow["derisked_rl_users"]), "delta"),
+                        ("End risk stock", _ret_wrow["end_risk_rl_users"], "total"),
+                    ]
+                )
+                _ret_color_scale = alt.Scale(
+                    domain=["up", "down", "total"],
+                    range=["#22c55e", "#ef4444", "#60a5fa"],
+                )
+                _ret_active_chart = (
+                    alt.Chart(_ret_active_steps)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(height=300, title=f"Active Stock Waterfall ({_ret_selected_week})")
+                )
+                _ret_risk_24h_chart = (
+                    alt.Chart(_ret_risk_24h_steps)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(
+                        height=300,
+                        title=f"At-risk Stock Waterfall (24h No Message) ({_ret_selected_week})",
+                    )
+                )
+                _ret_risk_rl_chart = (
+                    alt.Chart(_ret_risk_rl_steps)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("step:N", sort=None, title=None),
+                        y=alt.Y("start:Q", title="Users"),
+                        y2="end:Q",
+                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
+                        tooltip=[
+                            alt.Tooltip("step:N", title="Step"),
+                            alt.Tooltip("value:Q", title="Delta / Level"),
+                            alt.Tooltip("start:Q", title="From"),
+                            alt.Tooltip("end:Q", title="To"),
+                        ],
+                    )
+                    .properties(
+                        height=300,
+                        title=f"At-risk Stock Waterfall (Recovery Ladder) ({_ret_selected_week})",
+                    )
+                )
+                st.altair_chart(_ret_active_chart, use_container_width=True)
+                _ret_c1, _ret_c2 = st.columns(2)
+                with _ret_c1:
+                    st.altair_chart(_ret_risk_24h_chart, use_container_width=True)
+                with _ret_c2:
+                    st.altair_chart(_ret_risk_rl_chart, use_container_width=True)
+                st.caption(
+                    f"Active reconciliation gap for `{_ret_selected_week}`: "
+                    f"{int(_ret_wrow['active_reconciliation_gap'])} "
+                    "(observed end active - computed end active)."
+                )
+                _ret_waterfall_display = _ret_wf.drop(columns=["week_start_dt"]).rename(
+                    columns={
+                        "week_start": "Week",
+                        "start_active_users": "Start active users",
+                        "new_acquired_users": "+ New acquired",
+                        "reactivated_users": "+ Reactivated",
+                        "became_inactive_users": "- Became inactive (farewell)",
+                        "end_active_users_computed": "End active (computed)",
+                        "end_active_users_observed": "End active (observed)",
+                        "active_reconciliation_gap": "Active reconciliation gap",
+                        "start_risk_24h_users": "Start risk 24h stock",
+                        "new_risk_24h_users": "New at-risk 24h",
+                        "derisked_24h_users": "De-risked after 24h",
+                        "end_risk_24h_users": "End risk 24h stock",
+                        "start_risk_rl_users": "Start RL risk stock",
+                        "new_risk_rl_users": "New at-risk RL",
+                        "derisked_rl_users": "De-risked after RL",
+                        "end_risk_rl_users": "End RL risk stock",
+                    }
+                )
+                st.dataframe(_ret_waterfall_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("No weekly waterfall data for this date range.")
+    else:
+        st.caption(
+            "No recovery ladder sends in the last 12 weeks — reply timeline and waterfall are unavailable."
+        )
+
+    st.markdown("---")
     st.markdown("### 📈 User Retention by Weekly Cohort")
     # Use shared loader so all tabs/queries stay in sync with the latest internal-users.json
     internal_waids = load_internal_users()
@@ -5192,269 +5580,6 @@ with tab5:
             k4.metric("Activity 24h (% sends)", "—")
             k5.metric("No-reply rate (% sends)", "—")
             k6.metric("Median reply time (min)", "—")
-
-        st.markdown("#### 📈 Weekly Timeline — Reply Rate (% sends)")
-        timeline_df = weekly[["week_start_sp", "reply_rate_pct"]].copy().sort_values("week_start_sp")
-        timeline_df = timeline_df.rename(columns={"week_start_sp": "Week", "reply_rate_pct": "Reply rate (%)"})
-        timeline_df["Week"] = pd.to_datetime(timeline_df["Week"]).dt.strftime("%Y-%m-%d")
-        import altair as alt
-        timeline_chart = (
-            alt.Chart(timeline_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("Week:N", sort=None, title="Week"),
-                y=alt.Y("Reply rate (%)", title="Reply rate (%)"),
-                tooltip=[alt.Tooltip("Week:N", title="Week"), alt.Tooltip("Reply rate (%)", title="Reply rate (%)")],
-            )
-            .properties(height=300)
-        )
-        st.altair_chart(timeline_chart, use_container_width=True)
-
-        # Week-by-week: active/risk waterfall table + visualizations
-        st.markdown("#### 📋 Weekly Waterfall — Active, Inactive, Risk & De-risk")
-
-        wf_default_start_date = (datetime.now() - timedelta(weeks=12)).date()
-        wf_default_end_date = datetime.now().date()
-        use_custom_wf_dates = st.toggle(
-            "Use custom date range for waterfall section",
-            value=False,
-            key="rl_waterfall_custom_dates_toggle",
-            help="When off, uses the last 12 weeks."
-        )
-        wf_start_date = wf_default_start_date
-        wf_end_date = wf_default_end_date
-        if use_custom_wf_dates:
-            d1, d2 = st.columns(2)
-            with d1:
-                wf_start_date = st.date_input(
-                    "Waterfall start date",
-                    value=wf_default_start_date,
-                    key="rl_waterfall_start_date"
-                )
-            with d2:
-                wf_end_date = st.date_input(
-                    "Waterfall end date",
-                    value=wf_default_end_date,
-                    key="rl_waterfall_end_date"
-                )
-
-        if wf_start_date > wf_end_date:
-            st.warning("Waterfall date range is invalid (`start > end`). Swapping dates automatically.")
-            wf_start_date, wf_end_date = wf_end_date, wf_start_date
-
-        try:
-            waterfall_df = get_recovery_weekly_waterfall_metrics(wf_start_date.strftime("%Y-%m-%d"))
-        except Exception as e:
-            waterfall_df = pd.DataFrame()
-            st.warning(f"Could not load weekly active/risk waterfall metrics: {e}")
-
-        if waterfall_df is not None and not waterfall_df.empty:
-            wf = waterfall_df.copy()
-            wf["week_start_dt"] = pd.to_datetime(wf["week_start"], errors="coerce")
-            wf = wf[
-                (wf["week_start_dt"].notna())
-                & (wf["week_start_dt"] >= pd.to_datetime(wf_start_date))
-                & (wf["week_start_dt"] <= pd.to_datetime(wf_end_date))
-            ].copy()
-            wf = wf.sort_values("week_start", ascending=False)
-
-            if wf.empty:
-                st.info("No weekly waterfall data for the selected date range.")
-            else:
-                def _build_waterfall_steps(steps):
-                    rows = []
-                    running = 0
-                    for step_label, value, step_type in steps:
-                        val = int(value)
-                        if step_type == "total":
-                            y0 = 0
-                            y1 = val
-                            running = val
-                            display_val = val
-                            direction = "total"
-                        else:
-                            y0 = running
-                            y1 = running + val
-                            running = y1
-                            display_val = val
-                            direction = "up" if val >= 0 else "down"
-                        rows.append(
-                            {
-                                "step": step_label,
-                                "start": y0,
-                                "end": y1,
-                                "value": display_val,
-                                "bar_type": direction,
-                            }
-                        )
-                    return pd.DataFrame(rows)
-
-                st.markdown("#### 📈 Weekly Timeline — Active & At-risk Stock")
-                stock_timeline_df = (
-                    wf[["week_start", "start_active_users", "start_risk_24h_users", "start_risk_rl_users"]]
-                    .copy()
-                    .sort_values("week_start")
-                )
-                stock_timeline_long = stock_timeline_df.melt(
-                    id_vars=["week_start"],
-                    value_vars=["start_active_users", "start_risk_24h_users", "start_risk_rl_users"],
-                    var_name="metric",
-                    value_name="users"
-                )
-                stock_timeline_long["metric"] = stock_timeline_long["metric"].map(
-                    {
-                        "start_active_users": "Start active users",
-                        "start_risk_24h_users": "Start at-risk users (24h)",
-                        "start_risk_rl_users": "Start at-risk users (RL)",
-                    }
-                )
-                stock_timeline_chart = (
-                    alt.Chart(stock_timeline_long)
-                    .mark_line(point=True)
-                    .encode(
-                        x=alt.X("week_start:N", sort=None, title="Week"),
-                        y=alt.Y("users:Q", title="Users"),
-                        color=alt.Color("metric:N", title="Series"),
-                        tooltip=[
-                            alt.Tooltip("week_start:N", title="Week"),
-                            alt.Tooltip("metric:N", title="Series"),
-                            alt.Tooltip("users:Q", title="Users"),
-                        ],
-                    )
-                    .properties(height=300)
-                )
-                st.altair_chart(stock_timeline_chart, use_container_width=True)
-
-                selected_week = st.selectbox(
-                    "Select week for waterfall visuals",
-                    options=wf["week_start"].tolist(),
-                    index=0,
-                    key="rl_waterfall_week_select"
-                )
-                wrow = wf[wf["week_start"] == selected_week].iloc[0]
-
-                active_steps_df = _build_waterfall_steps(
-                    [
-                        ("Start active", wrow["start_active_users"], "total"),
-                        ("+ New acquired", wrow["new_acquired_users"], "delta"),
-                        ("+ Reactivated", wrow["reactivated_users"], "delta"),
-                        ("- Became inactive", -int(wrow["became_inactive_users"]), "delta"),
-                        ("End active", wrow["end_active_users_observed"], "total"),
-                    ]
-                )
-
-                risk_24h_steps_df = _build_waterfall_steps(
-                    [
-                        ("Start risk stock", wrow["start_risk_24h_users"], "total"),
-                        ("+ New at risk", wrow["new_risk_24h_users"], "delta"),
-                        ("- De-risked", -int(wrow["derisked_24h_users"]), "delta"),
-                        ("End risk stock", wrow["end_risk_24h_users"], "total"),
-                    ]
-                )
-                risk_rl_steps_df = _build_waterfall_steps(
-                    [
-                        ("Start risk stock", wrow["start_risk_rl_users"], "total"),
-                        ("+ New at risk", wrow["new_risk_rl_users"], "delta"),
-                        ("- De-risked", -int(wrow["derisked_rl_users"]), "delta"),
-                        ("End risk stock", wrow["end_risk_rl_users"], "total"),
-                    ]
-                )
-
-                color_scale = alt.Scale(
-                    domain=["up", "down", "total"],
-                    range=["#22c55e", "#ef4444", "#60a5fa"]
-                )
-
-                active_chart = (
-                    alt.Chart(active_steps_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(height=300, title=f"Active Stock Waterfall ({selected_week})")
-                )
-
-                risk_24h_chart = (
-                    alt.Chart(risk_24h_steps_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(height=300, title=f"At-risk Stock Waterfall (24h No Message) ({selected_week})")
-                )
-
-                risk_rl_chart = (
-                    alt.Chart(risk_rl_steps_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(height=300, title=f"At-risk Stock Waterfall (Recovery Ladder) ({selected_week})")
-                )
-
-                st.altair_chart(active_chart, use_container_width=True)
-                c_risk_24h, c_risk_rl = st.columns(2)
-                with c_risk_24h:
-                    st.altair_chart(risk_24h_chart, use_container_width=True)
-                with c_risk_rl:
-                    st.altair_chart(risk_rl_chart, use_container_width=True)
-
-                st.caption(
-                    f"Active reconciliation gap for `{selected_week}`: "
-                    f"{int(wrow['active_reconciliation_gap'])} "
-                    "(observed end active - computed end active)."
-                )
-
-                waterfall_display = wf.drop(columns=["week_start_dt"]).rename(
-                    columns={
-                        "week_start": "Week",
-                        "start_active_users": "Start active users",
-                        "new_acquired_users": "+ New acquired",
-                        "reactivated_users": "+ Reactivated",
-                        "became_inactive_users": "- Became inactive (farewell)",
-                        "end_active_users_computed": "End active (computed)",
-                        "end_active_users_observed": "End active (observed)",
-                        "active_reconciliation_gap": "Active reconciliation gap",
-                        "start_risk_24h_users": "Start risk 24h stock",
-                        "new_risk_24h_users": "New at-risk 24h",
-                        "derisked_24h_users": "De-risked after 24h",
-                        "end_risk_24h_users": "End risk 24h stock",
-                        "start_risk_rl_users": "Start RL risk stock",
-                        "new_risk_rl_users": "New at-risk RL",
-                        "derisked_rl_users": "De-risked after RL",
-                        "end_risk_rl_users": "End RL risk stock",
-                    }
-                )
-                st.dataframe(waterfall_display, use_container_width=True, hide_index=True)
-        else:
-            st.info("No weekly waterfall data for this date range.")
 
 # Footer
 st.markdown("---")
