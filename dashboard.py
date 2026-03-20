@@ -2405,7 +2405,8 @@ with tab1:
                 u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
-                m.message as raw_message
+                m.message as raw_message,
+                m.status
             FROM messages m
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
@@ -2423,7 +2424,8 @@ with tab1:
                 u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
-                m.message as raw_message
+                m.message as raw_message,
+                m.status
             FROM messages m
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
@@ -2441,7 +2443,8 @@ with tab1:
                 u.waid as user_waid,
                 u.timezone as user_timezone,
                 m.sender,
-                m.message as raw_message
+                m.message as raw_message,
+                m.status
             FROM messages m
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
@@ -2743,8 +2746,22 @@ with tab1:
                 except Exception:
                     pass
 
-        # Merge sticker + description: same pattern as images (message before sticker)
+        # Merge sticker + description: stricter than image/audio to avoid false grouping.
+        # Only use immediately previous message (i-1), from same sender, if it's text-like.
         description_for_sticker = {}
+        def is_text_like_for_sticker(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw = "" if pd.isna(raw_msg) else str(raw_msg)
+            # Exclude obvious non-text/media/template payloads
+            if is_sticker_message(msg_type, raw_msg) or is_audio_message(msg_type, raw_msg) or is_image_message(msg_type, raw_msg):
+                return False
+            if "notification" in raw.lower() or '"template"' in raw.lower():
+                return False
+            # Text-ish types are safe to merge as sticker descriptions
+            return t in ("text", "interactive", "quickreply", "postback", "flows", "") or "text" in raw.lower()
+
         for i in range(len(recent_messages)):
             row = recent_messages.iloc[i]
             if not is_sticker_message(row.get("msg_type"), row.get("raw_message")):
@@ -2753,18 +2770,21 @@ with tab1:
                 ts_cur = pd.to_datetime(row["timestamp"])
             except Exception:
                 continue
-            # Check i-1 first (message before sticker), then i+1 as fallback
-            for candidate_idx in [i - 1, i + 1]:
+            # Only previous row to prevent swallowing the next unrelated chat message.
+            for candidate_idx in [i - 1]:
                 if candidate_idx < 0 or candidate_idx >= len(recent_messages):
                     continue
                 if candidate_idx in skip_idx:
                     continue
                 other = recent_messages.iloc[candidate_idx]
-                if other["sender"] != row["sender"] or is_sticker_message(other.get("msg_type"), other.get("raw_message")):
+                if other["sender"] != row["sender"]:
+                    continue
+                if not is_text_like_for_sticker(other.get("msg_type"), other.get("raw_message")):
                     continue
                 try:
                     ts_other = pd.to_datetime(other["timestamp"])
-                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                    # Keep a tight window for caption-style companion messages.
+                    if 0 <= (ts_cur - ts_other).total_seconds() <= 30:
                         description_for_sticker[i] = candidate_idx
                         skip_idx.add(candidate_idx)
                         break
@@ -2825,21 +2845,30 @@ with tab1:
                 "Time": format_timestamp_local(row),
                 "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
+                "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
                 "Message": text,
                 "Message (EN)": translate_to_english(text),
             })
 
         display_df = pd.DataFrame(rows_display)
+        display_obj = display_df
+        if not display_df.empty and "Status" in display_df.columns:
+            def _highlight_failed_row(row):
+                failed = str(row.get("Status", "")).strip().lower() == "failed"
+                style = "background-color: rgba(239, 68, 68, 0.16);" if failed else ""
+                return [style] * len(row)
+            display_obj = display_df.style.apply(_highlight_failed_row, axis=1)
         
         st.dataframe(
-            display_df, 
+            display_obj,
             use_container_width=True, 
             hide_index=True,
             column_config={
                 "Time": st.column_config.TextColumn(width="small"),
                 "User": st.column_config.TextColumn(width="medium"),
                 "From": st.column_config.TextColumn(width="small"),
+                "Status": st.column_config.TextColumn(width="small"),
                 "Type": st.column_config.TextColumn(width="small"),
                 "Message": st.column_config.TextColumn(width="large"),
                 "Message (EN)": st.column_config.TextColumn(width="large"),
@@ -3673,7 +3702,7 @@ with tab2:
         msg_limit_sql = f"LIMIT {msg_limit}" if msg_limit else ""
         
         messages_df = run_query(f"""
-            SELECT id as msg_id, sent_at, sender, type as msg_type, message
+            SELECT id as msg_id, sent_at, sender, type as msg_type, message, status
             FROM messages
             WHERE user_id = {user_id} AND sent_at IS NOT NULL
             ORDER BY sent_at DESC
@@ -3906,8 +3935,20 @@ with tab2:
                     except Exception:
                         pass
 
-            # Merge sticker + description: same pattern as images (message before sticker)
+            # Merge sticker + description: stricter than image/audio to avoid false grouping.
+            # Only use immediately previous message (i-1), from same sender, if it's text-like.
             description_for_sticker_dd = {}
+            def is_text_like_for_sticker_dd(msg_type, raw_msg):
+                if pd.isna(msg_type):
+                    msg_type = ""
+                t = str(msg_type).strip().lower()
+                raw = "" if pd.isna(raw_msg) else str(raw_msg)
+                if is_sticker_msg(msg_type, raw_msg) or is_audio_msg(msg_type, raw_msg) or is_image_msg(msg_type, raw_msg):
+                    return False
+                if "notification" in raw.lower() or '"template"' in raw.lower():
+                    return False
+                return t in ("text", "interactive", "quickreply", "postback", "flows", "") or "text" in raw.lower()
+
             for i in range(len(messages_df)):
                 row = messages_df.iloc[i]
                 if not is_sticker_msg(row.get("msg_type"), row.get("message")):
@@ -3916,17 +3957,21 @@ with tab2:
                     ts_cur = pd.to_datetime(row["sent_at"])
                 except Exception:
                     continue
-                for candidate_idx in [i - 1, i + 1]:
+                # Only previous row to prevent swallowing the next unrelated chat message.
+                for candidate_idx in [i - 1]:
                     if candidate_idx < 0 or candidate_idx >= len(messages_df):
                         continue
                     if candidate_idx in skip_idx_dd:
                         continue
                     other = messages_df.iloc[candidate_idx]
-                    if other["sender"] != row["sender"] or is_sticker_msg(other.get("msg_type"), other.get("message")):
+                    if other["sender"] != row["sender"]:
+                        continue
+                    if not is_text_like_for_sticker_dd(other.get("msg_type"), other.get("message")):
                         continue
                     try:
                         ts_other = pd.to_datetime(other["sent_at"])
-                        if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        # Keep a tight window for caption-style companion messages.
+                        if 0 <= (ts_cur - ts_other).total_seconds() <= 30:
                             description_for_sticker_dd[i] = candidate_idx
                             skip_idx_dd.add(candidate_idx)
                             break
@@ -3984,20 +4029,29 @@ with tab2:
                 rows_history.append({
                     "Time": format_ts_local(row["sent_at"]),
                     "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
+                    "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                     "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_template(row.get("message"))),
                     "Message": text,
                     "Message (EN)": translate_to_english(text),
                 })
 
             history_df = pd.DataFrame(rows_history)
+            history_obj = history_df
+            if not history_df.empty and "Status" in history_df.columns:
+                def _highlight_failed_history_row(row):
+                    failed = str(row.get("Status", "")).strip().lower() == "failed"
+                    style = "background-color: rgba(239, 68, 68, 0.16);" if failed else ""
+                    return [style] * len(row)
+                history_obj = history_df.style.apply(_highlight_failed_history_row, axis=1)
             st.dataframe(
-                history_df,
+                history_obj,
                 use_container_width=True,
                 hide_index=True,
                 height=420,
                 column_config={
                     "Time": st.column_config.TextColumn(width="small"),
                     "From": st.column_config.TextColumn(width="small"),
+                    "Status": st.column_config.TextColumn(width="small"),
                     "Type": st.column_config.TextColumn(width="small"),
                     "Message": st.column_config.TextColumn(width="large"),
                     "Message (EN)": st.column_config.TextColumn(width="large"),
