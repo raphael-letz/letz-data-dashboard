@@ -640,6 +640,53 @@ ORDER BY ladder_step DESC, sent_at DESC;
 
 
 @st.cache_data(ttl=300)
+def get_reactivated_users_last_24h() -> pd.DataFrame:
+    """
+    Users who were previously marked inactive (received a farewell in recovery_logs at any point)
+    and have sent an inbound message to the coach within the last 24 hours.
+    Returns columns: waid, full_name, last_message_at, farewell_at (most recent farewell before reactivation).
+    Excludes internal users.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+had_farewell AS (
+  SELECT DISTINCT ON (r.user_id)
+    r.user_id,
+    r.sent_at AS farewell_at
+  FROM recovery_logs r
+  JOIN users u ON u.id = r.user_id
+  WHERE r.ladder_step = 'farewell'
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  ORDER BY r.user_id, r.sent_at DESC
+),
+recent_inbound AS (
+  SELECT
+    m.user_id,
+    MAX(m.sent_at) AS last_message_at
+  FROM messages m
+  WHERE m.sender = 'user'
+    AND m.sent_at >= NOW() - INTERVAL '24 hours'
+  GROUP BY m.user_id
+)
+SELECT
+  u.waid,
+  COALESCE(u.full_name, 'Unknown') AS full_name,
+  ri.last_message_at,
+  hf.farewell_at
+FROM had_farewell hf
+JOIN recent_inbound ri ON ri.user_id = hf.user_id
+JOIN users u ON u.id = hf.user_id
+WHERE ri.last_message_at > hf.farewell_at
+ORDER BY ri.last_message_at DESC;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
 def get_recovery_ladder_events(start_date_sp: str = "2026-02-01") -> pd.DataFrame:
     """
     Recovery template sends with latest-template attribution windows.
@@ -1722,7 +1769,16 @@ with tab1:
         sp_tz = "America/Sao_Paulo"
 
         with st.expander("⚠️ At Risk Users"):
-            st.caption("Users who received Recovery Ladder or Farewell templates in the last 24 hours (times in São Paulo). ✅ = responded after receiving template.")
+            st.caption("Users who received Recovery Ladder or Farewell templates in the last 24 hours (times in São Paulo). ✅ = responded after.")
+
+            st.markdown("**Farewell (marked inactive)**")
+            if farewell_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in farewell_df.iterrows():
+                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
+                    reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
+                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
 
             st.markdown("**Recovery Ladder 2** (penultimate step)")
             if rl2_df.empty:
@@ -1741,17 +1797,24 @@ with tab1:
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
                     st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
-
-            st.markdown("**Farewell (marked inactive)**")
-            if farewell_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in farewell_df.iterrows():
-                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
+
+    # Reactivated Users: previously inactive (received farewell) who messaged in the last 24h
+    try:
+        reactivated_df = get_reactivated_users_last_24h()
+        sp_tz = "America/Sao_Paulo"
+        with st.expander("🔄 Reactivated Users"):
+            st.caption("Previously inactive users (received farewell) who sent a message to the coach in the last 24 hours.")
+            if reactivated_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in reactivated_df.iterrows():
+                    last_msg_sp = _format_ts_local(row["last_message_at"], sp_tz)
+                    farewell_sp = _format_ts_local(row["farewell_at"], sp_tz)
+                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
+    except Exception as e:
+        st.warning(f"Could not load Reactivated Users: {e}")
 
     # Goals: consistency over the last 4 SP Monday-weeks
     st.markdown("### 🎯 Goals")
