@@ -1970,14 +1970,14 @@ with tab1:
             ob_better = onboarding_pct_7d > onboarding_pct_prev
             ob_worse = onboarding_pct_7d < onboarding_pct_prev
 
-            # Added slogan/mantra: count cohort users with either users.mantra or post_onboarding slogan.
+            # Added slogan/mantra: count cohort users with mantra key (if present) or post_onboarding slogan.
             if exclude_internal and internal_filter_join:
                 sl_7d = run_query(f"""
                     SELECT COUNT(*) as c
                     FROM users u
                     WHERE {new_user_7d_window}
                       AND (
-                            NULLIF(u.mantra, '') IS NOT NULL
+                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
                             OR EXISTS (
                                 SELECT 1
                                 FROM ai_companion_flows acf
@@ -1993,7 +1993,7 @@ with tab1:
                     FROM users u
                     WHERE {new_user_prev_7d_window}
                       AND (
-                            NULLIF(u.mantra, '') IS NOT NULL
+                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
                             OR EXISTS (
                                 SELECT 1
                                 FROM ai_companion_flows acf
@@ -2010,7 +2010,7 @@ with tab1:
                     FROM users u
                     WHERE {new_user_7d_window}
                       AND (
-                            NULLIF(u.mantra, '') IS NOT NULL
+                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
                             OR EXISTS (
                                 SELECT 1
                                 FROM ai_companion_flows acf
@@ -2025,7 +2025,7 @@ with tab1:
                     FROM users u
                     WHERE {new_user_prev_7d_window}
                       AND (
-                            NULLIF(u.mantra, '') IS NOT NULL
+                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
                             OR EXISTS (
                                 SELECT 1
                                 FROM ai_companion_flows acf
@@ -3350,8 +3350,7 @@ with tab2:
                 waid,
                 timezone,
                 created_at,
-                coach_name,
-                mantra
+                coach_name
             FROM users
             ORDER BY waid, created_at DESC
         ),
@@ -3378,7 +3377,7 @@ with tab2:
             u.timezone,
             u.created_at,
             u.coach_name,
-            COALESCE(NULLIF(u.mantra, ''), us.slogan) AS slogan,
+            COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
             CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
         FROM unique_users u
         LEFT JOIN active_users a ON u.id = a.user_id
@@ -3648,7 +3647,7 @@ with tab2:
             FROM users u
             WHERE u.id = {user_id}
               AND (
-                    NULLIF(u.mantra, '') IS NOT NULL
+                    NULLIF(u.metadata->>'mantra', '') IS NOT NULL
                     OR EXISTS (
                         SELECT 1
                         FROM ai_companion_flows acf
