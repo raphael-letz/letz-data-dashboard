@@ -3274,7 +3274,8 @@ with tab2:
                 waid,
                 timezone,
                 created_at,
-                coach_name
+                coach_name,
+                mantra
             FROM users
             ORDER BY waid, created_at DESC
         ),
@@ -3301,7 +3302,7 @@ with tab2:
             u.timezone,
             u.created_at,
             u.coach_name,
-            us.slogan,
+            COALESCE(NULLIF(u.mantra, ''), us.slogan) AS slogan,
             CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
         FROM unique_users u
         LEFT JOIN active_users a ON u.id = a.user_id
@@ -3549,7 +3550,7 @@ with tab2:
         with info_col1:
             st.info(f"**Coach:** {user_coach if user_coach and pd.notna(user_coach) else '—'}")
         with info_col2:
-            st.info(f"**Slogan:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
+            st.info(f"**Slogan / Mantra:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
         
         # Funnel metrics: onboarding completed, slogan set, first activity completed
         st.markdown("#### 🎯 User Journey Funnel")
@@ -3565,13 +3566,21 @@ with tab2:
         """)
         onboarding_completed = onboarding_check['completed'].iloc[0] if not onboarding_check.empty else False
         
-        # Check slogan set
+        # Check slogan/mantra set
         slogan_check = run_query(f"""
             SELECT COUNT(*) as count
-            FROM ai_companion_flows
-            WHERE user_id = {user_id}
-              AND type = 'post_onboarding'
-              AND content->>'slogan' IS NOT NULL
+            FROM users u
+            WHERE u.id = {user_id}
+              AND (
+                    NULLIF(u.mantra, '') IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM ai_companion_flows acf
+                        WHERE acf.user_id = u.id
+                          AND acf.type = 'post_onboarding'
+                          AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                    )
+                  )
         """)
         slogan_set = slogan_check['count'].iloc[0] > 0 if not slogan_check.empty else False
         
