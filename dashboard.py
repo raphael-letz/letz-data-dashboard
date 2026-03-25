@@ -1903,30 +1903,65 @@ with tab1:
             new_user_7d_window = "u.created_at >= NOW() - INTERVAL '7 days'"
             new_user_prev_7d_window = "u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'"
 
-            # Completed onboarding: denominator = all users rows with created_at in window (users table only; include empty name/waid-only). Numerator = those who have onboarding_completed event in that window.
+            # Completed onboarding: count cohort users that have onboarding completion from either
+            # users.onboarding_timestamp (preferred) or events.onboarding_completed (fallback).
             if exclude_internal and internal_filter_join:
                 ob_7d = run_query(f"""
                     SELECT COUNT(*) as c FROM users u
                     WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '7 days')
+                      AND (
+                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '7 days')
+                            OR EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.user_id = u.id
+                                  AND e.event_type = 'onboarding_completed'
+                                  AND e.executed_at >= NOW() - INTERVAL '7 days'
+                            )
+                          )
                       {internal_filter_join}
                 """)
                 ob_prev = run_query(f"""
                     SELECT COUNT(*) as c FROM users u
                     WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
-                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days')
+                      AND (
+                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '14 days' AND u.onboarding_timestamp < NOW() - INTERVAL '7 days')
+                            OR EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.user_id = u.id
+                                  AND e.event_type = 'onboarding_completed'
+                                  AND e.executed_at >= NOW() - INTERVAL '14 days'
+                                  AND e.executed_at < NOW() - INTERVAL '7 days'
+                            )
+                          )
                       {internal_filter_join}
                 """)
             else:
                 ob_7d = run_query("""
                     SELECT COUNT(*) as c FROM users u
                     WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '7 days')
+                      AND (
+                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '7 days')
+                            OR EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.user_id = u.id
+                                  AND e.event_type = 'onboarding_completed'
+                                  AND e.executed_at >= NOW() - INTERVAL '7 days'
+                            )
+                          )
                 """)
                 ob_prev = run_query("""
                     SELECT COUNT(*) as c FROM users u
                     WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
-                      AND EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed' AND e.executed_at >= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days')
+                      AND (
+                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '14 days' AND u.onboarding_timestamp < NOW() - INTERVAL '7 days')
+                            OR EXISTS (
+                                SELECT 1 FROM events e
+                                WHERE e.user_id = u.id
+                                  AND e.event_type = 'onboarding_completed'
+                                  AND e.executed_at >= NOW() - INTERVAL '14 days'
+                                  AND e.executed_at < NOW() - INTERVAL '7 days'
+                            )
+                          )
                 """)
             o7 = ob_7d['c'].iloc[0] if not ob_7d.empty else 0
             o_prev = ob_prev['c'].iloc[0] if not ob_prev.empty else 0
@@ -1935,29 +1970,70 @@ with tab1:
             ob_better = onboarding_pct_7d > onboarding_pct_prev
             ob_worse = onboarding_pct_7d < onboarding_pct_prev
 
-            # Added slogan: count only new users in the time window who added slogan in that window; denominator = new users in window
-            acf_7d_filter = "acf.created_at >= NOW() - INTERVAL '7 days'"
+            # Added slogan/mantra: count cohort users with either users.mantra or post_onboarding slogan.
             if exclude_internal and internal_filter_join:
                 sl_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
-                    JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND {acf_7d_filter} AND {new_user_7d_window} {internal_filter_join}
+                    SELECT COUNT(*) as c
+                    FROM users u
+                    WHERE {new_user_7d_window}
+                      AND (
+                            NULLIF(u.mantra, '') IS NOT NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM ai_companion_flows acf
+                                WHERE acf.user_id = u.id
+                                  AND acf.type = 'post_onboarding'
+                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                            )
+                          )
+                      {internal_filter_join}
                 """)
                 sl_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
-                    JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window} {internal_filter_join}
+                    SELECT COUNT(*) as c
+                    FROM users u
+                    WHERE {new_user_prev_7d_window}
+                      AND (
+                            NULLIF(u.mantra, '') IS NOT NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM ai_companion_flows acf
+                                WHERE acf.user_id = u.id
+                                  AND acf.type = 'post_onboarding'
+                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                            )
+                          )
+                      {internal_filter_join}
                 """)
             else:
                 sl_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
-                    JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window}
+                    SELECT COUNT(*) as c
+                    FROM users u
+                    WHERE {new_user_7d_window}
+                      AND (
+                            NULLIF(u.mantra, '') IS NOT NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM ai_companion_flows acf
+                                WHERE acf.user_id = u.id
+                                  AND acf.type = 'post_onboarding'
+                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                            )
+                          )
                 """)
                 sl_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT acf.user_id) as c FROM ai_companion_flows acf
-                    JOIN users u ON acf.user_id = u.id
-                    WHERE acf.type = 'post_onboarding' AND acf.content->>'slogan' IS NOT NULL AND acf.created_at >= NOW() - INTERVAL '14 days' AND acf.created_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window}
+                    SELECT COUNT(*) as c
+                    FROM users u
+                    WHERE {new_user_prev_7d_window}
+                      AND (
+                            NULLIF(u.mantra, '') IS NOT NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM ai_companion_flows acf
+                                WHERE acf.user_id = u.id
+                                  AND acf.type = 'post_onboarding'
+                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                            )
+                          )
                 """)
             s7 = sl_7d['c'].iloc[0] if not sl_7d.empty else 0
             s_prev = sl_prev['c'].iloc[0] if not sl_prev.empty else 0
