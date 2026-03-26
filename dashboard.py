@@ -3350,7 +3350,8 @@ with tab2:
                 waid,
                 timezone,
                 created_at,
-                coach_name
+                coach_name,
+                metadata
             FROM users
             ORDER BY waid, created_at DESC
         ),
