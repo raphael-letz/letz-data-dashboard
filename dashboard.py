@@ -1650,18 +1650,25 @@ with tab1:
         total_users_count = total_df['count'].iloc[0] if not total_df.empty else 0
         alive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = true{extra}")
         alive_count = alive_df['count'].iloc[0] if not alive_df.empty else 0
-        inactive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = false{extra}")
-        inactive_count = inactive_df['count'].iloc[0] if not inactive_df.empty else 0
         new_7d_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra}")
         new_7d_count = new_7d_df['count'].iloc[0] if not new_7d_df.empty else 0
+        churned_7d_df = run_query(f"""
+            SELECT COUNT(DISTINCT rl.user_id) as count
+            FROM recovery_logs rl
+            JOIN users u ON rl.user_id = u.id
+            WHERE rl.ladder_step = 'farewell'
+              AND rl.sent_at >= NOW() - INTERVAL '7 days'
+              {internal_filter_join}
+        """)
+        churned_7d_count = churned_7d_df['count'].iloc[0] if not churned_7d_df.empty else 0
     except Exception:
-        total_users_count = alive_count = inactive_count = new_7d_count = 0
+        total_users_count = alive_count = new_7d_count = churned_7d_count = 0
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total users", total_users_count if total_users_count else "—")
     col2.metric("Alive users", alive_count if alive_count is not None else "—")
-    col3.metric("Inactive users", inactive_count if inactive_count is not None else "—")
-    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
+    col3.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
+    col4.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
 
     # Row 2: Inside 24h, Messaged today, Active today — percentages only
     today_day = datetime.utcnow().strftime("%A")
@@ -1677,6 +1684,7 @@ with tab1:
         inside_24h = inside_24h_df['count'].iloc[0] if not inside_24h_df.empty else 0
         pct_inside_24h = round(100 * inside_24h / alive_count, 1) if alive_count else 0
     except Exception:
+        inside_24h = 0
         pct_inside_24h = 0
     try:
         messaged_today_df = run_query(f"""
@@ -1690,6 +1698,7 @@ with tab1:
         messaged_today = messaged_today_df['count'].iloc[0] if not messaged_today_df.empty else 0
         pct_messaged_today = round(100 * messaged_today / alive_count, 1) if alive_count else 0
     except Exception:
+        messaged_today = 0
         pct_messaged_today = 0
     try:
         completed_today_df = run_query(f"""
@@ -1710,12 +1719,16 @@ with tab1:
         has_activity_today = has_activity_today_df['count'].iloc[0] if not has_activity_today_df.empty else 0
         pct_activity_complete = round(100 * completed_today / has_activity_today, 1) if has_activity_today else 0
     except Exception:
+        completed_today = 0
         pct_activity_complete = 0
 
     c4, c5, c6 = st.columns(3)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
+    c4.caption(f"↳ {inside_24h} users")
     c5.metric("Messaged today", f"{pct_messaged_today}%")
+    c5.caption(f"↳ {messaged_today} users")
     c6.metric("Active today", f"{pct_activity_complete}%")
+    c6.caption(f"↳ {completed_today} users")
 
     # Expandable simple lists for key metrics
     try:
@@ -1743,25 +1756,36 @@ with tab1:
     
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        active_today_list = run_query(f"""
-            SELECT DISTINCT COALESCE(u.full_name, 'Unknown') AS name, u.waid
-            FROM messages m
-            JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at >= CURRENT_DATE 
-              AND m.user_id IS NOT NULL
-              AND m.sender = 'user'
+        inactive_7d_list = run_query(f"""
+            SELECT DISTINCT ON (u.id)
+                COALESCE(u.full_name, 'Unknown') AS name,
+                u.waid AS phone,
+                u.active_days,
+                TO_CHAR(
+                    date_trunc('week', u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo'),
+                    'YYYY-MM-DD'
+                ) AS onboarding_week,
+                rl.sent_at AS farewell_at
+            FROM recovery_logs rl
+            JOIN users u ON rl.user_id = u.id
+            WHERE rl.ladder_step = 'farewell'
+              AND rl.sent_at >= NOW() - INTERVAL '7 days'
               {internal_filter_join}
-            ORDER BY name
-            LIMIT 200
+            ORDER BY u.id, rl.sent_at DESC
         """)
-        with st.expander("Messaged today"):
-            if active_today_list.empty:
+        inactive_7d_count = len(inactive_7d_list) if not inactive_7d_list.empty else 0
+        with st.expander(f"Inactive users (past 7d) — {inactive_7d_count} users"):
+            if inactive_7d_list.empty:
                 st.caption("No users")
             else:
-                for _, row in active_today_list.iterrows():
-                    st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
-    except:
-        st.warning("Could not load Messaged today list")
+                for _, row in inactive_7d_list.iterrows():
+                    name = format_display_name(row['name'], row.get('phone'))
+                    phone = row.get('phone', '—')
+                    onb_week = row.get('onboarding_week') or '—'
+                    active_days_val = row.get('active_days', '—')
+                    st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
+    except Exception as e:
+        st.warning(f"Could not load inactive users list: {e}")
 
     # At Risk Users: Recovery Ladder 1 & 2 + Farewell (inactive) in last 24h
     try:
@@ -1816,61 +1840,157 @@ with tab1:
     except Exception as e:
         st.warning(f"Could not load Reactivated Users: {e}")
 
-    # Goals: consistency over the last 4 SP Monday-weeks
-    st.markdown("### 🎯 Goals")
-    try:
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        goals_df = run_query(f"""
-            WITH week_bounds AS (
-                SELECT date_trunc('week', NOW() AT TIME ZONE 'America/Sao_Paulo')::date AS current_week_start
-            ),
-            weekly_activity AS (
-                SELECT
-                    uah.user_id,
-                    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start_sp,
-                    COUNT(*) AS activities_count
-                FROM user_activities_history uah
-                JOIN users u ON uah.user_id = u.id
-                WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date >= (SELECT current_week_start - INTERVAL '3 weeks' FROM week_bounds)
-                  AND (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date < (SELECT current_week_start + INTERVAL '1 week' FROM week_bounds)
-                  {internal_filter_join}
-                GROUP BY uah.user_id, week_start_sp
-            ),
-            qualified_weeks AS (
-                SELECT user_id, week_start_sp
-                FROM weekly_activity
-                WHERE activities_count >= 3
-            ),
-            two_consecutive AS (
-                SELECT DISTINCT q1.user_id
-                FROM qualified_weeks q1
-                JOIN qualified_weeks q2
-                  ON q2.user_id = q1.user_id
-                 AND q2.week_start_sp = q1.week_start_sp + INTERVAL '7 days'
-            )
-            SELECT
-                (SELECT COUNT(DISTINCT user_id) FROM qualified_weeks) AS users_3plus_1week,
-                (SELECT COUNT(DISTINCT user_id) FROM two_consecutive) AS users_3plus_2consecutive
-        """)
-        users_1week = int(goals_df["users_3plus_1week"].iloc[0]) if not goals_df.empty else 0
-        users_2consec = int(goals_df["users_3plus_2consecutive"].iloc[0]) if not goals_df.empty else 0
+    # Active Days Timeline — avg active days per active user per week (last 12 weeks)
+    # Active users denominator = waterfall active_stock definition (not inactive = no unresolved farewell)
+    import altair as alt
 
-        goals_table = pd.DataFrame([
-            {
-                "Metric": "Users with 3+ activities for 1 week",
-                "Current (last 4 weeks)": users_1week,
-                "March goal": 50,
-            },
-            {
-                "Metric": "Users with 3+ activities for 2 consecutive weeks",
-                "Current (last 4 weeks)": users_2consec,
-                "March goal": 50,
-            },
-        ])
-        st.dataframe(goals_table, use_container_width=True, hide_index=True)
-        st.caption("Week buckets start on Monday in America/Sao_Paulo.")
+    st.markdown("### 📅 Avg Active Days per Active User — Weekly")
+    try:
+        internal_waids = load_internal_users()
+        internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+        _ad_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+        active_days_weekly_df = run_query(f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+base_users AS (
+  SELECT u.id, u.waid, u.created_at
+  FROM users u
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{_ad_start}')::date,
+    date_trunc('week', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT
+    week_start,
+    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
+    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
+  FROM weeks
+),
+inbound_msgs AS (
+  SELECT bu.id AS user_id, m.sent_at
+  FROM base_users bu
+  JOIN messages m ON m.sender = 'user' AND (m.user_id = bu.id OR m.waid = bu.waid)
+),
+farewell_events AS (
+  SELECT r.user_id, r.sent_at AS farewell_at,
+    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
+  FROM recovery_logs r
+  JOIN base_users bu ON bu.id = r.user_id
+  WHERE r.ladder_step = 'farewell'
+),
+farewell_cycles AS (
+  SELECT fe.user_id, fe.farewell_at,
+    (
+      SELECT MIN(im.sent_at)
+      FROM inbound_msgs im
+      WHERE im.user_id = fe.user_id
+        AND im.sent_at > fe.farewell_at
+        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
+    ) AS reactivated_at
+  FROM farewell_events fe
+),
+active_stock AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT bu.id) FILTER (
+      WHERE bu.created_at < wb.week_start_ts
+        AND NOT EXISTS (
+          SELECT 1 FROM farewell_cycles fc
+          WHERE fc.user_id = bu.id
+            AND fc.farewell_at < wb.week_start_ts
+            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
+        )
+    )::bigint AS active_users_start
+  FROM week_bounds wb
+  CROSS JOIN base_users bu
+  GROUP BY wb.week_start
+),
+weekly_user_active AS (
+  SELECT
+    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start,
+    uah.user_id,
+    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) AS active_days_in_week
+  FROM user_activities_history uah
+  JOIN base_users bu ON uah.user_id = bu.id
+  WHERE uah.completed_at >= (DATE '{_ad_start}'::timestamp AT TIME ZONE 'America/Sao_Paulo')
+  GROUP BY week_start, uah.user_id
+),
+weekly_totals AS (
+  SELECT
+    week_start,
+    SUM(active_days_in_week)::bigint AS total_active_days,
+    COUNT(DISTINCT user_id)::bigint AS users_with_completions
+  FROM weekly_user_active
+  GROUP BY week_start
+)
+SELECT
+  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
+  COALESCE(ast.active_users_start, 0)::bigint AS active_users_start,
+  COALESCE(wt.users_with_completions, 0)::bigint AS users_with_completions,
+  CASE
+    WHEN COALESCE(ast.active_users_start, 0) > 0
+    THEN ROUND(COALESCE(wt.total_active_days, 0)::numeric / ast.active_users_start, 2)
+    ELSE 0
+  END AS avg_active_days
+FROM week_bounds wb
+LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
+LEFT JOIN weekly_totals wt ON wt.week_start = wb.week_start
+ORDER BY wb.week_start
+        """)
+        if not active_days_weekly_df.empty:
+            _ad_df = active_days_weekly_df.copy()
+            _ad_df["avg_active_days"] = _ad_df["avg_active_days"].astype(float)
+            _ad_chart = (
+                alt.Chart(_ad_df)
+                .mark_line(point=True, color="#00E07B")
+                .encode(
+                    x=alt.X("week_start:N", sort=None, title="Week"),
+                    y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(_ad_chart, use_container_width=True)
+            st.caption("Avg active days = total distinct completion days across all active users ÷ active user base at week start. Active = not inactive (no unresolved farewell). Weeks start Monday (America/Sao_Paulo).")
+        else:
+            st.info("No activity data found for the last 12 weeks.")
     except Exception as e:
-        st.warning(f"Could not load Goals stats: {e}")
+        st.warning(f"Could not load active days chart: {e}")
+
+    # Churn Rate — % of active users who became inactive each week
+    st.markdown("### 📉 Weekly Churn Rate — % Active Users Who Left")
+    try:
+        _churn_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+        _churn_wf_df = get_recovery_weekly_waterfall_metrics(_churn_start)
+        if not _churn_wf_df.empty:
+            _churn_df = _churn_wf_df.copy()
+            _churn_df = _churn_df.sort_values("week_start")
+            _churn_df["churn_rate"] = _churn_df.apply(
+                lambda r: round(100.0 * r["became_inactive_users"] / r["start_active_users"], 1)
+                if r["start_active_users"] > 0 else 0.0,
+                axis=1,
+            )
+            _churn_chart = (
+                alt.Chart(_churn_df)
+                .mark_line(point=True, color="#FF5000")
+                .encode(
+                    x=alt.X("week_start:N", sort=None, title="Week"),
+                    y=alt.Y("churn_rate:Q", title="Churn rate (%)", scale=alt.Scale(zero=True)),
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(_churn_chart, use_container_width=True)
+            st.caption("Churn = users who received a farewell message that week / active users at week start. Weeks start Monday (America/Sao_Paulo).")
+        else:
+            st.info("No churn data available for the last 12 weeks.")
+    except Exception as e:
+        st.warning(f"Could not load churn rate chart: {e}")
     
     # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
     st.markdown("### 🎯 User Journey Progress")
@@ -5655,6 +5775,304 @@ with tab4:
 with tab5:
     st.markdown("### 🪜 Recovery Ladder")
 
+    # Last 7d + prev 7d: template conversion and drop-off
+    st.markdown("#### 📬 Recovery Ladder & Template Sends (Last 7d)")
+    try:
+        rec_7d_filter = "r.sent_at >= NOW() - INTERVAL '7 days'"
+        rec_prev_7d_filter = "r.sent_at >= NOW() - INTERVAL '14 days' AND r.sent_at < NOW() - INTERVAL '7 days'"
+
+        internal_filter_join = get_internal_users_filter_join_sql(True, "u")
+
+        # Conversion rates 24h / 72h
+        if internal_filter_join:
+            conversion_7d = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE {rec_7d_filter} {internal_filter_join}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                      {internal_filter_join}
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                      {internal_filter_join}
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+            conversion_prev = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE {rec_prev_7d_filter} {internal_filter_join}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                      {internal_filter_join}
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                      {internal_filter_join}
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+        else:
+            conversion_7d = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_7d_filter}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+            conversion_prev = run_query(f"""
+                WITH sent AS (
+                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_prev_7d_filter}
+                ),
+                conv24 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
+                ),
+                conv72 AS (
+                    SELECT DISTINCT r.user_id
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id
+                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
+                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM sent) AS total_users,
+                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
+                    (SELECT COUNT(*) FROM conv72) AS conv72_users
+            """)
+
+        t_7d = conversion_7d['total_users'].iloc[0] if not conversion_7d.empty else 0
+        c24_7d = conversion_7d['conv24_users'].iloc[0] if not conversion_7d.empty else 0
+        c72_7d = conversion_7d['conv72_users'].iloc[0] if not conversion_7d.empty else 0
+        conv24_pct = round(100 * c24_7d / t_7d, 1) if t_7d else 0
+        conv72_pct = round(100 * c72_7d / t_7d, 1) if t_7d else 0
+        t_prev = conversion_prev['total_users'].iloc[0] if not conversion_prev.empty else 0
+        c24_prev = conversion_prev['conv24_users'].iloc[0] if not conversion_prev.empty else 0
+        c72_prev = conversion_prev['conv72_users'].iloc[0] if not conversion_prev.empty else 0
+        conv24_prev_pct = round(100 * c24_prev / t_prev, 1) if t_prev else 0
+        conv72_prev_pct = round(100 * c72_prev / t_prev, 1) if t_prev else 0
+
+        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
+        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
+
+        # Ladder drop-off by step and template (last 7d only)
+        if internal_filter_join:
+            dropoff_df = run_query(f"""
+                WITH recovery_sends AS (
+                    SELECT 
+                        r.id,
+                        r.ladder_step,
+                        COALESCE(r.template_name, 'Unknown') AS template_name,
+                        r.user_id,
+                        r.sent_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    WHERE {rec_7d_filter} {internal_filter_join}
+                ),
+                conversions AS (
+                    SELECT DISTINCT r.id
+                    FROM recovery_sends r
+                    JOIN messages m ON m.user_id = r.user_id 
+                        AND m.sender = 'user' 
+                        AND m.sent_at > r.sent_at
+                )
+                SELECT 
+                    r.ladder_step,
+                    r.template_name,
+                    COUNT(*) AS sends,
+                    COUNT(c.id) AS conversions,
+                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
+                FROM recovery_sends r
+                LEFT JOIN conversions c ON r.id = c.id
+                GROUP BY r.ladder_step, r.template_name
+                ORDER BY r.ladder_step, sends DESC
+                LIMIT 50
+            """)
+        else:
+            dropoff_df = run_query(f"""
+                WITH recovery_sends AS (
+                    SELECT 
+                        r.id,
+                        r.ladder_step,
+                        COALESCE(r.template_name, 'Unknown') AS template_name,
+                        r.user_id,
+                        r.sent_at
+                    FROM recovery_logs r
+                    WHERE {rec_7d_filter}
+                ),
+                conversions AS (
+                    SELECT DISTINCT r.id
+                    FROM recovery_sends r
+                    JOIN messages m ON m.user_id = r.user_id 
+                        AND m.sender = 'user' 
+                        AND m.sent_at > r.sent_at
+                )
+                SELECT 
+                    r.ladder_step,
+                    r.template_name,
+                    COUNT(*) AS sends,
+                    COUNT(c.id) AS conversions,
+                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
+                FROM recovery_sends r
+                LEFT JOIN conversions c ON r.id = c.id
+                GROUP BY r.ladder_step, r.template_name
+                ORDER BY r.ladder_step, sends DESC
+                LIMIT 50
+            """)
+
+        # Time to reactivation (avg/median hours)
+        if internal_filter_join:
+            reactivation_7d = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_7d_filter} {internal_filter_join}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+            reactivation_prev = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN users u ON r.user_id = u.id
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_prev_7d_filter} {internal_filter_join}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+        else:
+            reactivation_7d = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_7d_filter}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+            reactivation_prev = run_query(f"""
+                WITH first_reply AS (
+                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
+                    FROM recovery_logs r
+                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
+                    WHERE {rec_prev_7d_filter}
+                    GROUP BY r.id, r.user_id, r.sent_at
+                )
+                SELECT 
+                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
+                FROM first_reply
+            """)
+
+        conv24_prev_blob = _journey_blob(conv24_prev_pct, better_24, not better_24 if better_24 is not None else None)
+        conv72_prev_blob = _journey_blob(conv72_prev_pct, better_72, not better_72 if better_72 is not None else None)
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Conv 24h (% users)", f"{conv24_pct}%", help="Share of unique users who replied within 24h of a recovery template (last 7 days).")
+        col_a.markdown(conv24_prev_blob, unsafe_allow_html=True)
+        col_b.metric("Conv 72h (% users)", f"{conv72_pct}%", help="Share of unique users who replied within 72h of a recovery template (last 7 days).")
+        col_b.markdown(conv72_prev_blob, unsafe_allow_html=True)
+
+        avg_hours_7d = reactivation_7d['avg_hours'].iloc[0] if not reactivation_7d.empty and reactivation_7d['avg_hours'].iloc[0] is not None else None
+        median_hours_7d = reactivation_7d['median_hours'].iloc[0] if not reactivation_7d.empty and reactivation_7d['median_hours'].iloc[0] is not None else None
+        avg_hours_prev = reactivation_prev['avg_hours'].iloc[0] if not reactivation_prev.empty and reactivation_prev['avg_hours'].iloc[0] is not None else None
+        median_hours_prev = reactivation_prev['median_hours'].iloc[0] if not reactivation_prev.empty and reactivation_prev['median_hours'].iloc[0] is not None else None
+
+        col_c.metric(
+            "Median reply time (hours)",
+            f"{round(median_hours_7d,1)}h" if median_hours_7d is not None else "—",
+            _metric_delta(median_hours_7d, median_hours_prev, "h", precision=1),
+            help="Median time from template send to first user reply (hours).",
+            delta_color="inverse",
+        )
+
+        st.markdown("##### Ladder Drop-off by Step & Template (Last 7d)")
+        if dropoff_df.empty:
+            st.caption("No recovery ladder sends found in the last 7 days.")
+        else:
+            st.dataframe(
+                dropoff_df.rename(
+                    columns={
+                        "ladder_step": "Step",
+                        "template_name": "Template",
+                        "sends": "Sends",
+                        "conversions": "Conversions",
+                        "conversion_pct": "Conv %",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+    except Exception as e:
+        st.warning(f"Could not load Recovery Ladder & Template Sends stats: {e}")
+
+    # 12w+ view: ladder performance and reply timeline
     default_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
     try:
         recovery_events = get_recovery_ladder_events(default_start)
