@@ -1653,22 +1653,46 @@ with tab1:
         new_7d_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra}")
         new_7d_count = new_7d_df['count'].iloc[0] if not new_7d_df.empty else 0
         churned_7d_df = run_query(f"""
-            SELECT COUNT(DISTINCT rl.user_id) as count
-            FROM recovery_logs rl
-            JOIN users u ON rl.user_id = u.id
-            WHERE rl.ladder_step = 'farewell'
-              AND rl.sent_at >= NOW() - INTERVAL '7 days'
-              {internal_filter_join}
+            WITH latest_farewell AS (
+                SELECT DISTINCT ON (rl.user_id)
+                    rl.user_id,
+                    rl.sent_at AS farewell_at
+                FROM recovery_logs rl
+                JOIN users u ON rl.user_id = u.id
+                WHERE rl.ladder_step = 'farewell'
+                  AND rl.sent_at >= NOW() - INTERVAL '7 days'
+                  {internal_filter_join}
+                ORDER BY rl.user_id, rl.sent_at DESC
+            ),
+            churn_status AS (
+                SELECT
+                    lf.user_id,
+                    EXISTS (
+                        SELECT 1
+                        FROM messages m
+                        JOIN users u2 ON u2.id = lf.user_id
+                        WHERE (m.user_id = u2.id OR m.waid = u2.waid)
+                          AND m.sender = 'user'
+                          AND m.sent_at > lf.farewell_at
+                    ) AS came_back
+                FROM latest_farewell lf
+            )
+            SELECT
+                COUNT(*) FILTER (WHERE NOT came_back) AS still_inactive_count,
+                COUNT(*) FILTER (WHERE came_back) AS came_back_count
+            FROM churn_status
         """)
-        churned_7d_count = churned_7d_df['count'].iloc[0] if not churned_7d_df.empty else 0
+        churned_7d_count = int(churned_7d_df['still_inactive_count'].iloc[0]) if not churned_7d_df.empty else 0
+        churned_7d_came_back = int(churned_7d_df['came_back_count'].iloc[0]) if not churned_7d_df.empty else 0
     except Exception:
-        total_users_count = alive_count = new_7d_count = churned_7d_count = 0
+        total_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total users", total_users_count if total_users_count else "—")
     col2.metric("Alive users", alive_count if alive_count is not None else "—")
     col3.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
     col4.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
+    col4.caption(f"↳ {churned_7d_came_back} came back")
 
     # Row 2: Inside 24h, Messaged today, Active today — percentages only
     today_day = datetime.utcnow().strftime("%A")
@@ -1757,7 +1781,18 @@ with tab1:
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
         inactive_7d_list = run_query(f"""
-            SELECT DISTINCT ON (u.id)
+            WITH latest_farewell AS (
+                SELECT DISTINCT ON (rl.user_id)
+                    rl.user_id,
+                    rl.sent_at AS farewell_at
+                FROM recovery_logs rl
+                JOIN users u ON rl.user_id = u.id
+                WHERE rl.ladder_step = 'farewell'
+                  AND rl.sent_at >= NOW() - INTERVAL '7 days'
+                  {internal_filter_join}
+                ORDER BY rl.user_id, rl.sent_at DESC
+            )
+            SELECT
                 COALESCE(u.full_name, 'Unknown') AS name,
                 u.waid AS phone,
                 u.active_days,
@@ -1765,25 +1800,46 @@ with tab1:
                     date_trunc('week', u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo'),
                     'YYYY-MM-DD'
                 ) AS onboarding_week,
-                rl.sent_at AS farewell_at
-            FROM recovery_logs rl
-            JOIN users u ON rl.user_id = u.id
-            WHERE rl.ladder_step = 'farewell'
-              AND rl.sent_at >= NOW() - INTERVAL '7 days'
-              {internal_filter_join}
-            ORDER BY u.id, rl.sent_at DESC
+                lf.farewell_at,
+                EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    WHERE (m.user_id = u.id OR m.waid = u.waid)
+                      AND m.sender = 'user'
+                      AND m.sent_at > lf.farewell_at
+                ) AS came_back
+            FROM latest_farewell lf
+            JOIN users u ON u.id = lf.user_id
+            ORDER BY lf.farewell_at DESC
         """)
-        inactive_7d_count = len(inactive_7d_list) if not inactive_7d_list.empty else 0
-        with st.expander(f"Inactive users (past 7d) — {inactive_7d_count} users"):
+        still_inactive_df = inactive_7d_list[inactive_7d_list["came_back"] == False] if not inactive_7d_list.empty else pd.DataFrame()
+        came_back_df = inactive_7d_list[inactive_7d_list["came_back"] == True] if not inactive_7d_list.empty else pd.DataFrame()
+        inactive_7d_count = len(still_inactive_df) if not still_inactive_df.empty else 0
+        with st.expander(f"Inactive users (past 7d) — {inactive_7d_count} still inactive"):
             if inactive_7d_list.empty:
                 st.caption("No users")
             else:
-                for _, row in inactive_7d_list.iterrows():
-                    name = format_display_name(row['name'], row.get('phone'))
-                    phone = row.get('phone', '—')
-                    onb_week = row.get('onboarding_week') or '—'
-                    active_days_val = row.get('active_days', '—')
-                    st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
+                st.markdown("**Still inactive**")
+                if still_inactive_df.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in still_inactive_df.iterrows():
+                        name = format_display_name(row['name'], row.get('phone'))
+                        phone = row.get('phone', '—')
+                        onb_week = row.get('onboarding_week') or '—'
+                        active_days_val = row.get('active_days', '—')
+                        st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
+
+                st.markdown("**Came back after farewell**")
+                if came_back_df.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in came_back_df.iterrows():
+                        name = format_display_name(row['name'], row.get('phone'))
+                        phone = row.get('phone', '—')
+                        onb_week = row.get('onboarding_week') or '—'
+                        active_days_val = row.get('active_days', '—')
+                        st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
     except Exception as e:
         st.warning(f"Could not load inactive users list: {e}")
 
