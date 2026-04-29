@@ -139,7 +139,12 @@ def get_connection():
                     database=st.secrets["DB_NAME"],
                     user=st.secrets["DB_USER"],
                     password=st.secrets["DB_PASSWORD"],
-                    port=st.secrets.get("DB_PORT", "5432")
+                    port=st.secrets.get("DB_PORT", "5432"),
+                    connect_timeout=10,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
                 )
                 return conn
         except:
@@ -151,7 +156,12 @@ def get_connection():
             database=os.getenv("DB_NAME"),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
-            port=os.getenv("DB_PORT", "5432")
+            port=os.getenv("DB_PORT", "5432"),
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
         return conn
     except Exception as e:
@@ -161,19 +171,27 @@ def get_connection():
 
 def run_query(query: str) -> pd.DataFrame:
     """Execute SQL query and return results as DataFrame."""
-    conn = get_connection()
-    if conn is None:
-        return pd.DataFrame()
-    
-    try:
-        # Check if connection is still alive
-        conn.rollback()  # Reset any failed transaction
-        return pd.read_sql_query(query, conn)
-    except Exception as e:
-        st.error(f"Query failed: {e}")
-        # Clear the cached connection if it failed
-        st.cache_resource.clear()
-        return pd.DataFrame()
+    last_error = None
+    for attempt in range(2):
+        conn = get_connection()
+        if conn is None:
+            return pd.DataFrame()
+
+        try:
+            # Reset failed transactions and verify the cached connection is usable.
+            conn.rollback()
+            return pd.read_sql_query(query, conn)
+        except Exception as e:
+            last_error = e
+            try:
+                get_connection.clear()
+            except Exception:
+                st.cache_resource.clear()
+            if attempt == 0:
+                continue
+
+    st.error(f"Query failed after reconnect: {last_error}")
+    return pd.DataFrame()
 
 
 def get_table_list() -> list:
@@ -338,6 +356,347 @@ def get_internal_users_filter_join_sql(exclude_internal: bool = True, table_alia
     # Format as SQL array
     internal_waids_str = "', '".join(internal_waids)
     return f"AND {table_alias}.waid NOT IN ('{internal_waids_str}')"
+
+
+PLAN_PROPOSAL_MESSAGE_CONDITION = """
+(
+    m.message ILIKE '%O coach enviou uma imagem com o plano semanal. Atividades:%'
+    OR m.message ILIKE '%The coach sent an image with the weekly plan. Activities:%'
+    OR m.message ILIKE '%activity plan proposal%'
+    OR m.message ILIKE '%plano de atividade%'
+    OR m.message ILIKE '%plano de atividades%'
+    OR (
+        m.message ILIKE '%aqui está o plano da%semana%'
+        AND (m.message ILIKE '%aprova%' OR m.message ILIKE '%approve%')
+    )
+)
+"""
+
+
+def get_beta_users_cte() -> str:
+    """
+    Beta users are users who accepted an activity plan or received a coach plan proposal.
+    Accepted plans are represented by user_activities rows.
+    """
+    return f"""
+WITH beta_users AS (
+    SELECT DISTINCT u.id, u.waid
+    FROM users u
+    WHERE EXISTS (
+        SELECT 1
+        FROM user_activities ua
+        WHERE ua.user_id = u.id
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM messages m
+        WHERE m.sender = 'companion'
+          AND m.message IS NOT NULL
+          AND (m.user_id = u.id OR m.waid = u.waid)
+          AND {PLAN_PROPOSAL_MESSAGE_CONDITION}
+    )
+)
+"""
+
+
+@st.cache_data(ttl=300)
+def get_quick_insights_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Fetch the top Quick Insights KPIs in one round trip.
+
+    The beta cohort scans plan proposal messages, so keeping all headline counts in
+    a single query avoids repeating that expensive CTE for every metric card.
+    """
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    beta_users_cte = get_beta_users_cte()
+    query = f"""
+{beta_users_cte},
+filtered_beta_users AS (
+    SELECT DISTINCT u.id, u.waid, u.is_active, u.created_at
+    FROM beta_users bu
+    JOIN users u ON u.id = bu.id
+    WHERE 1 = 1
+      {internal_filter_join}
+),
+latest_farewell AS (
+    SELECT DISTINCT ON (rl.user_id)
+        rl.user_id,
+        rl.sent_at AS farewell_at
+    FROM recovery_logs rl
+    JOIN filtered_beta_users fbu ON fbu.id = rl.user_id
+    WHERE rl.ladder_step = 'farewell'
+      AND rl.sent_at >= NOW() - INTERVAL '7 days'
+    ORDER BY rl.user_id, rl.sent_at DESC
+),
+churn_status AS (
+    SELECT
+        lf.user_id,
+        EXISTS (
+            SELECT 1
+            FROM messages m
+            JOIN users u2 ON u2.id = lf.user_id
+            WHERE (m.user_id = u2.id OR m.waid = u2.waid)
+              AND m.sender = 'user'
+              AND m.sent_at > lf.farewell_at
+        ) AS came_back
+    FROM latest_farewell lf
+),
+recent_user_messages AS (
+    SELECT
+        COUNT(DISTINCT fbu.waid) FILTER (
+            WHERE m.sent_at >= NOW() - INTERVAL '24 hours'
+        ) AS inside_24h,
+        COUNT(DISTINCT fbu.waid) FILTER (
+            WHERE m.sent_at >= CURRENT_DATE
+        ) AS messaged_today
+    FROM filtered_beta_users fbu
+    JOIN messages m ON m.sender = 'user' AND (m.user_id = fbu.id OR m.waid = fbu.waid)
+    WHERE m.sent_at >= NOW() - INTERVAL '24 hours'
+),
+completed_today AS (
+    SELECT COUNT(DISTINCT uah.user_id) AS completed_today
+    FROM user_activities_history uah
+    JOIN filtered_beta_users fbu ON fbu.id = uah.user_id
+    WHERE uah.completed_at >= CURRENT_DATE
+      AND uah.completed_at < CURRENT_DATE + INTERVAL '1 day'
+)
+SELECT
+    (
+        SELECT COUNT(DISTINCT u.waid)
+        FROM users u
+        WHERE EXISTS (
+            SELECT 1
+            FROM messages m
+            WHERE m.sender = 'user'
+              AND (m.user_id = u.id OR m.waid = u.waid)
+        )
+        {internal_filter_join}
+    ) AS all_users_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users) AS beta_users_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users WHERE is_active = true) AS alive_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_7d_count,
+    COALESCE((SELECT COUNT(*) FROM churn_status WHERE NOT came_back), 0) AS churned_7d_count,
+    COALESCE((SELECT COUNT(*) FROM churn_status WHERE came_back), 0) AS churned_7d_came_back,
+    COALESCE((SELECT inside_24h FROM recent_user_messages), 0) AS inside_24h,
+    COALESCE((SELECT messaged_today FROM recent_user_messages), 0) AS messaged_today,
+    COALESCE((SELECT completed_today FROM completed_today), 0) AS completed_today
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_user_journey_progress_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """Fetch current and previous 7-day journey funnel metrics in one query."""
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    beta_users_cte = get_beta_users_cte()
+    query = f"""
+{beta_users_cte},
+cohort_users AS (
+    SELECT
+        u.id,
+        u.metadata,
+        u.onboarding_timestamp,
+        CASE
+            WHEN u.created_at >= NOW() - INTERVAL '7 days' THEN 'current'
+            ELSE 'previous'
+        END AS cohort,
+        CASE
+            WHEN u.created_at >= NOW() - INTERVAL '7 days' THEN NOW() - INTERVAL '7 days'
+            ELSE NOW() - INTERVAL '14 days'
+        END AS window_start,
+        CASE
+            WHEN u.created_at >= NOW() - INTERVAL '7 days' THEN NOW()
+            ELSE NOW() - INTERVAL '7 days'
+        END AS window_end
+    FROM users u
+    JOIN beta_users bu ON bu.id = u.id
+    WHERE u.created_at >= NOW() - INTERVAL '14 days'
+      {internal_filter_join}
+),
+journey_flags AS (
+    SELECT
+        cu.cohort,
+        cu.id,
+        (
+            (cu.onboarding_timestamp IS NOT NULL
+             AND cu.onboarding_timestamp >= cu.window_start
+             AND cu.onboarding_timestamp < cu.window_end)
+            OR EXISTS (
+                SELECT 1
+                FROM events e
+                WHERE e.user_id = cu.id
+                  AND e.event_type = 'onboarding_completed'
+                  AND e.executed_at >= cu.window_start
+                  AND e.executed_at < cu.window_end
+            )
+        ) AS completed_onboarding,
+        (
+            NULLIF(cu.metadata->>'mantra', '') IS NOT NULL
+            OR EXISTS (
+                SELECT 1
+                FROM ai_companion_flows acf
+                WHERE acf.user_id = cu.id
+                  AND acf.type = 'post_onboarding'
+                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+            )
+        ) AS added_slogan,
+        EXISTS (
+            SELECT 1
+            FROM user_activities_history uah
+            WHERE uah.user_id = cu.id
+              AND uah.completed_at >= cu.window_start
+              AND uah.completed_at < cu.window_end
+        ) AS completed_activity,
+        EXISTS (
+            SELECT 1
+            FROM messages m
+            WHERE m.user_id = cu.id
+              AND m.sender = 'user'
+              AND m.type = 'audio'
+              AND m.sent_at >= cu.window_start
+              AND m.sent_at < cu.window_end
+        ) AS sent_audio,
+        EXISTS (
+            SELECT 1
+            FROM messages m
+            WHERE m.user_id = cu.id
+              AND m.sender = 'user'
+              AND m.type IN ('image', 'photo')
+              AND m.sent_at >= cu.window_start
+              AND m.sent_at < cu.window_end
+        ) AS sent_picture
+    FROM cohort_users cu
+)
+SELECT
+    cohort,
+    COUNT(*) AS total_users,
+    COUNT(*) FILTER (WHERE completed_onboarding) AS completed_onboarding,
+    COUNT(*) FILTER (WHERE added_slogan) AS added_slogan,
+    COUNT(*) FILTER (WHERE completed_activity) AS completed_activity,
+    COUNT(*) FILTER (WHERE sent_audio) AS sent_audio,
+    COUNT(*) FILTER (WHERE sent_picture) AS sent_picture
+FROM journey_flags
+GROUP BY cohort
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_recovery_ladder_quick_metrics(exclude_internal: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch Recovery Ladder metrics for beta users only."""
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    beta_users_cte = get_beta_users_cte()
+    metrics_query = f"""
+{beta_users_cte},
+filtered_beta_users AS (
+    SELECT DISTINCT u.id, u.waid
+    FROM beta_users bu
+    JOIN users u ON u.id = bu.id
+    WHERE 1 = 1
+      {internal_filter_join}
+),
+recovery_sends AS (
+    SELECT
+        r.id,
+        r.user_id,
+        r.sent_at,
+        CASE
+            WHEN r.sent_at >= NOW() - INTERVAL '7 days' THEN 'current'
+            ELSE 'previous'
+        END AS cohort
+    FROM recovery_logs r
+    JOIN filtered_beta_users fbu ON fbu.id = r.user_id
+    WHERE r.sent_at >= NOW() - INTERVAL '14 days'
+),
+first_reply AS (
+    SELECT
+        rs.id,
+        rs.user_id,
+        rs.sent_at,
+        rs.cohort,
+        MIN(m.sent_at) AS reply_at
+    FROM recovery_sends rs
+    LEFT JOIN messages m
+      ON m.user_id = rs.user_id
+     AND m.sender = 'user'
+     AND m.sent_at > rs.sent_at
+    GROUP BY rs.id, rs.user_id, rs.sent_at, rs.cohort
+),
+send_counts AS (
+    SELECT
+        cohort,
+        user_id,
+        COUNT(*) AS send_count
+    FROM recovery_sends
+    GROUP BY cohort, user_id
+),
+multi_counts AS (
+    SELECT
+        cohort,
+        COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
+        COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
+    FROM send_counts
+    GROUP BY cohort
+)
+SELECT
+    fr.cohort,
+    COUNT(DISTINCT fr.user_id) AS total_users,
+    COUNT(DISTINCT fr.user_id) FILTER (
+        WHERE fr.reply_at > fr.sent_at AND fr.reply_at <= fr.sent_at + INTERVAL '24 hours'
+    ) AS conv24_users,
+    COUNT(DISTINCT fr.user_id) FILTER (
+        WHERE fr.reply_at > fr.sent_at AND fr.reply_at <= fr.sent_at + INTERVAL '72 hours'
+    ) AS conv72_users,
+    AVG(EXTRACT(EPOCH FROM (fr.reply_at - fr.sent_at))) FILTER (WHERE fr.reply_at IS NOT NULL) / 3600 AS avg_hours,
+    percentile_cont(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (fr.reply_at - fr.sent_at)) / 3600
+    ) FILTER (WHERE fr.reply_at IS NOT NULL) AS median_hours,
+    COALESCE(MAX(mc.users_2_plus), 0) AS users_2_plus,
+    COALESCE(MAX(mc.users_3_plus), 0) AS users_3_plus
+FROM first_reply fr
+LEFT JOIN multi_counts mc ON mc.cohort = fr.cohort
+GROUP BY fr.cohort
+"""
+    dropoff_query = f"""
+{beta_users_cte},
+filtered_beta_users AS (
+    SELECT DISTINCT u.id, u.waid
+    FROM beta_users bu
+    JOIN users u ON u.id = bu.id
+    WHERE 1 = 1
+      {internal_filter_join}
+),
+recovery_sends AS (
+    SELECT
+        r.id,
+        r.ladder_step,
+        COALESCE(r.template_name, 'Unknown') AS template_name,
+        r.user_id,
+        r.sent_at
+    FROM recovery_logs r
+    JOIN filtered_beta_users fbu ON fbu.id = r.user_id
+    WHERE r.sent_at >= NOW() - INTERVAL '7 days'
+),
+conversions AS (
+    SELECT DISTINCT r.id
+    FROM recovery_sends r
+    JOIN messages m ON m.user_id = r.user_id
+        AND m.sender = 'user'
+        AND m.sent_at > r.sent_at
+)
+SELECT
+    r.ladder_step,
+    r.template_name,
+    COUNT(*) AS sends,
+    COUNT(c.id) AS conversions,
+    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
+FROM recovery_sends r
+LEFT JOIN conversions c ON r.id = c.id
+GROUP BY r.ladder_step, r.template_name
+ORDER BY r.ladder_step, sends DESC
+LIMIT 50
+"""
+    return run_query(metrics_query), run_query(dropoff_query)
 
 
 @st.cache_data(ttl=300)
@@ -642,7 +1001,7 @@ ORDER BY ladder_step DESC, sent_at DESC;
 @st.cache_data(ttl=300)
 def get_reactivated_users_last_24h() -> pd.DataFrame:
     """
-    Users who were previously marked inactive (received a farewell in recovery_logs at any point)
+    Users who were marked inactive in the last 7 days (received farewell in recovery_logs)
     and have sent an inbound message to the coach within the last 24 hours.
     Returns columns: waid, full_name, last_message_at, farewell_at (most recent farewell before reactivation).
     Excludes internal users.
@@ -660,17 +1019,20 @@ had_farewell AS (
   FROM recovery_logs r
   JOIN users u ON u.id = r.user_id
   WHERE r.ladder_step = 'farewell'
+    AND r.sent_at >= NOW() - INTERVAL '7 days'
     AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
   ORDER BY r.user_id, r.sent_at DESC
 ),
 recent_inbound AS (
   SELECT
-    m.user_id,
+    u.id AS user_id,
     MAX(m.sent_at) AS last_message_at
   FROM messages m
+  JOIN users u ON (m.user_id = u.id OR m.waid = u.waid)
   WHERE m.sender = 'user'
     AND m.sent_at >= NOW() - INTERVAL '24 hours'
-  GROUP BY m.user_id
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY u.id
 )
 SELECT
   u.waid,
@@ -1191,6 +1553,114 @@ ORDER BY wb.week_start DESC;
     return run_query(query)
 
 
+@st.cache_data(ttl=300)
+def get_beta_weekly_churn_rate_metrics(start_date_sp: str, exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Weekly churn chart metrics for Quick Insights, using beta users as denominator.
+
+    Churn numerator = beta users who received a farewell in the week.
+    Denominator = beta users active at week start, where active means no unresolved
+    farewell before the week start.
+    """
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    beta_users_cte = get_beta_users_cte()
+    query = f"""
+{beta_users_cte},
+base_users AS (
+  SELECT
+    u.id,
+    u.waid,
+    u.created_at
+  FROM beta_users bu
+  JOIN users u ON u.id = bu.id
+  WHERE 1 = 1
+    {internal_filter_join}
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{start_date_sp}')::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT
+    week_start,
+    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
+    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
+  FROM weeks
+),
+inbound_msgs AS (
+  SELECT
+    bu.id AS user_id,
+    m.sent_at
+  FROM base_users bu
+  JOIN messages m
+    ON m.sender = 'user'
+   AND (m.user_id = bu.id OR m.waid = bu.waid)
+),
+farewell_events AS (
+  SELECT
+    r.user_id,
+    r.sent_at AS farewell_at,
+    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
+  FROM recovery_logs r
+  JOIN base_users bu ON bu.id = r.user_id
+  WHERE r.ladder_step = 'farewell'
+),
+farewell_cycles AS (
+  SELECT
+    fe.user_id,
+    fe.farewell_at,
+    (
+      SELECT MIN(im.sent_at)
+      FROM inbound_msgs im
+      WHERE im.user_id = fe.user_id
+        AND im.sent_at > fe.farewell_at
+        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
+    ) AS reactivated_at
+  FROM farewell_events fe
+),
+active_stock AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT bu.id) FILTER (
+      WHERE bu.created_at < wb.week_start_ts
+        AND NOT EXISTS (
+          SELECT 1
+          FROM farewell_cycles fc
+          WHERE fc.user_id = bu.id
+            AND fc.farewell_at < wb.week_start_ts
+            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
+        )
+    )::bigint AS start_active_users
+  FROM week_bounds wb
+  CROSS JOIN base_users bu
+  GROUP BY wb.week_start
+),
+weekly_became_inactive AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT fe.user_id)::bigint AS became_inactive_users
+  FROM week_bounds wb
+  JOIN farewell_events fe
+    ON fe.farewell_at >= wb.week_start_ts
+   AND fe.farewell_at < wb.week_end_ts
+  GROUP BY wb.week_start
+)
+SELECT
+  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
+  COALESCE(ast.start_active_users, 0)::bigint AS start_active_users,
+  COALESCE(wi.became_inactive_users, 0)::bigint AS became_inactive_users
+FROM week_bounds wb
+LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
+LEFT JOIN weekly_became_inactive wi ON wi.week_start = wb.week_start
+ORDER BY wb.week_start DESC;
+"""
+    return run_query(query)
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -1590,161 +2060,68 @@ with st.sidebar:
         st.rerun()
 
 
-# Alerts badge: total alerts shown on Alerts page for "today"
-# (message delivery misses + onboarding issues + recovery ladder 2 alerts)
-try:
-    _delivery_df = get_message_delivery_detail()
-    _onboarding_df = get_onboarding_dropoff_detail()
-    _recovery_ladder_2_df = get_recovery_ladder_2_alert_detail()
-
-    _msg_missed_count = int(
-        _delivery_df.loc[_delivery_df["period"] == "today", "missed_morning"].sum()
-        + _delivery_df.loc[_delivery_df["period"] == "today", "missed_evening"].sum()
-    ) if not _delivery_df.empty else 0
-    _onboarding_count = len(_onboarding_df[_onboarding_df["period"] == "today"]) if not _onboarding_df.empty else 0
-    _rl2_count = len(_recovery_ladder_2_df[_recovery_ladder_2_df["period"] == "today"]) if not _recovery_ladder_2_df.empty else 0
-    _alert_count = int(_msg_missed_count + _onboarding_count + _rl2_count)
-except Exception:
-    _alert_count = 0
-_alert_label = "🔔 Alerts" + (f" ({_alert_count})" if _alert_count else "")
-
-# Main content tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Quick Insights",
-    "🔍 User Deep Dive",
-    "📈 User Retention",
-    _alert_label,
-    "🪜 Recovery Ladder",
-])
+# Main content navigation. Streamlit tabs execute every tab eagerly, so use a
+# conditional selector to avoid running hidden tabs' database queries.
+selected_section = st.radio(
+    "Dashboard section",
+    [
+        "📊 Quick Insights",
+        "🔍 User Deep Dive",
+        "📈 User Retention",
+        "🔔 Alerts",
+        "🪜 Recovery Ladder",
+    ],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
 
 # Tab 1: Quick Insights
-with tab1:
-    # Internal users filter toggle (subtle, compact design)
-    filter_col1, filter_col2 = st.columns([1, 11])
-    with filter_col1:
-        exclude_internal = st.toggle(
-            "🔒",
-            value=True,
-            help="Exclude internal users (coaches, test accounts) from all metrics. Internal users are loaded from analysis/.context/internal-users.json",
-            label_visibility="collapsed"
-        )
-    with filter_col2:
-        internal_users_list = load_internal_users()
-        if exclude_internal:
-            if internal_users_list:
-                st.caption(f"Excluding {len(internal_users_list)} internal users")
-            else:
-                st.caption("Filter active (no internal users file found)")
-        else:
-            st.caption("Showing all users (including internal)")
+if selected_section == "📊 Quick Insights":
+    # Quick Insights always excludes internal users
+    exclude_internal = True
     
     st.markdown("---")
     
-    # Headline: Total / Alive / Inactive (all by waid, with internal filter)
+    # Headline metrics (all by waid, excluding internal users)
     internal_filter = get_internal_users_filter_sql(exclude_internal)
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-    extra = (" " + internal_filter.replace("WHERE ", "AND ", 1)) if internal_filter else ""
+    beta_users_cte = get_beta_users_cte()
     try:
-        total_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users {internal_filter}" if internal_filter else "SELECT COUNT(DISTINCT waid) as count FROM users")
-        total_users_count = total_df['count'].iloc[0] if not total_df.empty else 0
-        alive_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE is_active = true{extra}")
-        alive_count = alive_df['count'].iloc[0] if not alive_df.empty else 0
-        new_7d_df = run_query(f"SELECT COUNT(DISTINCT waid) as count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra}")
-        new_7d_count = new_7d_df['count'].iloc[0] if not new_7d_df.empty else 0
-        churned_7d_df = run_query(f"""
-            WITH latest_farewell AS (
-                SELECT DISTINCT ON (rl.user_id)
-                    rl.user_id,
-                    rl.sent_at AS farewell_at
-                FROM recovery_logs rl
-                JOIN users u ON rl.user_id = u.id
-                WHERE rl.ladder_step = 'farewell'
-                  AND rl.sent_at >= NOW() - INTERVAL '7 days'
-                  {internal_filter_join}
-                ORDER BY rl.user_id, rl.sent_at DESC
-            ),
-            churn_status AS (
-                SELECT
-                    lf.user_id,
-                    EXISTS (
-                        SELECT 1
-                        FROM messages m
-                        JOIN users u2 ON u2.id = lf.user_id
-                        WHERE (m.user_id = u2.id OR m.waid = u2.waid)
-                          AND m.sender = 'user'
-                          AND m.sent_at > lf.farewell_at
-                    ) AS came_back
-                FROM latest_farewell lf
-            )
-            SELECT
-                COUNT(*) FILTER (WHERE NOT came_back) AS still_inactive_count,
-                COUNT(*) FILTER (WHERE came_back) AS came_back_count
-            FROM churn_status
-        """)
-        churned_7d_count = int(churned_7d_df['still_inactive_count'].iloc[0]) if not churned_7d_df.empty else 0
-        churned_7d_came_back = int(churned_7d_df['came_back_count'].iloc[0]) if not churned_7d_df.empty else 0
+        headline_df = get_quick_insights_headline_metrics(exclude_internal)
+        headline = headline_df.iloc[0] if not headline_df.empty else {}
+        all_users_count = int(headline.get("all_users_count", 0))
+        beta_users_count = int(headline.get("beta_users_count", 0))
+        alive_count = int(headline.get("alive_count", 0))
+        new_7d_count = int(headline.get("new_7d_count", 0))
+        churned_7d_count = int(headline.get("churned_7d_count", 0))
+        churned_7d_came_back = int(headline.get("churned_7d_came_back", 0))
+        inside_24h = int(headline.get("inside_24h", 0))
+        messaged_today = int(headline.get("messaged_today", 0))
+        completed_today = int(headline.get("completed_today", 0))
     except Exception:
-        total_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
+        all_users_count = beta_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
+        inside_24h = messaged_today = completed_today = 0
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total users", total_users_count if total_users_count else "—")
-    col2.metric("Alive users", alive_count if alive_count is not None else "—")
-    col3.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
-    col4.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
-    col4.caption(f"↳ {churned_7d_came_back} came back")
+    beta_pct = round(100 * beta_users_count / all_users_count, 1) if all_users_count else 0
+    alive_pct = round(100 * alive_count / beta_users_count, 1) if beta_users_count else 0
+    new_7d_pct = round(100 * new_7d_count / beta_users_count, 1) if beta_users_count else 0
+    churned_7d_pct = round(100 * churned_7d_count / beta_users_count, 1) if beta_users_count else 0
+    pct_inside_24h = round(100 * inside_24h / beta_users_count, 1) if beta_users_count else 0
+    pct_messaged_today = round(100 * messaged_today / beta_users_count, 1) if beta_users_count else 0
+    pct_activity_complete = round(100 * completed_today / beta_users_count, 1) if beta_users_count else 0
 
-    # Row 2: Inside 24h, Messaged today, Active today — percentages only
-    today_day = datetime.utcnow().strftime("%A")
-    try:
-        inside_24h_df = run_query(f"""
-            SELECT COUNT(DISTINCT u.waid) as count
-            FROM messages m
-            JOIN users u ON m.user_id = u.id
-            WHERE u.is_active = true AND m.sender = 'user'
-              AND m.sent_at >= NOW() - INTERVAL '24 hours'
-              {internal_filter_join}
-        """)
-        inside_24h = inside_24h_df['count'].iloc[0] if not inside_24h_df.empty else 0
-        pct_inside_24h = round(100 * inside_24h / alive_count, 1) if alive_count else 0
-    except Exception:
-        inside_24h = 0
-        pct_inside_24h = 0
-    try:
-        messaged_today_df = run_query(f"""
-            SELECT COUNT(DISTINCT u.waid) as count
-            FROM messages m
-            JOIN users u ON m.user_id = u.id
-            WHERE u.is_active = true AND m.sent_at >= CURRENT_DATE
-              AND m.user_id IS NOT NULL AND m.sender = 'user'
-              {internal_filter_join}
-        """)
-        messaged_today = messaged_today_df['count'].iloc[0] if not messaged_today_df.empty else 0
-        pct_messaged_today = round(100 * messaged_today / alive_count, 1) if alive_count else 0
-    except Exception:
-        messaged_today = 0
-        pct_messaged_today = 0
-    try:
-        completed_today_df = run_query(f"""
-            SELECT COUNT(DISTINCT uah.user_id) as count
-            FROM user_activities_history uah
-            JOIN users u ON uah.user_id = u.id
-            WHERE uah.completed_at >= CURRENT_DATE AND uah.completed_at < CURRENT_DATE + INTERVAL '1 day'
-              {internal_filter_join}
-        """)
-        completed_today = completed_today_df['count'].iloc[0] if not completed_today_df.empty else 0
-        has_activity_today_df = run_query(f"""
-            SELECT COUNT(DISTINCT ua.user_id) as count
-            FROM user_activities ua
-            JOIN users u ON ua.user_id = u.id
-            WHERE ua.days::jsonb ? '{today_day}'
-              {internal_filter_join}
-        """)
-        has_activity_today = has_activity_today_df['count'].iloc[0] if not has_activity_today_df.empty else 0
-        pct_activity_complete = round(100 * completed_today / has_activity_today, 1) if has_activity_today else 0
-    except Exception:
-        completed_today = 0
-        pct_activity_complete = 0
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("All users", all_users_count if all_users_count else "—")
+    col1.caption("Users who ever messaged")
+    col2.metric("Beta users", beta_users_count if beta_users_count else "—")
+    col2.caption("Users who have a plan")
+    col3.metric("Alive users", alive_count if alive_count is not None else "—")
+    col3.caption(f"↳ {alive_pct}% of beta users")
+    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
+    col4.caption(f"↳ {new_7d_pct}% of beta users")
+    col5.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
+    col5.caption(f"↳ {churned_7d_pct}% of beta users · {churned_7d_came_back} came back")
 
     c4, c5, c6 = st.columns(3)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
@@ -1756,20 +2133,21 @@ with tab1:
 
     # Expandable simple lists for key metrics
     try:
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        where_clause = "WHERE created_at >= NOW() - INTERVAL '7 days'" if not internal_filter else f"{internal_filter} AND created_at >= NOW() - INTERVAL '7 days'"
         new_today_list = run_query(f"""
+            {beta_users_cte}
             SELECT COALESCE(full_name, 'Unknown') AS name, waid
             FROM (
-                SELECT DISTINCT ON (waid) full_name, waid, created_at
-                FROM users
-                {where_clause}
-                ORDER BY waid, created_at DESC
+                SELECT DISTINCT ON (u.waid) u.full_name, u.waid, u.created_at
+                FROM beta_users bu
+                JOIN users u ON u.id = bu.id
+                WHERE u.created_at >= NOW() - INTERVAL '7 days'
+                  {internal_filter_join}
+                ORDER BY u.waid, u.created_at DESC
             ) unique_users
             ORDER BY created_at DESC
             LIMIT 200
         """)
-        with st.expander("New users (past 7d) - names"):
+        with st.expander("New beta users (past 7d) - names"):
             if new_today_list.empty:
                 st.caption("No users")
             else:
@@ -1781,11 +2159,13 @@ with tab1:
     try:
         internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
         inactive_7d_list = run_query(f"""
-            WITH latest_farewell AS (
+            {beta_users_cte},
+            latest_farewell AS (
                 SELECT DISTINCT ON (rl.user_id)
                     rl.user_id,
                     rl.sent_at AS farewell_at
                 FROM recovery_logs rl
+                JOIN beta_users bu ON bu.id = rl.user_id
                 JOIN users u ON rl.user_id = u.id
                 WHERE rl.ladder_step = 'farewell'
                   AND rl.sent_at >= NOW() - INTERVAL '7 days'
@@ -1815,7 +2195,7 @@ with tab1:
         still_inactive_df = inactive_7d_list[inactive_7d_list["came_back"] == False] if not inactive_7d_list.empty else pd.DataFrame()
         came_back_df = inactive_7d_list[inactive_7d_list["came_back"] == True] if not inactive_7d_list.empty else pd.DataFrame()
         inactive_7d_count = len(still_inactive_df) if not still_inactive_df.empty else 0
-        with st.expander(f"Inactive users (past 7d) — {inactive_7d_count} still inactive"):
+        with st.expander(f"Churned users (past 7d) — ({inactive_7d_count})"):
             if inactive_7d_list.empty:
                 st.caption("No users")
             else:
@@ -1896,782 +2276,6 @@ with tab1:
     except Exception as e:
         st.warning(f"Could not load Reactivated Users: {e}")
 
-    # Active Days Timeline — avg active days per active user per week (last 12 weeks)
-    # Active users denominator = waterfall active_stock definition (not inactive = no unresolved farewell)
-    import altair as alt
-
-    st.markdown("### 📅 Avg Active Days per Active User — Weekly")
-    try:
-        internal_waids = load_internal_users()
-        internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
-        _ad_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
-        active_days_weekly_df = run_query(f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-base_users AS (
-  SELECT u.id, u.waid, u.created_at
-  FROM users u
-  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
-),
-weeks AS (
-  SELECT gs::date AS week_start
-  FROM generate_series(
-    date_trunc('week', DATE '{_ad_start}')::date,
-    date_trunc('week', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date),
-    interval '7 days'
-  ) AS gs
-),
-week_bounds AS (
-  SELECT
-    week_start,
-    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
-    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
-  FROM weeks
-),
-inbound_msgs AS (
-  SELECT bu.id AS user_id, m.sent_at
-  FROM base_users bu
-  JOIN messages m ON m.sender = 'user' AND (m.user_id = bu.id OR m.waid = bu.waid)
-),
-farewell_events AS (
-  SELECT r.user_id, r.sent_at AS farewell_at,
-    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
-  FROM recovery_logs r
-  JOIN base_users bu ON bu.id = r.user_id
-  WHERE r.ladder_step = 'farewell'
-),
-farewell_cycles AS (
-  SELECT fe.user_id, fe.farewell_at,
-    (
-      SELECT MIN(im.sent_at)
-      FROM inbound_msgs im
-      WHERE im.user_id = fe.user_id
-        AND im.sent_at > fe.farewell_at
-        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
-    ) AS reactivated_at
-  FROM farewell_events fe
-),
-active_stock AS (
-  SELECT
-    wb.week_start,
-    COUNT(DISTINCT bu.id) FILTER (
-      WHERE bu.created_at < wb.week_start_ts
-        AND NOT EXISTS (
-          SELECT 1 FROM farewell_cycles fc
-          WHERE fc.user_id = bu.id
-            AND fc.farewell_at < wb.week_start_ts
-            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
-        )
-    )::bigint AS active_users_start
-  FROM week_bounds wb
-  CROSS JOIN base_users bu
-  GROUP BY wb.week_start
-),
-weekly_user_active AS (
-  SELECT
-    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start,
-    uah.user_id,
-    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) AS active_days_in_week
-  FROM user_activities_history uah
-  JOIN base_users bu ON uah.user_id = bu.id
-  WHERE uah.completed_at >= (DATE '{_ad_start}'::timestamp AT TIME ZONE 'America/Sao_Paulo')
-  GROUP BY week_start, uah.user_id
-),
-weekly_totals AS (
-  SELECT
-    week_start,
-    SUM(active_days_in_week)::bigint AS total_active_days,
-    COUNT(DISTINCT user_id)::bigint AS users_with_completions
-  FROM weekly_user_active
-  GROUP BY week_start
-)
-SELECT
-  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
-  COALESCE(ast.active_users_start, 0)::bigint AS active_users_start,
-  COALESCE(wt.users_with_completions, 0)::bigint AS users_with_completions,
-  CASE
-    WHEN COALESCE(ast.active_users_start, 0) > 0
-    THEN ROUND(COALESCE(wt.total_active_days, 0)::numeric / ast.active_users_start, 2)
-    ELSE 0
-  END AS avg_active_days
-FROM week_bounds wb
-LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
-LEFT JOIN weekly_totals wt ON wt.week_start = wb.week_start
-ORDER BY wb.week_start
-        """)
-        if not active_days_weekly_df.empty:
-            _ad_df = active_days_weekly_df.copy()
-            _ad_df["avg_active_days"] = _ad_df["avg_active_days"].astype(float)
-            _ad_chart = (
-                alt.Chart(_ad_df)
-                .mark_line(point=True, color="#00E07B")
-                .encode(
-                    x=alt.X("week_start:N", sort=None, title="Week"),
-                    y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
-                )
-                .properties(height=280)
-            )
-            st.altair_chart(_ad_chart, use_container_width=True)
-            st.caption("Avg active days = total distinct completion days across all active users ÷ active user base at week start. Active = not inactive (no unresolved farewell). Weeks start Monday (America/Sao_Paulo).")
-        else:
-            st.info("No activity data found for the last 12 weeks.")
-    except Exception as e:
-        st.warning(f"Could not load active days chart: {e}")
-
-    # Churn Rate — % of active users who became inactive each week
-    st.markdown("### 📉 Weekly Churn Rate — % Active Users Who Left")
-    try:
-        _churn_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
-        _churn_wf_df = get_recovery_weekly_waterfall_metrics(_churn_start)
-        if not _churn_wf_df.empty:
-            _churn_df = _churn_wf_df.copy()
-            _churn_df = _churn_df.sort_values("week_start")
-            _churn_df["churn_rate"] = _churn_df.apply(
-                lambda r: round(100.0 * r["became_inactive_users"] / r["start_active_users"], 1)
-                if r["start_active_users"] > 0 else 0.0,
-                axis=1,
-            )
-            _churn_chart = (
-                alt.Chart(_churn_df)
-                .mark_line(point=True, color="#FF5000")
-                .encode(
-                    x=alt.X("week_start:N", sort=None, title="Week"),
-                    y=alt.Y("churn_rate:Q", title="Churn rate (%)", scale=alt.Scale(zero=True)),
-                )
-                .properties(height=280)
-            )
-            st.altair_chart(_churn_chart, use_container_width=True)
-            st.caption("Churn = users who received a farewell message that week / active users at week start. Weeks start Monday (America/Sao_Paulo).")
-        else:
-            st.info("No churn data available for the last 12 weeks.")
-    except Exception as e:
-        st.warning(f"Could not load churn rate chart: {e}")
-    
-    # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
-    st.markdown("### 🎯 User Journey Progress")
-    st.caption("% of **new users acquired in the last 7 days** who completed each step. Prev 7d shows the prior cohort for comparison.")
-    journey_7d = ">= NOW() - INTERVAL '7 days'"
-    journey_prev_7d_ev = ">= NOW() - INTERVAL '14 days' AND e.executed_at < NOW() - INTERVAL '7 days'"
-
-    try:
-        internal_filter = get_internal_users_filter_sql(exclude_internal)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        # Denominators: new users created in the time window (consistent across all metrics)
-        extra_where = (" " + internal_filter.replace("WHERE ", "AND ", 1)) if internal_filter else ""
-        new_users_7d_query = f"SELECT COUNT(*) as total FROM users WHERE created_at >= NOW() - INTERVAL '7 days'{extra_where}"
-        new_users_7d_result = run_query(new_users_7d_query)
-        new_users_7d = new_users_7d_result['total'].iloc[0] if not new_users_7d_result.empty else 0
-        new_users_prev_7d_query = f"SELECT COUNT(*) as total FROM users WHERE created_at >= NOW() - INTERVAL '14 days' AND created_at < NOW() - INTERVAL '7 days'{extra_where}"
-        new_users_prev_7d_result = run_query(new_users_prev_7d_query)
-        new_users_prev_7d = new_users_prev_7d_result['total'].iloc[0] if not new_users_prev_7d_result.empty else 0
-
-        def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
-            if better:
-                color = "#0d7d0d"
-            elif worse:
-                color = "#c52222"
-            else:
-                color = "#6b7280"
-            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
-
-        if (new_users_7d > 0 or new_users_prev_7d > 0):
-            new_user_7d_window = "u.created_at >= NOW() - INTERVAL '7 days'"
-            new_user_prev_7d_window = "u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'"
-
-            # Completed onboarding: count cohort users that have onboarding completion from either
-            # users.onboarding_timestamp (preferred) or events.onboarding_completed (fallback).
-            if exclude_internal and internal_filter_join:
-                ob_7d = run_query(f"""
-                    SELECT COUNT(*) as c FROM users u
-                    WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                      AND (
-                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '7 days')
-                            OR EXISTS (
-                                SELECT 1 FROM events e
-                                WHERE e.user_id = u.id
-                                  AND e.event_type = 'onboarding_completed'
-                                  AND e.executed_at >= NOW() - INTERVAL '7 days'
-                            )
-                          )
-                      {internal_filter_join}
-                """)
-                ob_prev = run_query(f"""
-                    SELECT COUNT(*) as c FROM users u
-                    WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
-                      AND (
-                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '14 days' AND u.onboarding_timestamp < NOW() - INTERVAL '7 days')
-                            OR EXISTS (
-                                SELECT 1 FROM events e
-                                WHERE e.user_id = u.id
-                                  AND e.event_type = 'onboarding_completed'
-                                  AND e.executed_at >= NOW() - INTERVAL '14 days'
-                                  AND e.executed_at < NOW() - INTERVAL '7 days'
-                            )
-                          )
-                      {internal_filter_join}
-                """)
-            else:
-                ob_7d = run_query("""
-                    SELECT COUNT(*) as c FROM users u
-                    WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                      AND (
-                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '7 days')
-                            OR EXISTS (
-                                SELECT 1 FROM events e
-                                WHERE e.user_id = u.id
-                                  AND e.event_type = 'onboarding_completed'
-                                  AND e.executed_at >= NOW() - INTERVAL '7 days'
-                            )
-                          )
-                """)
-                ob_prev = run_query("""
-                    SELECT COUNT(*) as c FROM users u
-                    WHERE u.created_at >= NOW() - INTERVAL '14 days' AND u.created_at < NOW() - INTERVAL '7 days'
-                      AND (
-                            (u.onboarding_timestamp IS NOT NULL AND u.onboarding_timestamp >= NOW() - INTERVAL '14 days' AND u.onboarding_timestamp < NOW() - INTERVAL '7 days')
-                            OR EXISTS (
-                                SELECT 1 FROM events e
-                                WHERE e.user_id = u.id
-                                  AND e.event_type = 'onboarding_completed'
-                                  AND e.executed_at >= NOW() - INTERVAL '14 days'
-                                  AND e.executed_at < NOW() - INTERVAL '7 days'
-                            )
-                          )
-                """)
-            o7 = ob_7d['c'].iloc[0] if not ob_7d.empty else 0
-            o_prev = ob_prev['c'].iloc[0] if not ob_prev.empty else 0
-            onboarding_pct_7d = round(100 * o7 / new_users_7d, 1) if new_users_7d else 0
-            onboarding_pct_prev = round(100 * o_prev / new_users_prev_7d, 1) if new_users_prev_7d else 0
-            ob_better = onboarding_pct_7d > onboarding_pct_prev
-            ob_worse = onboarding_pct_7d < onboarding_pct_prev
-
-            # Added slogan/mantra: count cohort users with mantra key (if present) or post_onboarding slogan.
-            if exclude_internal and internal_filter_join:
-                sl_7d = run_query(f"""
-                    SELECT COUNT(*) as c
-                    FROM users u
-                    WHERE {new_user_7d_window}
-                      AND (
-                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
-                            OR EXISTS (
-                                SELECT 1
-                                FROM ai_companion_flows acf
-                                WHERE acf.user_id = u.id
-                                  AND acf.type = 'post_onboarding'
-                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
-                            )
-                          )
-                      {internal_filter_join}
-                """)
-                sl_prev = run_query(f"""
-                    SELECT COUNT(*) as c
-                    FROM users u
-                    WHERE {new_user_prev_7d_window}
-                      AND (
-                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
-                            OR EXISTS (
-                                SELECT 1
-                                FROM ai_companion_flows acf
-                                WHERE acf.user_id = u.id
-                                  AND acf.type = 'post_onboarding'
-                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
-                            )
-                          )
-                      {internal_filter_join}
-                """)
-            else:
-                sl_7d = run_query(f"""
-                    SELECT COUNT(*) as c
-                    FROM users u
-                    WHERE {new_user_7d_window}
-                      AND (
-                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
-                            OR EXISTS (
-                                SELECT 1
-                                FROM ai_companion_flows acf
-                                WHERE acf.user_id = u.id
-                                  AND acf.type = 'post_onboarding'
-                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
-                            )
-                          )
-                """)
-                sl_prev = run_query(f"""
-                    SELECT COUNT(*) as c
-                    FROM users u
-                    WHERE {new_user_prev_7d_window}
-                      AND (
-                            NULLIF(u.metadata->>'mantra', '') IS NOT NULL
-                            OR EXISTS (
-                                SELECT 1
-                                FROM ai_companion_flows acf
-                                WHERE acf.user_id = u.id
-                                  AND acf.type = 'post_onboarding'
-                                  AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
-                            )
-                          )
-                """)
-            s7 = sl_7d['c'].iloc[0] if not sl_7d.empty else 0
-            s_prev = sl_prev['c'].iloc[0] if not sl_prev.empty else 0
-            slogan_pct_7d = round(100 * s7 / new_users_7d, 1) if new_users_7d else 0
-            slogan_pct_prev = round(100 * s_prev / new_users_prev_7d, 1) if new_users_prev_7d else 0
-            sl_better = slogan_pct_7d > slogan_pct_prev
-            sl_worse = slogan_pct_7d < slogan_pct_prev
-
-            # Completed activity — denominator = new users in window (same as onboarding/slogan)
-            uah_7d = "uah.completed_at >= NOW() - INTERVAL '7 days'"
-            if exclude_internal and internal_filter_join:
-                act_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
-                    JOIN users u ON uah.user_id = u.id
-                    WHERE {uah_7d} AND {new_user_7d_window} {internal_filter_join}
-                """)
-                act_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
-                    JOIN users u ON uah.user_id = u.id
-                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window} {internal_filter_join}
-                """)
-            else:
-                act_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
-                    JOIN users u ON uah.user_id = u.id
-                    WHERE uah.completed_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window}
-                """)
-                act_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT uah.user_id) as c FROM user_activities_history uah
-                    JOIN users u ON uah.user_id = u.id
-                    WHERE uah.completed_at >= NOW() - INTERVAL '14 days' AND uah.completed_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window}
-                """)
-            a7 = act_7d['c'].iloc[0] if not act_7d.empty else 0
-            a_prev = act_prev['c'].iloc[0] if not act_prev.empty else 0
-            activity_pct_7d = round(100 * a7 / new_users_7d, 1) if new_users_7d else 0
-            activity_pct_prev = round(100 * a_prev / new_users_prev_7d, 1) if new_users_prev_7d else 0
-            act_better = activity_pct_7d > activity_pct_prev
-            act_worse = activity_pct_7d < activity_pct_prev
-
-            # Sent audio — denominator = new users in window
-            if exclude_internal and internal_filter_join:
-                aud_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window} {internal_filter_join}
-                """)
-                aud_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window} {internal_filter_join}
-                """)
-            else:
-                aud_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window}
-                """)
-                aud_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type = 'audio' AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window}
-                """)
-            aud7 = aud_7d['c'].iloc[0] if not aud_7d.empty else 0
-            aud_prev_v = aud_prev['c'].iloc[0] if not aud_prev.empty else 0
-            audio_pct_7d = round(100 * aud7 / new_users_7d, 1) if new_users_7d else 0
-            audio_pct_prev = round(100 * aud_prev_v / new_users_prev_7d, 1) if new_users_prev_7d else 0
-            aud_better = audio_pct_7d > audio_pct_prev
-            aud_worse = audio_pct_7d < audio_pct_prev
-
-            # Sent picture — denominator = new users in window
-            if exclude_internal and internal_filter_join:
-                img_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window} {internal_filter_join}
-                """)
-                img_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window} {internal_filter_join}
-                """)
-            else:
-                img_7d = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '7 days' AND {new_user_7d_window}
-                """)
-                img_prev = run_query(f"""
-                    SELECT COUNT(DISTINCT m.user_id) as c FROM messages m
-                    JOIN users u ON m.user_id = u.id
-                    WHERE m.sender = 'user' AND m.user_id IS NOT NULL AND m.type IN ('image', 'photo') AND m.sent_at >= NOW() - INTERVAL '14 days' AND m.sent_at < NOW() - INTERVAL '7 days' AND {new_user_prev_7d_window}
-                """)
-            img7 = img_7d['c'].iloc[0] if not img_7d.empty else 0
-            img_prev_v = img_prev['c'].iloc[0] if not img_prev.empty else 0
-            image_pct_7d = round(100 * img7 / new_users_7d, 1) if new_users_7d else 0
-            image_pct_prev = round(100 * img_prev_v / new_users_prev_7d, 1) if new_users_prev_7d else 0
-            img_better = image_pct_7d > image_pct_prev
-            img_worse = image_pct_7d < image_pct_prev
-
-            jcol1, jcol2, jcol3, jcol4, jcol5 = st.columns(5)
-            jcol1.metric("✅ Completed Onboarding", f"{onboarding_pct_7d}%")
-            jcol1.markdown(_journey_blob(onboarding_pct_prev, ob_better, ob_worse), unsafe_allow_html=True)
-            jcol2.metric("💬 Added Slogan", f"{slogan_pct_7d}%")
-            jcol2.markdown(_journey_blob(slogan_pct_prev, sl_better, sl_worse), unsafe_allow_html=True)
-            jcol3.metric("🏃 Completed Activity", f"{activity_pct_7d}%")
-            jcol3.markdown(_journey_blob(activity_pct_prev, act_better, act_worse), unsafe_allow_html=True)
-            jcol4.metric("🎧 Sent Audio", f"{audio_pct_7d}%")
-            jcol4.markdown(_journey_blob(audio_pct_prev, aud_better, aud_worse), unsafe_allow_html=True)
-            jcol5.metric("📷 Sent Picture", f"{image_pct_7d}%")
-            jcol5.markdown(_journey_blob(image_pct_prev, img_better, img_worse), unsafe_allow_html=True)
-        else:
-            st.info("No users found")
-    except Exception as e:
-        st.warning(f"Could not load journey stats: {e}")
-    
-    st.markdown("### 🪜 Recovery Ladder & Template Sends")
-    try:
-        # Time windows: last 7d, prev 7d
-        rec_7d_filter = "r.sent_at >= NOW() - INTERVAL '7 days'"
-        rec_prev_7d_filter = "r.sent_at >= NOW() - INTERVAL '14 days' AND r.sent_at < NOW() - INTERVAL '7 days'"
-
-        # Conversion rates 24h / 72h — last 7d (conv72 uses 72h window so conv72 >= conv24; same value = all replies within 24h)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        if exclude_internal and internal_filter_join:
-            conversion_7d = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                      {internal_filter_join}
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                      {internal_filter_join}
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-            conversion_prev = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_prev_7d_filter} {internal_filter_join}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                      {internal_filter_join}
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                      {internal_filter_join}
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-        else:
-            conversion_7d = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_7d_filter}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-            conversion_prev = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_prev_7d_filter}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-        t_7d = conversion_7d['total_users'].iloc[0] if not conversion_7d.empty else 0
-        c24_7d = conversion_7d['conv24_users'].iloc[0] if not conversion_7d.empty else 0
-        c72_7d = conversion_7d['conv72_users'].iloc[0] if not conversion_7d.empty else 0
-        conv24_pct = round(100 * c24_7d / t_7d, 1) if t_7d else 0
-        conv72_pct = round(100 * c72_7d / t_7d, 1) if t_7d else 0
-        t_prev = conversion_prev['total_users'].iloc[0] if not conversion_prev.empty else 0
-        c24_prev = conversion_prev['conv24_users'].iloc[0] if not conversion_prev.empty else 0
-        c72_prev = conversion_prev['conv72_users'].iloc[0] if not conversion_prev.empty else 0
-        conv24_prev_pct = round(100 * c24_prev / t_prev, 1) if t_prev else 0
-        conv72_prev_pct = round(100 * c72_prev / t_prev, 1) if t_prev else 0
-        # Better/worse vs prev 7d (for blob color): higher % = better
-        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
-        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
-
-        # Ladder drop-off by step and template (last 7d only)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        if exclude_internal and internal_filter_join:
-            dropoff_df = run_query(f"""
-                WITH recovery_sends AS (
-                    SELECT 
-                        r.id,
-                        r.ladder_step,
-                        COALESCE(r.template_name, 'Unknown') AS template_name,
-                        r.user_id,
-                        r.sent_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                ),
-                conversions AS (
-                    SELECT DISTINCT r.id
-                    FROM recovery_sends r
-                    JOIN messages m ON m.user_id = r.user_id 
-                        AND m.sender = 'user' 
-                        AND m.sent_at > r.sent_at
-                )
-                SELECT 
-                    r.ladder_step,
-                    r.template_name,
-                    COUNT(*) AS sends,
-                    COUNT(c.id) AS conversions,
-                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
-                FROM recovery_sends r
-                LEFT JOIN conversions c ON r.id = c.id
-                GROUP BY r.ladder_step, r.template_name
-                ORDER BY r.ladder_step, sends DESC
-                LIMIT 50
-            """)
-        else:
-            dropoff_df = run_query(f"""
-                WITH recovery_sends AS (
-                    SELECT 
-                        r.id,
-                        r.ladder_step,
-                        COALESCE(r.template_name, 'Unknown') AS template_name,
-                        r.user_id,
-                        r.sent_at
-                    FROM recovery_logs r
-                    WHERE {rec_7d_filter}
-                ),
-                conversions AS (
-                    SELECT DISTINCT r.id
-                    FROM recovery_sends r
-                    JOIN messages m ON m.user_id = r.user_id 
-                        AND m.sender = 'user' 
-                        AND m.sent_at > r.sent_at
-                )
-                SELECT 
-                    r.ladder_step,
-                    r.template_name,
-                    COUNT(*) AS sends,
-                    COUNT(c.id) AS conversions,
-                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
-                FROM recovery_sends r
-                LEFT JOIN conversions c ON r.id = c.id
-                GROUP BY r.ladder_step, r.template_name
-                ORDER BY r.ladder_step, sends DESC
-                LIMIT 50
-            """)
-
-        # Time to reactivation (avg/median hours) — last 7d and prev 7d
-        if exclude_internal and internal_filter_join:
-            reactivation_7d = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-            reactivation_prev = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_prev_7d_filter} {internal_filter_join}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-        else:
-            reactivation_7d = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_7d_filter}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-            reactivation_prev = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_prev_7d_filter}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-        avg_hours = round(reactivation_7d['avg_hours'].iloc[0], 1) if not reactivation_7d.empty and pd.notna(reactivation_7d['avg_hours'].iloc[0]) else None
-        median_hours = round(reactivation_7d['median_hours'].iloc[0], 1) if not reactivation_7d.empty and pd.notna(reactivation_7d['median_hours'].iloc[0]) else None
-        avg_prev = round(reactivation_prev['avg_hours'].iloc[0], 1) if not reactivation_prev.empty and pd.notna(reactivation_prev['avg_hours'].iloc[0]) else None
-        median_prev = round(reactivation_prev['median_hours'].iloc[0], 1) if not reactivation_prev.empty and pd.notna(reactivation_prev['median_hours'].iloc[0]) else None
-        # Better = lower hours (faster reactivation)
-        better_react = avg_hours is not None and avg_prev is not None and avg_hours < avg_prev
-        worse_react = avg_hours is not None and avg_prev is not None and avg_hours > avg_prev
-
-        # Users with 2+ / 3+ sends in last 7d and prev 7d
-        if exclude_internal and internal_filter_join:
-            multi_7d = run_query(f"""
-                SELECT 
-                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
-                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
-                FROM (
-                    SELECT r.user_id, COUNT(*) AS send_count
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                    GROUP BY r.user_id
-                ) t
-            """)
-            multi_prev = run_query(f"""
-                SELECT 
-                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
-                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
-                FROM (
-                    SELECT r.user_id, COUNT(*) AS send_count
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_prev_7d_filter} {internal_filter_join}
-                    GROUP BY r.user_id
-                ) t
-            """)
-        else:
-            multi_7d = run_query(f"""
-                SELECT 
-                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
-                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
-                FROM (
-                    SELECT user_id, COUNT(*) AS send_count
-                    FROM recovery_logs
-                    WHERE {rec_7d_filter}
-                    GROUP BY user_id
-                ) t
-            """)
-            multi_prev = run_query(f"""
-                SELECT 
-                    COUNT(*) FILTER (WHERE send_count >= 2) AS users_2_plus,
-                    COUNT(*) FILTER (WHERE send_count >= 3) AS users_3_plus
-                FROM (
-                    SELECT user_id, COUNT(*) AS send_count
-                    FROM recovery_logs
-                    WHERE {rec_prev_7d_filter}
-                    GROUP BY user_id
-                ) t
-            """)
-        users_2_plus = multi_7d['users_2_plus'].iloc[0] if not multi_7d.empty else 0
-        users_3_plus = multi_7d['users_3_plus'].iloc[0] if not multi_7d.empty else 0
-        u2_prev = multi_prev['users_2_plus'].iloc[0] if not multi_prev.empty else 0
-        u3_prev = multi_prev['users_3_plus'].iloc[0] if not multi_prev.empty else 0
-        # Fewer users needing 2+/3+ pings = better
-        better_multi = (users_2_plus < u2_prev) if (multi_prev is not None and not multi_prev.empty) else None
-        worse_multi = (users_2_plus > u2_prev) if (multi_prev is not None and not multi_prev.empty) else None
-
-        def _blob(prev_text: str, better: bool | None, worse: bool | None) -> str:
-            if better:
-                color = "#0d7d0d"
-            elif worse:
-                color = "#c52222"
-            else:
-                color = "#6b7280"
-            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_text}</span>'
-
-        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
-        worse_24 = t_prev and conv24_pct < conv24_prev_pct
-        worse_72 = t_prev and conv72_pct < conv72_prev_pct
-        rcol1.metric("Conv 24h (7d)", f"{conv24_pct}%")
-        rcol1.markdown(_blob(f"{conv24_prev_pct}%" if t_prev else "—", better_24, worse_24), unsafe_allow_html=True)
-        rcol2.metric("Conv 72h (7d)", f"{conv72_pct}%")
-        rcol2.markdown(_blob(f"{conv72_prev_pct}%" if t_prev else "—", better_72, worse_72), unsafe_allow_html=True)
-        rcol3.metric("Avg → Reactivation (7d, h)", f"{avg_hours}h" if avg_hours is not None else "—")
-        rcol3.markdown(_blob(f"{avg_prev}h" if avg_prev is not None else "—", better_react, worse_react), unsafe_allow_html=True)
-        rcol4.metric("Users 2nd/3rd+ (7d)", f"{users_2_plus} / {users_3_plus}")
-        rcol4.markdown(_blob(f"{u2_prev} / {u3_prev}" if (multi_prev is not None and not multi_prev.empty) else "—", better_multi, worse_multi), unsafe_allow_html=True)
-
-        with st.expander("Ladder drop-off by step & template (last 7 days)", expanded=False):
-            if dropoff_df.empty:
-                st.caption("No recovery logs in last 7 days")
-            else:
-                st.dataframe(dropoff_df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not load recovery ladder stats: {e}")
-    
     st.markdown("---")
     
     # Recent messages section
@@ -2680,6 +2284,12 @@ ORDER BY wb.week_start
     # Show translation status (less intrusive)
     if GoogleTranslator is None:
         st.caption("ℹ️ Translation unavailable - install `deep-translator` to enable")
+    translate_recent_messages = st.checkbox(
+        "Translate recent messages to English",
+        value=False,
+        key="recent_messages_translate",
+        help="Disabled by default because translating every row can slow the Quick Insights tab.",
+    )
     
     # Time range selector
     time_range = st.selectbox(
@@ -3145,7 +2755,7 @@ ORDER BY wb.week_start
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
                 "Message": text,
-                "Message (EN)": translate_to_english(text),
+                "Message (EN)": translate_to_english(text) if translate_recent_messages else "",
             })
 
         display_df = pd.DataFrame(rows_display)
@@ -3175,6 +2785,305 @@ ORDER BY wb.week_start
         st.info("No messages found")
     
     st.markdown("---")
+    
+    # Active Days Timeline — avg active days per active user per week (last 12 weeks)
+    # Active users denominator = waterfall active_stock definition (not inactive = no unresolved farewell)
+    import altair as alt
+
+    st.markdown("### 📅 Avg Active Days per Active User — Weekly")
+    try:
+        internal_waids = load_internal_users()
+        internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+        _ad_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+        active_days_weekly_df = run_query(f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+base_users AS (
+  SELECT u.id, u.waid, u.created_at
+  FROM users u
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{_ad_start}')::date,
+    date_trunc('week', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT
+    week_start,
+    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
+    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
+  FROM weeks
+),
+inbound_msgs AS (
+  SELECT bu.id AS user_id, m.sent_at
+  FROM base_users bu
+  JOIN messages m ON m.sender = 'user' AND (m.user_id = bu.id OR m.waid = bu.waid)
+),
+farewell_events AS (
+  SELECT r.user_id, r.sent_at AS farewell_at,
+    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
+  FROM recovery_logs r
+  JOIN base_users bu ON bu.id = r.user_id
+  WHERE r.ladder_step = 'farewell'
+),
+farewell_cycles AS (
+  SELECT fe.user_id, fe.farewell_at,
+    (
+      SELECT MIN(im.sent_at)
+      FROM inbound_msgs im
+      WHERE im.user_id = fe.user_id
+        AND im.sent_at > fe.farewell_at
+        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
+    ) AS reactivated_at
+  FROM farewell_events fe
+),
+active_stock AS (
+  SELECT
+    wb.week_start,
+    COUNT(DISTINCT bu.id) FILTER (
+      WHERE bu.created_at < wb.week_start_ts
+        AND NOT EXISTS (
+          SELECT 1 FROM farewell_cycles fc
+          WHERE fc.user_id = bu.id
+            AND fc.farewell_at < wb.week_start_ts
+            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
+        )
+    )::bigint AS active_users_start
+  FROM week_bounds wb
+  CROSS JOIN base_users bu
+  GROUP BY wb.week_start
+),
+weekly_user_active AS (
+  SELECT
+    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start,
+    uah.user_id,
+    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) AS active_days_in_week
+  FROM user_activities_history uah
+  JOIN base_users bu ON uah.user_id = bu.id
+  WHERE uah.completed_at >= (DATE '{_ad_start}'::timestamp AT TIME ZONE 'America/Sao_Paulo')
+  GROUP BY week_start, uah.user_id
+),
+weekly_totals AS (
+  SELECT
+    week_start,
+    SUM(active_days_in_week)::bigint AS total_active_days,
+    COUNT(DISTINCT user_id)::bigint AS users_with_completions
+  FROM weekly_user_active
+  GROUP BY week_start
+)
+SELECT
+  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
+  COALESCE(ast.active_users_start, 0)::bigint AS active_users_start,
+  COALESCE(wt.users_with_completions, 0)::bigint AS users_with_completions,
+  CASE
+    WHEN COALESCE(ast.active_users_start, 0) > 0
+    THEN ROUND(COALESCE(wt.total_active_days, 0)::numeric / ast.active_users_start, 2)
+    ELSE 0
+  END AS avg_active_days
+FROM week_bounds wb
+LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
+LEFT JOIN weekly_totals wt ON wt.week_start = wb.week_start
+ORDER BY wb.week_start
+        """)
+        if not active_days_weekly_df.empty:
+            _ad_df = active_days_weekly_df.copy()
+            _ad_df["avg_active_days"] = _ad_df["avg_active_days"].astype(float)
+            _ad_chart = (
+                alt.Chart(_ad_df)
+                .mark_line(point=True, color="#00E07B")
+                .encode(
+                    x=alt.X("week_start:N", sort=None, title="Week"),
+                    y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(_ad_chart, use_container_width=True)
+        else:
+            st.info("No activity data found for the last 12 weeks.")
+    except Exception as e:
+        st.warning(f"Could not load active days chart: {e}")
+
+    # Churn Rate — % of active users who became inactive each week
+    st.markdown("### 📉 Weekly Churn Rate — % Active Users Who Left")
+    try:
+        _churn_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+        _churn_wf_df = get_beta_weekly_churn_rate_metrics(_churn_start, exclude_internal)
+        if not _churn_wf_df.empty:
+            _churn_df = _churn_wf_df.copy()
+            _churn_df = _churn_df.sort_values("week_start")
+            _churn_df["churn_rate"] = _churn_df.apply(
+                lambda r: round(100.0 * r["became_inactive_users"] / r["start_active_users"], 1)
+                if r["start_active_users"] > 0 else 0.0,
+                axis=1,
+            )
+            _churn_chart = (
+                alt.Chart(_churn_df)
+                .mark_line(point=True, color="#FF5000")
+                .encode(
+                    x=alt.X("week_start:N", sort=None, title="Week"),
+                    y=alt.Y("churn_rate:Q", title="Churn rate (%)", scale=alt.Scale(zero=True)),
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(_churn_chart, use_container_width=True)
+            st.caption("Churn = beta users who received a farewell message that week / active beta users at week start. Weeks start Monday (America/Sao_Paulo).")
+        else:
+            st.info("No churn data available for the last 12 weeks.")
+    except Exception as e:
+        st.warning(f"Could not load churn rate chart: {e}")
+    
+    # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
+    st.markdown("### 🎯 User Journey Progress")
+    st.caption("% of **new beta users acquired in the last 7 days** who completed each step. Prev 7d shows the prior beta cohort for comparison.")
+
+    try:
+        journey_df = get_user_journey_progress_metrics(exclude_internal)
+
+        def _cohort_row(cohort: str) -> dict:
+            if journey_df.empty or cohort not in set(journey_df["cohort"]):
+                return {
+                    "total_users": 0,
+                    "completed_onboarding": 0,
+                    "added_slogan": 0,
+                    "completed_activity": 0,
+                    "sent_audio": 0,
+                    "sent_picture": 0,
+                }
+            row = journey_df[journey_df["cohort"] == cohort].iloc[0]
+            return {k: int(row.get(k, 0) or 0) for k in [
+                "total_users",
+                "completed_onboarding",
+                "added_slogan",
+                "completed_activity",
+                "sent_audio",
+                "sent_picture",
+            ]}
+
+        current_journey = _cohort_row("current")
+        previous_journey = _cohort_row("previous")
+        new_users_7d = current_journey["total_users"]
+        new_users_prev_7d = previous_journey["total_users"]
+
+        def _pct(count: int, total: int) -> float:
+            return round(100 * count / total, 1) if total else 0
+
+        def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
+            if better:
+                color = "#0d7d0d"
+            elif worse:
+                color = "#c52222"
+            else:
+                color = "#6b7280"
+            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
+
+        if new_users_7d > 0 or new_users_prev_7d > 0:
+            metric_defs = [
+                ("✅ Completed Onboarding", "completed_onboarding"),
+                ("💬 Added Slogan", "added_slogan"),
+                ("🏃 Completed Activity", "completed_activity"),
+                ("🎧 Sent Audio", "sent_audio"),
+                ("📷 Sent Picture", "sent_picture"),
+            ]
+            for col, (label, key) in zip(st.columns(5), metric_defs):
+                current_pct = _pct(current_journey[key], new_users_7d)
+                previous_pct = _pct(previous_journey[key], new_users_prev_7d)
+                col.metric(label, f"{current_pct}%")
+                col.markdown(
+                    _journey_blob(
+                        previous_pct,
+                        current_pct > previous_pct if new_users_prev_7d else None,
+                        current_pct < previous_pct if new_users_prev_7d else None,
+                    ),
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No users found")
+    except Exception as e:
+        st.warning(f"Could not load journey stats: {e}")
+    
+    st.markdown("### 🪜 Recovery Ladder & Template Sends")
+    st.caption("Recovery metrics include beta users only.")
+    try:
+        recovery_metrics_df, dropoff_df = get_recovery_ladder_quick_metrics(exclude_internal)
+
+        def _recovery_row(cohort: str) -> dict:
+            if recovery_metrics_df.empty or cohort not in set(recovery_metrics_df["cohort"]):
+                return {
+                    "total_users": 0,
+                    "conv24_users": 0,
+                    "conv72_users": 0,
+                    "avg_hours": None,
+                    "median_hours": None,
+                    "users_2_plus": 0,
+                    "users_3_plus": 0,
+                }
+            row = recovery_metrics_df[recovery_metrics_df["cohort"] == cohort].iloc[0]
+            return {
+                "total_users": int(row.get("total_users", 0) or 0),
+                "conv24_users": int(row.get("conv24_users", 0) or 0),
+                "conv72_users": int(row.get("conv72_users", 0) or 0),
+                "avg_hours": row.get("avg_hours"),
+                "median_hours": row.get("median_hours"),
+                "users_2_plus": int(row.get("users_2_plus", 0) or 0),
+                "users_3_plus": int(row.get("users_3_plus", 0) or 0),
+            }
+
+        current_recovery = _recovery_row("current")
+        previous_recovery = _recovery_row("previous")
+        t_7d = current_recovery["total_users"]
+        t_prev = previous_recovery["total_users"]
+        conv24_pct = round(100 * current_recovery["conv24_users"] / t_7d, 1) if t_7d else 0
+        conv72_pct = round(100 * current_recovery["conv72_users"] / t_7d, 1) if t_7d else 0
+        conv24_prev_pct = round(100 * previous_recovery["conv24_users"] / t_prev, 1) if t_prev else 0
+        conv72_prev_pct = round(100 * previous_recovery["conv72_users"] / t_prev, 1) if t_prev else 0
+
+        avg_hours = round(current_recovery["avg_hours"], 1) if pd.notna(current_recovery["avg_hours"]) else None
+        avg_prev = round(previous_recovery["avg_hours"], 1) if pd.notna(previous_recovery["avg_hours"]) else None
+        users_2_plus = current_recovery["users_2_plus"]
+        users_3_plus = current_recovery["users_3_plus"]
+        u2_prev = previous_recovery["users_2_plus"]
+        u3_prev = previous_recovery["users_3_plus"]
+
+        def _blob(prev_text: str, better: bool | None, worse: bool | None) -> str:
+            if better:
+                color = "#0d7d0d"
+            elif worse:
+                color = "#c52222"
+            else:
+                color = "#6b7280"
+            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_text}</span>'
+
+        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
+        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
+        worse_24 = conv24_pct < conv24_prev_pct if t_prev else None
+        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
+        worse_72 = conv72_pct < conv72_prev_pct if t_prev else None
+        better_react = avg_hours is not None and avg_prev is not None and avg_hours < avg_prev
+        worse_react = avg_hours is not None and avg_prev is not None and avg_hours > avg_prev
+        better_multi = users_2_plus < u2_prev if t_prev else None
+        worse_multi = users_2_plus > u2_prev if t_prev else None
+
+        rcol1.metric("Conv 24h (7d)", f"{conv24_pct}%")
+        rcol1.markdown(_blob(f"{conv24_prev_pct}%" if t_prev else "—", better_24, worse_24), unsafe_allow_html=True)
+        rcol2.metric("Conv 72h (7d)", f"{conv72_pct}%")
+        rcol2.markdown(_blob(f"{conv72_prev_pct}%" if t_prev else "—", better_72, worse_72), unsafe_allow_html=True)
+        rcol3.metric("Avg → Reactivation (7d, h)", f"{avg_hours}h" if avg_hours is not None else "—")
+        rcol3.markdown(_blob(f"{avg_prev}h" if avg_prev is not None else "—", better_react, worse_react), unsafe_allow_html=True)
+        rcol4.metric("Users 2nd/3rd+ (7d)", f"{users_2_plus} / {users_3_plus}")
+        rcol4.markdown(_blob(f"{u2_prev} / {u3_prev}" if t_prev else "—", better_multi, worse_multi), unsafe_allow_html=True)
+
+        with st.expander("Ladder drop-off by step & template (last 7 days)", expanded=False):
+            if dropoff_df.empty:
+                st.caption("No beta-user recovery logs in last 7 days")
+            else:
+                st.dataframe(dropoff_df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning(f"Could not load recovery ladder stats: {e}")
     
     # User Activity by Hour chart
     st.markdown("### 📊 User Activity by Hour")
@@ -3276,245 +3185,10 @@ ORDER BY wb.week_start
     except Exception as e:
         st.warning(f"Could not load activity chart: {e}")
     
-    st.markdown("---")
-    
-    # All users (deduplicated by waid) with last message info
-    st.markdown("### 👥 All Users")
-    
-    # Query users with their last sent/received message times and content
-    internal_filter = get_internal_users_filter_sql(exclude_internal)
-    where_clause = "" if not internal_filter else internal_filter.replace("WHERE", "AND")
-    all_users = run_query(f"""
-        WITH unique_users AS (
-            SELECT DISTINCT ON (waid) 
-                id, waid, full_name, gender, age, coach_name, pillar, level, phase, is_active, timezone, created_at, updated_at
-            FROM users 
-            {internal_filter if internal_filter else ""}
-            ORDER BY waid, created_at DESC
-        ),
-        last_sent AS (
-            SELECT DISTINCT ON (m.user_id)
-                m.user_id,
-                m.sent_at as last_sent_at,
-                m.message as last_sent_msg
-            FROM messages m
-            WHERE m.sender = 'user'
-            ORDER BY m.user_id, m.sent_at DESC
-        ),
-        last_received AS (
-            SELECT DISTINCT ON (m.user_id)
-                m.user_id,
-                m.sent_at as last_received_at,
-                m.message as last_received_msg
-            FROM messages m
-            WHERE m.sender != 'user'
-            ORDER BY m.user_id, m.sent_at DESC
-        ),
-        recovery_counts AS (
-            SELECT 
-                user_id,
-                COUNT(*) AS recovery_templates_sent
-            FROM recovery_logs
-            GROUP BY user_id
-        )
-        SELECT 
-            u.id,
-            u.waid,
-            u.full_name,
-            u.gender,
-            u.age,
-            u.coach_name,
-            u.pillar,
-            u.level,
-            u.phase,
-            u.is_active,
-            u.timezone,
-            u.created_at,
-            ls.last_sent_at,
-            ls.last_sent_msg,
-            lr.last_received_at,
-            lr.last_received_msg,
-            COALESCE(rc.recovery_templates_sent, 0) AS recovery_templates_sent
-        FROM unique_users u
-        LEFT JOIN last_sent ls ON u.id = ls.user_id
-        LEFT JOIN last_received lr ON u.id = lr.user_id
-        LEFT JOIN recovery_counts rc ON u.id = rc.user_id
-        ORDER BY u.created_at DESC
-    """)
-    
-    if not all_users.empty:
-        # Parse timezone string like "UTC-3", "-3", "America/Sao_Paulo"
-        def parse_tz(tz_str):
-            if not tz_str or pd.isna(tz_str):
-                return None
-            tz_str = str(tz_str).strip()
-            try:
-                return pytz.timezone(tz_str)
-            except:
-                pass
-            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
-            if match:
-                sign = -1 if match.group(1) == '-' else 1
-                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
-                    sign = -1
-                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
-                    sign = 1
-                hours = int(match.group(2)) * sign
-                minutes = int(match.group(3) or 0)
-                offset = timedelta(hours=hours, minutes=minutes)
-                return timezone(offset)
-            return None
-        
-        # Format timestamp in user's local timezone
-        def format_ts(ts, tz_str):
-            if pd.isna(ts) or ts is None:
-                return "—"
-            try:
-                if isinstance(ts, str):
-                    ts = pd.to_datetime(ts)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=pytz.UTC)
-                user_tz = parse_tz(tz_str)
-                if user_tz:
-                    ts = ts.astimezone(user_tz)
-                    return ts.strftime("%b %d, %H:%M")
-                else:
-                    return ts.strftime("%b %d, %H:%M") + " UTC"
-            except:
-                return str(ts)[:16] if ts else "—"
-        
-        # Extract readable text from message JSON
-        def extract_msg(raw_msg):
-            if pd.isna(raw_msg) or raw_msg is None:
-                return "—"
-            msg_str = str(raw_msg).strip()
-            
-            def parse_json(s):
-                try:
-                    data = json.loads(s)
-                    if isinstance(data, str):
-                        try:
-                            return json.loads(data)
-                        except Exception:
-                            return data
-                    return data
-                except Exception:
-                    return None
-            
-            def find_text(obj, depth=0):
-                if depth > 10 or obj is None:
-                    return None
-                if isinstance(obj, str) and len(obj) > 2:
-                    return obj
-                if isinstance(obj, dict):
-                    for key in ["text", "body", "title", "message", "content", "caption", "label", "description", "value"]:
-                        if key in obj:
-                            val = obj[key]
-                            if isinstance(val, str) and len(val) > 2:
-                                return val
-                            found = find_text(val, depth + 1)
-                            if found:
-                                return found
-                    if "payload" in obj:
-                        payload = obj["payload"]
-                        if isinstance(payload, str):
-                            pj = parse_json(payload)
-                            if isinstance(pj, (dict, list)):
-                                found = find_text(pj, depth + 1)
-                                if found:
-                                    return found
-                            if len(payload) > 2:
-                                return payload
-                        else:
-                            found = find_text(payload, depth + 1)
-                            if found:
-                                return found
-                    for val in obj.values():
-                        if isinstance(val, (dict, list, str)):
-                            found = find_text(val, depth + 1)
-                            if found:
-                                return found
-                if isinstance(obj, list):
-                    for item in obj:
-                        found = find_text(item, depth + 1)
-                        if found:
-                            return found
-                return None
-            
-            data = parse_json(msg_str)
-            if data is not None:
-                found = find_text(data)
-                if found:
-                    return found[:80] + "..." if len(found) > 80 else found
-            
-            if isinstance(data, str) and len(data) > 2:
-                return data[:80] if len(data) > 80 else data
-            
-            if msg_str.startswith("{") or msg_str.startswith("["):
-                return msg_str[:80]
-            return msg_str[:80] if len(msg_str) > 80 else msg_str
-        
-        # Build display dataframe
-        def is_outside_24h(ts):
-            if ts is None or pd.isna(ts):
-                return True
-            try:
-                t = pd.to_datetime(ts)
-                if t.tzinfo is None:
-                    t = t.tz_localize(pytz.UTC)
-                cutoff = pd.Timestamp.utcnow().tz_localize(None) if pd.Timestamp.utcnow().tzinfo else pd.Timestamp.utcnow()
-                cutoff = cutoff.tz_localize(pytz.UTC) if cutoff.tzinfo is None else cutoff
-                return t < cutoff - pd.Timedelta(hours=24)
-            except Exception:
-                return True
-        
-        # Fetch total XP per user (user_id) for display; left join-like via map
-        xp_df = run_query("""
-            SELECT user_id, COALESCE(SUM(xp_earned), 0) AS total_xp
-            FROM user_activities_history
-            GROUP BY user_id
-        """)
-        xp_map = {}
-        if not xp_df.empty and 'user_id' in xp_df.columns and 'total_xp' in xp_df.columns:
-            xp_map = dict(zip(xp_df['user_id'], xp_df['total_xp']))
-        
-        display_df = pd.DataFrame({
-            'Name': all_users.apply(lambda r: format_display_name(r['full_name'], r.get('waid')), axis=1),
-            'WhatsApp ID': all_users['waid'],
-            'Age': all_users['age'].fillna('—') if 'age' in all_users.columns else '—',
-            'Gender': all_users['gender'].fillna('—') if 'gender' in all_users.columns else '—',
-            'Coach Name': all_users['coach_name'].fillna('—') if 'coach_name' in all_users.columns else '—',
-            'Level': all_users['level'].fillna('—'),
-            'XP': all_users['id'].map(xp_map).fillna(0).astype(int) if 'id' in all_users.columns else 0,
-            'Signed Up': all_users.apply(lambda r: format_ts(r['created_at'], r['timezone']), axis=1),
-            'Last Active': all_users.apply(lambda r: format_ts(r['last_sent_at'], r['timezone']), axis=1),
-            'Outside 24h': all_users.apply(lambda r: 'Yes' if is_outside_24h(r['last_sent_at']) else 'No', axis=1),
-            'Recovery Templates Sent': all_users['recovery_templates_sent'].fillna(0).astype(int) if 'recovery_templates_sent' in all_users.columns else 0,
-            'Last Sent': all_users.apply(lambda r: format_ts(r['last_sent_at'], r['timezone']), axis=1),
-            'Last Sent Msg': all_users['last_sent_msg'].apply(extract_msg),
-            'Last Received': all_users.apply(lambda r: format_ts(r['last_received_at'], r['timezone']), axis=1),
-            'Last Received Msg': all_users['last_received_msg'].apply(extract_msg),
-        })
-        
-        # Show count and expandable table
-        st.caption(f"{len(display_df)} total users")
-        
-        with st.expander("📋 View All Users", expanded=False):
-            st.dataframe(
-                display_df, 
-                use_container_width=True, 
-                hide_index=True,
-                height=400
-            )
-            
-            # Download button
-    else:
-        st.info("No users found or table doesn't exist yet")
-    
 
 
 # Tab 2: User Deep Dive
-with tab2:
+if selected_section == "🔍 User Deep Dive":
     st.markdown("### 🔍 User Deep Dive")
     st.caption("Select a user to view messages, activity plan, active days, and engagement")
     
@@ -4366,7 +4040,7 @@ with tab2:
 
 
 # Tab 3: User Retention
-with tab3:
+if selected_section == "📈 User Retention":
     # Recovery: weekly reply timeline + active/risk waterfall (top of tab)
     import altair as alt
 
@@ -5600,7 +5274,7 @@ ORDER BY cohort_week_start DESC
 
 
 # Tab 4: Alerts (message delivery + future: onboarding drop-off)
-with tab4:
+if selected_section == "🔔 Alerts":
     st.markdown("### 🔔 Alerts")
 
     try:
@@ -5828,7 +5502,7 @@ with tab4:
 
 
 # Tab 5: Recovery Ladder
-with tab5:
+if selected_section == "🪜 Recovery Ladder":
     st.markdown("### 🪜 Recovery Ladder")
 
     # Last 7d + prev 7d: template conversion and drop-off
