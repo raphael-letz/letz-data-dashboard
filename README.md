@@ -160,7 +160,7 @@ Never commit credentials to the repo.
 ### Tab 2: User Deep Dive
 - Select any user from dropdown
 - **Engagement metrics**: XP, last activity, messages sent (24h/3d/7d), recovery sends
-- **Activity Plan Calendar**: Weekly view of scheduled activities
+- **Activity Plan Calendar**: Weekly view of current scheduled activities (`user_activities.in_progress = true`)
 - **Message History**: Full conversation log for the selected user
 
 ### Sidebar

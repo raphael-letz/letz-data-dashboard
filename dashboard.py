@@ -1661,6 +1661,214 @@ ORDER BY wb.week_start DESC;
     return run_query(query)
 
 
+@st.cache_data(ttl=300)
+def get_deep_dive_user_options() -> pd.DataFrame:
+    """Load the user selector options for User Deep Dive."""
+    return run_query("""
+        WITH unique_users AS (
+            SELECT DISTINCT ON (waid)
+                id,
+                COALESCE(full_name, 'Unknown') as full_name,
+                waid,
+                timezone,
+                created_at,
+                coach_name,
+                metadata
+            FROM users
+            ORDER BY waid, created_at DESC
+        ),
+        active_users AS (
+            SELECT DISTINCT user_id
+            FROM messages
+            WHERE sender = 'user'
+              AND sent_at >= NOW() - INTERVAL '24 hours'
+              AND user_id IS NOT NULL
+        ),
+        user_slogans AS (
+            SELECT DISTINCT ON (user_id)
+                user_id,
+                content->>'slogan' as slogan
+            FROM ai_companion_flows
+            WHERE type = 'post_onboarding'
+              AND content->>'slogan' IS NOT NULL
+            ORDER BY user_id, created_at DESC
+        )
+        SELECT
+            u.id,
+            u.full_name,
+            u.waid,
+            u.timezone,
+            u.created_at,
+            u.coach_name,
+            COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
+            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
+        FROM unique_users u
+        LEFT JOIN active_users a ON u.id = a.user_id
+        LEFT JOIN user_slogans us ON u.id = us.user_id
+        ORDER BY u.full_name ASC
+        LIMIT 500
+    """)
+
+
+@st.cache_data(ttl=120)
+def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
+    """Fetch the main User Deep Dive metrics in one query."""
+    return run_query(f"""
+        WITH user_base AS (
+            SELECT
+                id,
+                COALESCE(active_days, 0)::int AS active_days,
+                active_days_goal::int AS active_days_goal,
+                onboarding_timestamp,
+                metadata
+            FROM users
+            WHERE id = {user_id}
+        ),
+        message_stats AS (
+            SELECT
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '24 hours') AS count_24h,
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '3 days') AS count_3d,
+                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '7 days') AS count_7d,
+                MAX(sent_at) AS last_user_message_at
+            FROM messages
+            WHERE user_id = {user_id}
+              AND sender = 'user'
+              AND sent_at IS NOT NULL
+        ),
+        last_completed AS (
+            SELECT activity_type, completed_at
+            FROM user_activities_history
+            WHERE user_id = {user_id}
+              AND completed_at IS NOT NULL
+            ORDER BY completed_at DESC
+            LIMIT 1
+        ),
+        recovery_summary AS (
+            SELECT COUNT(*) AS recovery_count
+            FROM recovery_logs
+            WHERE user_id = {user_id}
+        ),
+        last_recovery AS (
+            SELECT ladder_step, template_name, sent_at
+            FROM recovery_logs
+            WHERE user_id = {user_id}
+            ORDER BY sent_at DESC
+            LIMIT 1
+        ),
+        first_reply_after_last_recovery AS (
+            SELECT m.sent_at
+            FROM messages m
+            JOIN last_recovery lr ON true
+            WHERE m.user_id = {user_id}
+              AND m.sender = 'user'
+              AND m.sent_at > lr.sent_at
+            ORDER BY m.sent_at
+            LIMIT 1
+        )
+        SELECT
+            COALESCE(ms.count_24h, 0)::int AS count_24h,
+            COALESCE(ms.count_3d, 0)::int AS count_3d,
+            COALESCE(ms.count_7d, 0)::int AS count_7d,
+            ms.last_user_message_at,
+            ub.active_days,
+            ub.active_days_goal,
+            lc.activity_type AS last_activity_type,
+            lc.completed_at AS last_activity_completed_at,
+            COALESCE(rs.recovery_count, 0)::int AS recovery_count,
+            lr.template_name AS last_recovery_template_name,
+            lr.ladder_step AS last_recovery_ladder_step,
+            lr.sent_at AS last_recovery_sent_at,
+            (fr.sent_at <= lr.sent_at + INTERVAL '24 hours') AS conv24,
+            (fr.sent_at <= lr.sent_at + INTERVAL '72 hours') AS conv72,
+            EXTRACT(EPOCH FROM (fr.sent_at - lr.sent_at)) / 3600 AS hours_to_reply,
+            (
+                ub.onboarding_timestamp IS NOT NULL
+                OR EXISTS (
+                    SELECT 1
+                    FROM events e
+                    WHERE e.user_id = {user_id}
+                      AND e.event_type = 'onboarding_completed'
+                )
+            ) AS onboarding_completed,
+            (
+                NULLIF(ub.metadata->>'mantra', '') IS NOT NULL
+                OR EXISTS (
+                    SELECT 1
+                    FROM ai_companion_flows acf
+                    WHERE acf.user_id = {user_id}
+                      AND acf.type = 'post_onboarding'
+                      AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
+                )
+            ) AS slogan_set,
+            EXISTS (
+                SELECT 1
+                FROM user_activities_history uah
+                WHERE uah.user_id = {user_id}
+                  AND uah.completed_at IS NOT NULL
+            ) AS first_activity_completed
+        FROM user_base ub
+        CROSS JOIN message_stats ms
+        CROSS JOIN recovery_summary rs
+        LEFT JOIN last_completed lc ON true
+        LEFT JOIN last_recovery lr ON true
+        LEFT JOIN first_reply_after_last_recovery fr ON true
+    """)
+
+
+@st.cache_data(ttl=120)
+def get_user_activity_plan(user_id: int) -> pd.DataFrame:
+    """Fetch current activity plan rows for a user."""
+    return run_query(f"""
+        SELECT description, days, created_at
+        FROM user_activities
+        WHERE user_id = {user_id}
+          AND in_progress = true
+    """)
+
+
+@st.cache_data(ttl=120)
+def get_user_message_history(user_id: int, limit: int | None) -> pd.DataFrame:
+    """Fetch message history for a user."""
+    msg_limit_sql = f"LIMIT {int(limit)}" if limit else ""
+    return run_query(f"""
+        SELECT id as msg_id, sent_at, sender, type as msg_type, message, status
+        FROM messages
+        WHERE user_id = {user_id} AND sent_at IS NOT NULL
+        ORDER BY sent_at DESC
+        {msg_limit_sql}
+    """)
+
+
+@st.cache_data(ttl=120)
+def get_user_message_hour_counts(user_id: int, user_timezone: str | None) -> pd.DataFrame:
+    """Return user message counts by local hour without fetching every timestamp."""
+    tz = str(user_timezone or "").strip()
+    interval_hours = None
+    match = re.match(r"^(?:UTC|GMT)?([+-]\d{1,2})(?::?(\d{2}))?$", tz, re.IGNORECASE)
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2) or 0)
+        interval_hours = hours + (minutes / 60.0 if hours >= 0 else -minutes / 60.0)
+
+    if interval_hours is not None:
+        hour_expr = f"EXTRACT(HOUR FROM ((sent_at AT TIME ZONE 'UTC') + INTERVAL '{interval_hours} hours'))"
+    elif tz:
+        safe_tz = tz.replace("'", "''")
+        hour_expr = f"EXTRACT(HOUR FROM sent_at AT TIME ZONE '{safe_tz}')"
+    else:
+        hour_expr = "EXTRACT(HOUR FROM sent_at AT TIME ZONE 'UTC')"
+
+    return run_query(f"""
+        SELECT {hour_expr}::int AS hour, COUNT(*)::int AS message_count
+        FROM messages
+        WHERE user_id = {user_id}
+          AND sender = 'user'
+          AND sent_at IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1
+    """)
+
+
 def is_template(raw_msg) -> bool:
     """Check if a message payload is a WhatsApp template message.
     
@@ -3192,50 +3400,7 @@ if selected_section == "🔍 User Deep Dive":
     st.markdown("### 🔍 User Deep Dive")
     st.caption("Select a user to view messages, activity plan, active days, and engagement")
     
-    users_df = run_query("""
-        WITH unique_users AS (
-            SELECT DISTINCT ON (waid)
-                id,
-                COALESCE(full_name, 'Unknown') as full_name,
-                waid,
-                timezone,
-                created_at,
-                coach_name,
-                metadata
-            FROM users
-            ORDER BY waid, created_at DESC
-        ),
-        active_users AS (
-            SELECT DISTINCT user_id
-            FROM messages
-            WHERE sender = 'user'
-              AND sent_at >= NOW() - INTERVAL '24 hours'
-              AND user_id IS NOT NULL
-        ),
-        user_slogans AS (
-            SELECT DISTINCT ON (user_id)
-                user_id,
-                content->>'slogan' as slogan
-            FROM ai_companion_flows
-            WHERE type = 'post_onboarding'
-              AND content->>'slogan' IS NOT NULL
-            ORDER BY user_id, created_at DESC
-        )
-        SELECT 
-            u.id,
-            u.full_name,
-            u.waid,
-            u.timezone,
-            u.created_at,
-            u.coach_name,
-            COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
-            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
-        FROM unique_users u
-        LEFT JOIN active_users a ON u.id = a.user_id
-        LEFT JOIN user_slogans us ON u.id = us.user_id
-        ORDER BY u.full_name ASC
-        LIMIT 500
-    """)
+    users_df = get_deep_dive_user_options()
     
     if users_df.empty:
         st.info("No users found")
@@ -3285,63 +3450,24 @@ if selected_section == "🔍 User Deep Dive":
             except:
                 return str(ts)[:16]
         
-        # Engagement metrics
-        msg_counts = run_query(f"""
-            SELECT 
-                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '24 hours') as count_24h,
-                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '3 days') as count_3d,
-                COUNT(*) FILTER (WHERE sent_at >= NOW() - INTERVAL '7 days') as count_7d
-            FROM messages
-            WHERE user_id = {user_id}
-              AND sender = 'user'
-              AND sent_at IS NOT NULL
-        """)
-        mc_row = msg_counts.iloc[0] if not msg_counts.empty else {}
-        count_24h = int(mc_row.get('count_24h', 0)) if isinstance(mc_row, pd.Series) else 0
-        count_3d = int(mc_row.get('count_3d', 0)) if isinstance(mc_row, pd.Series) else 0
-        count_7d = int(mc_row.get('count_7d', 0)) if isinstance(mc_row, pd.Series) else 0
-        
-        last_active_df = run_query(f"""
-            SELECT sent_at 
-            FROM messages 
-            WHERE user_id = {user_id} AND sender = 'user' AND sent_at IS NOT NULL
-            ORDER BY sent_at DESC
-            LIMIT 1
-        """)
-        last_active = format_ts_local(last_active_df['sent_at'].iloc[0]) if not last_active_df.empty else "—"
-        
-        # Primary progress: users.active_days / active_days_goal (see analysis/.context/db-dictionary.md)
-        progress_df = run_query(f"""
-            SELECT
-                COALESCE(u.active_days, 0)::int AS active_days,
-                u.active_days_goal::int AS active_days_goal
-            FROM users u
-            WHERE u.id = {user_id}
-        """)
-        active_days_count = int(progress_df["active_days"].iloc[0]) if not progress_df.empty else 0
-        _goal = progress_df["active_days_goal"].iloc[0] if not progress_df.empty else None
-        active_days_goal_str = (
-            str(int(_goal)) if _goal is not None and pd.notna(_goal) else "—"
-        )
-        
-        last_completed_df = run_query(f"""
-            SELECT activity_type, completed_at
-            FROM user_activities_history
-            WHERE user_id = {user_id} AND completed_at IS NOT NULL
-            ORDER BY completed_at DESC
-            LIMIT 1
-        """)
-        last_activity_name = last_completed_df['activity_type'].iloc[0] if not last_completed_df.empty else "—"
-        last_activity_time = format_ts_local(last_completed_df['completed_at'].iloc[0]) if not last_completed_df.empty else "—"
-        
-        # 24h active window flag based on last user message
-        last_msg_df = run_query(f"""
-            SELECT sent_at
-            FROM messages
-            WHERE user_id = {user_id} AND sender = 'user' AND sent_at IS NOT NULL
-            ORDER BY sent_at DESC
-            LIMIT 1
-        """)
+        # Engagement, progress, recovery, and funnel metrics in one cached query.
+        summary_df = get_user_deep_dive_summary(user_id)
+        summary = summary_df.iloc[0] if not summary_df.empty else pd.Series(dtype=object)
+
+        count_24h = int(summary.get('count_24h', 0) or 0)
+        count_3d = int(summary.get('count_3d', 0) or 0)
+        count_7d = int(summary.get('count_7d', 0) or 0)
+        last_user_message_at = summary.get('last_user_message_at')
+        last_active = format_ts_local(last_user_message_at) if pd.notna(last_user_message_at) else "—"
+
+        active_days_count = int(summary.get('active_days', 0) or 0)
+        _goal = summary.get('active_days_goal')
+        active_days_goal_str = str(int(_goal)) if _goal is not None and pd.notna(_goal) else "—"
+
+        last_activity_name = summary.get('last_activity_type') if pd.notna(summary.get('last_activity_type')) else "—"
+        last_activity_completed_at = summary.get('last_activity_completed_at')
+        last_activity_time = format_ts_local(last_activity_completed_at) if pd.notna(last_activity_completed_at) else "—"
+
         def is_outside_24h(ts):
             if ts is None or pd.isna(ts):
                 return True
@@ -3355,71 +3481,25 @@ if selected_section == "🔍 User Deep Dive":
                 return t < cutoff - pd.Timedelta(hours=24)
             except Exception:
                 return True
-        outside_24h_flag = is_outside_24h(last_msg_df['sent_at'].iloc[0]) if not last_msg_df.empty else True
-        
-        # Recovery stats for this user
-        user_recovery_df = run_query(f"""
-            SELECT 
-                id,
-                ladder_step,
-                template_name,
-                converted,
-                sent_at
-            FROM recovery_logs
-            WHERE user_id = {user_id}
-            ORDER BY sent_at DESC
-            LIMIT 10
-        """)
-        user_recovery_count = len(user_recovery_df) if not user_recovery_df.empty else 0
-        last_recovery_name = user_recovery_df['template_name'].iloc[0] if not user_recovery_df.empty else "—"
-        last_recovery_step = user_recovery_df['ladder_step'].iloc[0] if not user_recovery_df.empty else None
-        last_recovery_time = format_ts_local(user_recovery_df['sent_at'].iloc[0]) if not user_recovery_df.empty else "—"
-        
-        # Conversion after last recovery (24h/72h) and time to reply
-        conv_after_df = run_query(f"""
-            WITH last_rec AS (
-                SELECT sent_at
-                FROM recovery_logs
-                WHERE user_id = {user_id}
-                ORDER BY sent_at DESC
-                LIMIT 1
-            ),
-            reply AS (
-                SELECT m.sent_at
-                FROM messages m, last_rec lr
-                WHERE m.user_id = {user_id}
-                  AND m.sender = 'user'
-                  AND m.sent_at > lr.sent_at
-                ORDER BY m.sent_at
-                LIMIT 1
-            )
-            SELECT 
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM reply r, last_rec lr
-                    WHERE r.sent_at <= lr.sent_at + INTERVAL '24 hours'
-                ) THEN true ELSE false END AS conv24,
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM reply r, last_rec lr
-                    WHERE r.sent_at <= lr.sent_at + INTERVAL '72 hours'
-                ) THEN true ELSE false END AS conv72,
-                (SELECT EXTRACT(EPOCH FROM (r.sent_at - lr.sent_at))/3600
-                 FROM reply r, last_rec lr
-                 LIMIT 1) AS hours_to_reply
-        """)
-        conv24 = bool(conv_after_df['conv24'].iloc[0]) if not conv_after_df.empty else False
-        conv72 = bool(conv_after_df['conv72'].iloc[0]) if not conv_after_df.empty else False
-        hrs_reply = conv_after_df['hours_to_reply'].iloc[0] if not conv_after_df.empty else None
+        outside_24h_flag = is_outside_24h(last_user_message_at)
+
+        user_recovery_count = int(summary.get('recovery_count', 0) or 0)
+        last_recovery_name = summary.get('last_recovery_template_name') if pd.notna(summary.get('last_recovery_template_name')) else "—"
+        last_recovery_step = summary.get('last_recovery_ladder_step') if pd.notna(summary.get('last_recovery_ladder_step')) else None
+        last_recovery_sent_at = summary.get('last_recovery_sent_at')
+        last_recovery_time = format_ts_local(last_recovery_sent_at) if pd.notna(last_recovery_sent_at) else "—"
+
+        conv24 = bool(summary.get('conv24')) if pd.notna(summary.get('conv24')) else False
+        conv72 = bool(summary.get('conv72')) if pd.notna(summary.get('conv72')) else False
+        hrs_reply = summary.get('hours_to_reply')
         hrs_reply_fmt = f"{hrs_reply:.1f} h" if hrs_reply is not None and pd.notna(hrs_reply) else "—"
-        
+
+        onboarding_completed = bool(summary.get('onboarding_completed')) if pd.notna(summary.get('onboarding_completed')) else False
+        slogan_set = bool(summary.get('slogan_set')) if pd.notna(summary.get('slogan_set')) else False
+        first_activity_completed = bool(summary.get('first_activity_completed')) if pd.notna(summary.get('first_activity_completed')) else False
+
         # Activity plan (schedule) from user_activities
-        plan_df = run_query(f"""
-            SELECT 
-                description,
-                days,
-                created_at
-            FROM user_activities
-            WHERE user_id = {user_id}
-        """)
+        plan_df = get_user_activity_plan(user_id)
         
         week_full = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
         week_short = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -3482,43 +3562,6 @@ if selected_section == "🔍 User Deep Dive":
         st.markdown("#### 🎯 User Journey Funnel")
         funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
         
-        # Check onboarding completed (use users.onboarding_timestamp as source of truth;
-        # events.onboarding_completed is not reliably emitted for all onboarding paths)
-        onboarding_check = run_query(f"""
-            SELECT (u.onboarding_timestamp IS NOT NULL) OR EXISTS (
-                SELECT 1 FROM events e WHERE e.user_id = u.id AND e.event_type = 'onboarding_completed'
-            ) AS completed
-            FROM users u WHERE u.id = {user_id}
-        """)
-        onboarding_completed = onboarding_check['completed'].iloc[0] if not onboarding_check.empty else False
-        
-        # Check slogan/mantra set
-        slogan_check = run_query(f"""
-            SELECT COUNT(*) as count
-            FROM users u
-            WHERE u.id = {user_id}
-              AND (
-                    NULLIF(u.metadata->>'mantra', '') IS NOT NULL
-                    OR EXISTS (
-                        SELECT 1
-                        FROM ai_companion_flows acf
-                        WHERE acf.user_id = u.id
-                          AND acf.type = 'post_onboarding'
-                          AND NULLIF(acf.content->>'slogan', '') IS NOT NULL
-                    )
-                  )
-        """)
-        slogan_set = slogan_check['count'].iloc[0] > 0 if not slogan_check.empty else False
-        
-        # Check first activity completed
-        first_activity_check = run_query(f"""
-            SELECT COUNT(*) as count
-            FROM user_activities_history
-            WHERE user_id = {user_id}
-              AND completed_at IS NOT NULL
-        """)
-        first_activity_completed = first_activity_check['count'].iloc[0] > 0 if not first_activity_check.empty else False
-        
         with funnel_col1:
             status_icon = "✅" if onboarding_completed else "❌"
             st.metric("Onboarding Completed", status_icon, "Step 1")
@@ -3536,105 +3579,65 @@ if selected_section == "🔍 User Deep Dive":
         user_tz = parse_tz(user_tz_str)
         tz_name = user_tz_str if user_tz_str else "UTC"
         
-        # Query messages and convert to user's local timezone
-        messages_for_times = run_query(f"""
-            SELECT sent_at
-            FROM messages
-            WHERE user_id = {user_id}
-              AND sender = 'user'
-              AND sent_at IS NOT NULL
-        """)
-        
-        if not messages_for_times.empty:
-            # Convert timestamps to user's local timezone
-            def convert_to_local_hour(ts):
-                try:
-                    if isinstance(ts, str):
-                        ts = pd.to_datetime(ts)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=pytz.UTC)
-                    
-                    if user_tz:
-                        ts_local = ts.astimezone(user_tz)
-                        return ts_local.hour
-                    else:
-                        return ts.hour
-                except Exception:
-                    return None
-            
-            messages_for_times['local_hour'] = messages_for_times['sent_at'].apply(convert_to_local_hour)
-            messages_for_times = messages_for_times[messages_for_times['local_hour'].notna()]
-            
-            if not messages_for_times.empty:
-                # Count messages per hour
-                hour_counts = messages_for_times['local_hour'].value_counts().sort_index()
-                
-                # Create full 24-hour dataframe
-                all_hours = pd.DataFrame({'hour': range(24)})
-                hour_counts_df = pd.DataFrame({
-                    'hour': hour_counts.index,
-                    'message_count': hour_counts.values
-                })
-                
-                # Merge to get all hours with counts (fill missing with 0)
-                active_times_df = all_hours.merge(hour_counts_df, on='hour', how='left').fillna(0)
-                active_times_df['message_count'] = active_times_df['message_count'].astype(int)
-                
-                # Format hour labels for display
-                def format_hour(h):
-                    h = int(h)
-                    if h == 0:
-                        return "12am"
-                    elif h < 12:
-                        return f"{h}am"
-                    elif h == 12:
-                        return "12pm"
-                    else:
-                        return f"{h-12}pm"
-                
-                active_times_df['hour_label'] = active_times_df['hour'].apply(format_hour)
-                
-                # Create visual chart using Altair
-                import altair as alt
-                
-                chart = alt.Chart(active_times_df).mark_bar(
-                    color='#00d4aa',
-                    cornerRadiusTopLeft=3,
-                    cornerRadiusTopRight=3
-                ).encode(
-                    x=alt.X('hour_label:N', 
-                            sort=list(active_times_df['hour_label']),
-                            title='Hour of Day (Local Time)',
-                            axis=alt.Axis(labelAngle=-45)),
-                    y=alt.Y('message_count:Q', title='Messages'),
-                    tooltip=[
-                        alt.Tooltip('hour_label:N', title='Hour'),
-                        alt.Tooltip('message_count:Q', title='Messages')
-                    ]
-                ).properties(
-                    height=300,
-                    title=f'Message Activity by Hour ({tz_name})'
-                ).configure_axis(
-                    grid=True,
-                    gridColor='#2d3748'
-                ).configure_view(
-                    strokeWidth=0
-                )
-                
-                st.altair_chart(chart, use_container_width=True)
-                
-                # Show peak activity insight
-                peak_hour_row = active_times_df.loc[active_times_df['message_count'].idxmax()]
-                if peak_hour_row['message_count'] > 0:
-                    peak_hour = peak_hour_row['hour_label']
-                    peak_count = int(peak_hour_row['message_count'])
-                    total_messages = int(active_times_df['message_count'].sum())
-                    st.caption(f"**Peak activity:** {peak_hour} ({peak_count} messages, {round(100 * peak_count / total_messages, 1)}% of total)")
-            else:
-                st.caption("No message activity data available")
+        # Aggregate active hours in SQL instead of fetching every message timestamp.
+        message_hours_df = get_user_message_hour_counts(user_id, user_tz_str)
+
+        if not message_hours_df.empty:
+            all_hours = pd.DataFrame({'hour': range(24)})
+            message_hours_df['hour'] = message_hours_df['hour'].astype(int)
+            active_times_df = all_hours.merge(message_hours_df, on='hour', how='left').fillna(0)
+            active_times_df['message_count'] = active_times_df['message_count'].astype(int)
+
+            def format_hour(h):
+                h = int(h)
+                if h == 0:
+                    return "12am"
+                elif h < 12:
+                    return f"{h}am"
+                elif h == 12:
+                    return "12pm"
+                else:
+                    return f"{h-12}pm"
+
+            active_times_df['hour_label'] = active_times_df['hour'].apply(format_hour)
+
+            import altair as alt
+
+            chart = alt.Chart(active_times_df).mark_bar(
+                color='#00d4aa',
+                cornerRadiusTopLeft=3,
+                cornerRadiusTopRight=3
+            ).encode(
+                x=alt.X('hour_label:N',
+                        sort=list(active_times_df['hour_label']),
+                        title='Hour of Day (Local Time)',
+                        axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y('message_count:Q', title='Messages'),
+                tooltip=[
+                    alt.Tooltip('hour_label:N', title='Hour'),
+                    alt.Tooltip('message_count:Q', title='Messages')
+                ]
+            ).properties(
+                height=300,
+                title=f'Message Activity by Hour ({tz_name})'
+            ).configure_axis(
+                grid=True,
+                gridColor='#2d3748'
+            ).configure_view(
+                strokeWidth=0
+            )
+
+            st.altair_chart(chart, use_container_width=True)
+
+            peak_hour_row = active_times_df.loc[active_times_df['message_count'].idxmax()]
+            if peak_hour_row['message_count'] > 0:
+                peak_hour = peak_hour_row['hour_label']
+                peak_count = int(peak_hour_row['message_count'])
+                total_messages = int(active_times_df['message_count'].sum())
+                st.caption(f"**Peak activity:** {peak_hour} ({peak_count} messages, {round(100 * peak_count / total_messages, 1)}% of total)")
         else:
             st.caption("No message activity data available")
-        
+
         st.markdown("---")
         
         # Metrics row (active days + goal from users table per db-dictionary)
@@ -3679,15 +3682,14 @@ if selected_section == "🔍 User Deep Dive":
             key="msg_history_limit",
         )
         msg_limit = msg_limit_options[msg_limit_label]
-        msg_limit_sql = f"LIMIT {msg_limit}" if msg_limit else ""
-        
-        messages_df = run_query(f"""
-            SELECT id as msg_id, sent_at, sender, type as msg_type, message, status
-            FROM messages
-            WHERE user_id = {user_id} AND sent_at IS NOT NULL
-            ORDER BY sent_at DESC
-            {msg_limit_sql}
-        """)
+        translate_deep_dive_messages = st.checkbox(
+            "Translate message history to English",
+            value=False,
+            key="user_deepdive_translate_messages",
+            help="Disabled by default because translating every row can slow the deep dive.",
+        )
+
+        messages_df = get_user_message_history(user_id, msg_limit)
         
         def extract_msg_text(raw_msg):
             """Extract the most human-readable text from a message payload.
@@ -4012,7 +4014,7 @@ if selected_section == "🔍 User Deep Dive":
                     "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                     "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_template(row.get("message"))),
                     "Message": text,
-                    "Message (EN)": translate_to_english(text),
+                    "Message (EN)": translate_to_english(text) if translate_deep_dive_messages else "",
                 })
 
             history_df = pd.DataFrame(rows_history)
