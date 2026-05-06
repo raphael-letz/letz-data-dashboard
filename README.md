@@ -120,6 +120,35 @@ Or deploy to any platform that supports Python (Heroku, Railway, Render, etc.).
 
 ---
 
+## Git Workflow
+
+To push changes to the repository:
+
+```bash
+# Navigate to the project directory
+cd "analysis/Letz data dasboard"
+
+# Check current status
+git status
+
+# Stage your changes
+git add .
+
+# Commit with a descriptive message
+git commit -m "Your commit message here"
+
+# Push to the main branch
+git push origin main
+```
+
+**Example:**
+```bash
+git commit -m "Update new users filter to include user_accepted_messages context field"
+git push origin main
+```
+
+---
+
 ## Configuration
 
 ### Streamlit Theme (`.streamlit/config.toml`)
