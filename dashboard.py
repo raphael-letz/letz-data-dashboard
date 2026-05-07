@@ -2349,7 +2349,7 @@ if selected_section == "📊 Quick Insights":
                 FROM beta_users bu
                 JOIN users u ON u.id = bu.id
                 WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                  AND u.context ->> 'user_accepted_messages' = 'true'
+                  AND (u.metadata->>'user_accepted_messages')::boolean = true
                   {internal_filter_join}
                 ORDER BY u.waid, u.created_at DESC
             ) unique_users
