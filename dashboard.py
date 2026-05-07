@@ -2342,12 +2342,10 @@ if selected_section == "📊 Quick Insights":
     # Expandable simple lists for key metrics
     try:
         new_today_list = run_query(f"""
-            {beta_users_cte}
             SELECT COALESCE(full_name, 'Unknown') AS name, waid
             FROM (
                 SELECT DISTINCT ON (u.waid) u.full_name, u.waid, u.created_at
-                FROM beta_users bu
-                JOIN users u ON u.id = bu.id
+                FROM users u
                 WHERE u.created_at >= NOW() - INTERVAL '7 days'
                   AND (u.metadata->>'user_accepted_messages')::boolean = true
                   {internal_filter_join}
