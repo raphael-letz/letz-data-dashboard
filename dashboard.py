@@ -2342,12 +2342,26 @@ if selected_section == "📊 Quick Insights":
     # Expandable simple lists for key metrics
     try:
         new_today_list = run_query(f"""
-            SELECT COALESCE(full_name, 'Unknown') AS name, waid
+            {beta_users_cte}
+            SELECT COALESCE(full_name, 'Unknown') AS name, waid, is_beta
             FROM (
-                SELECT DISTINCT ON (u.waid) u.full_name, u.waid, u.created_at
+                SELECT DISTINCT ON (u.waid)
+                    u.full_name,
+                    u.waid,
+                    u.created_at,
+                    EXISTS (
+                        SELECT 1
+                        FROM beta_users bu
+                        WHERE bu.id = u.id OR bu.waid = u.waid
+                    ) AS is_beta
                 FROM users u
                 WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                  AND (u.metadata->>'user_accepted_messages')::boolean = true
+                  AND EXISTS (
+                      SELECT 1
+                      FROM messages m
+                      WHERE m.sender = 'user'
+                        AND (m.user_id = u.id OR m.waid = u.waid)
+                  )
                   {internal_filter_join}
                 ORDER BY u.waid, u.created_at DESC
             ) unique_users
@@ -2358,8 +2372,22 @@ if selected_section == "📊 Quick Insights":
             if new_today_list.empty:
                 st.caption("No users")
             else:
-                for _, row in new_today_list.iterrows():
-                    st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
+                beta_new_users = new_today_list[new_today_list["is_beta"] == True]
+                pre_plan_new_users = new_today_list[new_today_list["is_beta"] != True]
+
+                st.markdown(f"**Beta users with a plan** ({len(beta_new_users)})")
+                if beta_new_users.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in beta_new_users.iterrows():
+                        st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
+
+                st.markdown(f"**Messaging coach, no plan yet** ({len(pre_plan_new_users)})")
+                if pre_plan_new_users.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in pre_plan_new_users.iterrows():
+                        st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
     except:
         st.warning("Could not load new users (past 7d) list")
     
