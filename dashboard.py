@@ -10,6 +10,7 @@ from psycopg2.extras import RealDictCursor
 import os
 import json
 import re
+import html
 import pytz
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
@@ -311,6 +312,72 @@ def format_display_name(name, waid=None, tag="investor"):
     if waid_str and waid_str in investor_waids:
         return f"{name_str} [{tag}]"
     return name_str
+
+
+def render_wrapped_messages_table(df: pd.DataFrame) -> None:
+    """Render message rows as a wrapped HTML table for screenshots."""
+    if df.empty:
+        return
+
+    display_df = df.fillna("").copy()
+    columns = list(display_df.columns)
+    weights = {
+        "Time": 1.2,
+        "User": 1.8,
+        "From": 1,
+        "Status": 1,
+        "Type": 0.8,
+        "Message": 4,
+        "Message (EN)": 4,
+    }
+    total_weight = sum(weights.get(col, 1) for col in columns) or 1
+    colgroup = "".join(
+        f"<col style='width: {weights.get(col, 1) / total_weight * 100:.2f}%;'>"
+        for col in columns
+    )
+
+    header_html = "".join(f"<th>{html.escape(str(col))}</th>" for col in columns)
+    rows_html = []
+    for _, row in display_df.iterrows():
+        failed_class = " failed-row" if str(row.get("Status", "")).strip().lower() == "failed" else ""
+        cells = "".join(
+            f"<td>{html.escape(str(row.get(col, '')), quote=False)}</td>"
+            for col in columns
+        )
+        rows_html.append(f"<tr class='{failed_class}'>{cells}</tr>")
+
+    table_html = f"""
+<style>
+.wrapped-message-table {{
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 0.9rem;
+}}
+.wrapped-message-table th,
+.wrapped-message-table td {{
+    border: 1px solid rgba(250, 250, 250, 0.15);
+    padding: 0.45rem 0.55rem;
+    vertical-align: top;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}}
+.wrapped-message-table th {{
+    background: rgba(250, 250, 250, 0.08);
+    font-weight: 700;
+}}
+.wrapped-message-table .failed-row td {{
+    background-color: rgba(239, 68, 68, 0.16);
+}}
+</style>
+<table class="wrapped-message-table">
+    <colgroup>{colgroup}</colgroup>
+    <thead><tr>{header_html}</tr></thead>
+    <tbody>{''.join(rows_html)}</tbody>
+</table>
+"""
+    st.markdown(table_html, unsafe_allow_html=True)
 
 
 def get_internal_users_filter_sql(exclude_internal: bool = True) -> str:
@@ -2525,6 +2592,12 @@ if selected_section == "📊 Quick Insights":
         key="recent_messages_translate",
         help="Disabled by default because translating every row can slow the Quick Insights tab.",
     )
+    wrap_recent_messages = st.checkbox(
+        "Wrap recent messages for screenshots",
+        value=False,
+        key="recent_messages_wrap",
+        help="Shows the same table with wrapped message text so it fits in screenshots.",
+    )
     
     # Time range selector
     time_range = st.selectbox(
@@ -3002,20 +3075,23 @@ if selected_section == "📊 Quick Insights":
                 return [style] * len(row)
             display_obj = display_df.style.apply(_highlight_failed_row, axis=1)
         
-        st.dataframe(
-            display_obj,
-            use_container_width=True, 
-            hide_index=True,
-            column_config={
-                "Time": st.column_config.TextColumn(width="small"),
-                "User": st.column_config.TextColumn(width="medium"),
-                "From": st.column_config.TextColumn(width="small"),
-                "Status": st.column_config.TextColumn(width="small"),
-                "Type": st.column_config.TextColumn(width="small"),
-                "Message": st.column_config.TextColumn(width="large"),
-                "Message (EN)": st.column_config.TextColumn(width="large"),
-            }
-        )
+        if wrap_recent_messages:
+            render_wrapped_messages_table(display_df)
+        else:
+            st.dataframe(
+                display_obj,
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Time": st.column_config.TextColumn(width="small"),
+                    "User": st.column_config.TextColumn(width="medium"),
+                    "From": st.column_config.TextColumn(width="small"),
+                    "Status": st.column_config.TextColumn(width="small"),
+                    "Type": st.column_config.TextColumn(width="small"),
+                    "Message": st.column_config.TextColumn(width="large"),
+                    "Message (EN)": st.column_config.TextColumn(width="large"),
+                }
+            )
     else:
         st.info("No messages found")
     
@@ -3715,6 +3791,12 @@ if selected_section == "🔍 User Deep Dive":
             key="user_deepdive_translate_messages",
             help="Disabled by default because translating every row can slow the deep dive.",
         )
+        wrap_deep_dive_messages = st.checkbox(
+            "Wrap message history for screenshots",
+            value=False,
+            key="user_deepdive_wrap_messages",
+            help="Shows the same table with wrapped message text so it fits in screenshots.",
+        )
 
         messages_df = get_user_message_history(user_id, msg_limit)
         
@@ -4052,20 +4134,23 @@ if selected_section == "🔍 User Deep Dive":
                     style = "background-color: rgba(239, 68, 68, 0.16);" if failed else ""
                     return [style] * len(row)
                 history_obj = history_df.style.apply(_highlight_failed_history_row, axis=1)
-            st.dataframe(
-                history_obj,
-                use_container_width=True,
-                hide_index=True,
-                height=420,
-                column_config={
-                    "Time": st.column_config.TextColumn(width="small"),
-                    "From": st.column_config.TextColumn(width="small"),
-                    "Status": st.column_config.TextColumn(width="small"),
-                    "Type": st.column_config.TextColumn(width="small"),
-                    "Message": st.column_config.TextColumn(width="large"),
-                    "Message (EN)": st.column_config.TextColumn(width="large"),
-                }
-            )
+            if wrap_deep_dive_messages:
+                render_wrapped_messages_table(history_df)
+            else:
+                st.dataframe(
+                    history_obj,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    column_config={
+                        "Time": st.column_config.TextColumn(width="small"),
+                        "From": st.column_config.TextColumn(width="small"),
+                        "Status": st.column_config.TextColumn(width="small"),
+                        "Type": st.column_config.TextColumn(width="small"),
+                        "Message": st.column_config.TextColumn(width="large"),
+                        "Message (EN)": st.column_config.TextColumn(width="large"),
+                    }
+                )
 
 
 # Tab 3: User Retention
