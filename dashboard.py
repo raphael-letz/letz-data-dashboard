@@ -425,6 +425,21 @@ def get_internal_users_filter_join_sql(exclude_internal: bool = True, table_alia
     return f"AND {table_alias}.waid NOT IN ('{internal_waids_str}')"
 
 
+USER_VISIBLE_MESSAGE_EXCLUDED_TYPES = (
+    "think",
+    "tool_use",
+    "tool_result",
+    "turn_audit",
+    "weekly_digest",
+)
+
+
+def get_user_visible_message_filter_sql(table_alias: str = "m") -> str:
+    """Exclude agent trace rows that were not actually sent to the user."""
+    excluded_types = "', '".join(USER_VISIBLE_MESSAGE_EXCLUDED_TYPES)
+    return f"AND LOWER(COALESCE({table_alias}.type, '')) NOT IN ('{excluded_types}')"
+
+
 PLAN_PROPOSAL_MESSAGE_CONDITION = """
 (
     m.message ILIKE '%O coach enviou uma imagem com o plano semanal. Atividades:%'
@@ -1901,6 +1916,7 @@ def get_user_message_history(user_id: int, limit: int | None) -> pd.DataFrame:
         SELECT id as msg_id, sent_at, sender, type as msg_type, message, status
         FROM messages
         WHERE user_id = {user_id} AND sent_at IS NOT NULL
+          {get_user_visible_message_filter_sql("messages")}
         ORDER BY sent_at DESC
         {msg_limit_sql}
     """)
@@ -2625,6 +2641,7 @@ if selected_section == "📊 Quick Insights":
             FROM messages m
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
+              {get_user_visible_message_filter_sql("m")}
               {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
             LIMIT 20
@@ -2645,6 +2662,7 @@ if selected_section == "📊 Quick Insights":
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
               AND m.sent_at >= NOW() - INTERVAL '1 hour'
+              {get_user_visible_message_filter_sql("m")}
               {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
         """
@@ -2664,6 +2682,7 @@ if selected_section == "📊 Quick Insights":
             LEFT JOIN users u ON m.user_id = u.id
             WHERE m.sent_at IS NOT NULL
               AND m.sent_at >= NOW() - INTERVAL '24 hours'
+              {get_user_visible_message_filter_sql("m")}
               {internal_filter_join if exclude_internal and internal_filter_join else ""}
             ORDER BY m.sent_at DESC
         """
