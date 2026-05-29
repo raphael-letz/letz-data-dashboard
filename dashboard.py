@@ -567,6 +567,76 @@ SELECT
 
 
 @st.cache_data(ttl=300)
+def get_dotz_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Fetch Dotz-only headline KPIs for the Dotz tab.
+
+    Dotz users are identified via users.tags containing the "dotz" value.
+    """
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    beta_users_cte = get_beta_users_cte()
+    query = f"""
+{beta_users_cte},
+dotz_users AS (
+    SELECT DISTINCT
+        u.id,
+        u.waid,
+        u.is_active,
+        u.created_at
+    FROM users u
+    WHERE COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
+      {internal_filter_join}
+),
+dotz_users_with_messages AS (
+    SELECT DISTINCT du.id, du.waid
+    FROM dotz_users du
+    WHERE EXISTS (
+        SELECT 1
+        FROM messages m
+        WHERE m.sender = 'user'
+          AND (m.user_id = du.id OR m.waid = du.waid)
+    )
+),
+dotz_onboarded_users AS (
+    SELECT DISTINCT du.id, du.waid, du.is_active, du.created_at
+    FROM dotz_users du
+    JOIN beta_users bu ON bu.id = du.id
+),
+latest_farewell AS (
+    SELECT DISTINCT ON (rl.user_id)
+        rl.user_id,
+        rl.sent_at AS farewell_at
+    FROM recovery_logs rl
+    JOIN dotz_onboarded_users dou ON dou.id = rl.user_id
+    WHERE rl.ladder_step = 'farewell'
+      AND rl.sent_at >= NOW() - INTERVAL '7 days'
+    ORDER BY rl.user_id, rl.sent_at DESC
+),
+churn_status AS (
+    SELECT
+        lf.user_id,
+        EXISTS (
+            SELECT 1
+            FROM messages m
+            JOIN dotz_onboarded_users dou ON dou.id = lf.user_id
+            WHERE (m.user_id = dou.id OR m.waid = dou.waid)
+              AND m.sender = 'user'
+              AND m.sent_at > lf.farewell_at
+        ) AS came_back
+    FROM latest_farewell lf
+)
+SELECT
+    (SELECT COUNT(DISTINCT waid) FROM dotz_users_with_messages) AS all_users_count,
+    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users) AS onboarded_users_count,
+    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users WHERE is_active = true) AS alive_count,
+    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_7d_count,
+    COALESCE((SELECT COUNT(*) FROM churn_status WHERE NOT came_back), 0) AS churned_7d_count,
+    COALESCE((SELECT COUNT(*) FROM churn_status WHERE came_back), 0) AS churned_7d_came_back
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
 def get_user_journey_progress_metrics(exclude_internal: bool = True) -> pd.DataFrame:
     """Fetch current and previous 7-day journey funnel metrics in one query."""
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
@@ -1755,7 +1825,8 @@ def get_deep_dive_user_options() -> pd.DataFrame:
                 timezone,
                 created_at,
                 coach_name,
-                metadata
+                metadata,
+                tags
             FROM users
             ORDER BY waid, created_at DESC
         ),
@@ -1783,7 +1854,16 @@ def get_deep_dive_user_options() -> pd.DataFrame:
             u.created_at,
             u.coach_name,
             COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
-            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END as is_active_24h
+            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END AS is_active_24h,
+            CASE WHEN COALESCE(jsonb_array_length(COALESCE(u.tags, '[]'::jsonb)), 0) > 0 THEN true ELSE false END AS has_tags,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(COALESCE(u.tags, '[]'::jsonb)) AS t(tag)
+                    WHERE LOWER(t.tag) = 'dotz'
+                ) THEN true
+                ELSE false
+            END AS is_dotz
         FROM unique_users u
         LEFT JOIN active_users a ON u.id = a.user_id
         LEFT JOIN user_slogans us ON u.id = us.user_id
@@ -2357,6 +2437,7 @@ selected_section = st.radio(
     "Dashboard section",
     [
         "📊 Quick Insights",
+        "🎯 Dotz",
         "🔍 User Deep Dive",
         "📈 User Retention",
         "🔔 Alerts",
@@ -3267,154 +3348,6 @@ ORDER BY wb.week_start
     except Exception as e:
         st.warning(f"Could not load churn rate chart: {e}")
     
-    # User Journey Stats — last 7d % with prev 7d % below (red/green), no absolute numbers
-    st.markdown("### 🎯 User Journey Progress")
-    st.caption("% of **new beta users acquired in the last 7 days** who completed each step. Prev 7d shows the prior beta cohort for comparison.")
-
-    try:
-        journey_df = get_user_journey_progress_metrics(exclude_internal)
-
-        def _cohort_row(cohort: str) -> dict:
-            if journey_df.empty or cohort not in set(journey_df["cohort"]):
-                return {
-                    "total_users": 0,
-                    "completed_onboarding": 0,
-                    "added_slogan": 0,
-                    "completed_activity": 0,
-                    "sent_audio": 0,
-                    "sent_picture": 0,
-                }
-            row = journey_df[journey_df["cohort"] == cohort].iloc[0]
-            return {k: int(row.get(k, 0) or 0) for k in [
-                "total_users",
-                "completed_onboarding",
-                "added_slogan",
-                "completed_activity",
-                "sent_audio",
-                "sent_picture",
-            ]}
-
-        current_journey = _cohort_row("current")
-        previous_journey = _cohort_row("previous")
-        new_users_7d = current_journey["total_users"]
-        new_users_prev_7d = previous_journey["total_users"]
-
-        def _pct(count: int, total: int) -> float:
-            return round(100 * count / total, 1) if total else 0
-
-        def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
-            if better:
-                color = "#0d7d0d"
-            elif worse:
-                color = "#c52222"
-            else:
-                color = "#6b7280"
-            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
-
-        if new_users_7d > 0 or new_users_prev_7d > 0:
-            metric_defs = [
-                ("✅ Completed Onboarding", "completed_onboarding"),
-                ("💬 Added Slogan", "added_slogan"),
-                ("🏃 Completed Activity", "completed_activity"),
-                ("🎧 Sent Audio", "sent_audio"),
-                ("📷 Sent Picture", "sent_picture"),
-            ]
-            for col, (label, key) in zip(st.columns(5), metric_defs):
-                current_pct = _pct(current_journey[key], new_users_7d)
-                previous_pct = _pct(previous_journey[key], new_users_prev_7d)
-                col.metric(label, f"{current_pct}%")
-                col.markdown(
-                    _journey_blob(
-                        previous_pct,
-                        current_pct > previous_pct if new_users_prev_7d else None,
-                        current_pct < previous_pct if new_users_prev_7d else None,
-                    ),
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("No users found")
-    except Exception as e:
-        st.warning(f"Could not load journey stats: {e}")
-    
-    st.markdown("### 🪜 Recovery Ladder & Template Sends")
-    st.caption("Recovery metrics include beta users only.")
-    try:
-        recovery_metrics_df, dropoff_df = get_recovery_ladder_quick_metrics(exclude_internal)
-
-        def _recovery_row(cohort: str) -> dict:
-            if recovery_metrics_df.empty or cohort not in set(recovery_metrics_df["cohort"]):
-                return {
-                    "total_users": 0,
-                    "conv24_users": 0,
-                    "conv72_users": 0,
-                    "avg_hours": None,
-                    "median_hours": None,
-                    "users_2_plus": 0,
-                    "users_3_plus": 0,
-                }
-            row = recovery_metrics_df[recovery_metrics_df["cohort"] == cohort].iloc[0]
-            return {
-                "total_users": int(row.get("total_users", 0) or 0),
-                "conv24_users": int(row.get("conv24_users", 0) or 0),
-                "conv72_users": int(row.get("conv72_users", 0) or 0),
-                "avg_hours": row.get("avg_hours"),
-                "median_hours": row.get("median_hours"),
-                "users_2_plus": int(row.get("users_2_plus", 0) or 0),
-                "users_3_plus": int(row.get("users_3_plus", 0) or 0),
-            }
-
-        current_recovery = _recovery_row("current")
-        previous_recovery = _recovery_row("previous")
-        t_7d = current_recovery["total_users"]
-        t_prev = previous_recovery["total_users"]
-        conv24_pct = round(100 * current_recovery["conv24_users"] / t_7d, 1) if t_7d else 0
-        conv72_pct = round(100 * current_recovery["conv72_users"] / t_7d, 1) if t_7d else 0
-        conv24_prev_pct = round(100 * previous_recovery["conv24_users"] / t_prev, 1) if t_prev else 0
-        conv72_prev_pct = round(100 * previous_recovery["conv72_users"] / t_prev, 1) if t_prev else 0
-
-        avg_hours = round(current_recovery["avg_hours"], 1) if pd.notna(current_recovery["avg_hours"]) else None
-        avg_prev = round(previous_recovery["avg_hours"], 1) if pd.notna(previous_recovery["avg_hours"]) else None
-        users_2_plus = current_recovery["users_2_plus"]
-        users_3_plus = current_recovery["users_3_plus"]
-        u2_prev = previous_recovery["users_2_plus"]
-        u3_prev = previous_recovery["users_3_plus"]
-
-        def _blob(prev_text: str, better: bool | None, worse: bool | None) -> str:
-            if better:
-                color = "#0d7d0d"
-            elif worse:
-                color = "#c52222"
-            else:
-                color = "#6b7280"
-            return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_text}</span>'
-
-        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
-        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
-        worse_24 = conv24_pct < conv24_prev_pct if t_prev else None
-        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
-        worse_72 = conv72_pct < conv72_prev_pct if t_prev else None
-        better_react = avg_hours is not None and avg_prev is not None and avg_hours < avg_prev
-        worse_react = avg_hours is not None and avg_prev is not None and avg_hours > avg_prev
-        better_multi = users_2_plus < u2_prev if t_prev else None
-        worse_multi = users_2_plus > u2_prev if t_prev else None
-
-        rcol1.metric("Conv 24h (7d)", f"{conv24_pct}%")
-        rcol1.markdown(_blob(f"{conv24_prev_pct}%" if t_prev else "—", better_24, worse_24), unsafe_allow_html=True)
-        rcol2.metric("Conv 72h (7d)", f"{conv72_pct}%")
-        rcol2.markdown(_blob(f"{conv72_prev_pct}%" if t_prev else "—", better_72, worse_72), unsafe_allow_html=True)
-        rcol3.metric("Avg → Reactivation (7d, h)", f"{avg_hours}h" if avg_hours is not None else "—")
-        rcol3.markdown(_blob(f"{avg_prev}h" if avg_prev is not None else "—", better_react, worse_react), unsafe_allow_html=True)
-        rcol4.metric("Users 2nd/3rd+ (7d)", f"{users_2_plus} / {users_3_plus}")
-        rcol4.markdown(_blob(f"{u2_prev} / {u3_prev}" if t_prev else "—", better_multi, worse_multi), unsafe_allow_html=True)
-
-        with st.expander("Ladder drop-off by step & template (last 7 days)", expanded=False):
-            if dropoff_df.empty:
-                st.caption("No beta-user recovery logs in last 7 days")
-            else:
-                st.dataframe(dropoff_df, use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.warning(f"Could not load recovery ladder stats: {e}")
-    
     # User Activity by Hour chart
     st.markdown("### 📊 User Activity by Hour")
     
@@ -3517,6 +3450,148 @@ ORDER BY wb.week_start
     
 
 
+# Tab 1b: Dotz
+if selected_section == "🎯 Dotz":
+    exclude_internal = True
+    st.markdown("---")
+
+    try:
+        headline_df = get_dotz_headline_metrics(exclude_internal)
+        headline = headline_df.iloc[0] if not headline_df.empty else {}
+        all_users_count = int(headline.get("all_users_count", 0))
+        onboarded_users_count = int(headline.get("onboarded_users_count", 0))
+        alive_count = int(headline.get("alive_count", 0))
+        new_7d_count = int(headline.get("new_7d_count", 0))
+        churned_7d_count = int(headline.get("churned_7d_count", 0))
+        churned_7d_came_back = int(headline.get("churned_7d_came_back", 0))
+    except Exception:
+        all_users_count = onboarded_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
+
+    alive_pct = round(100 * alive_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    new_7d_pct = round(100 * new_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    churned_7d_pct = round(100 * churned_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("All users", all_users_count if all_users_count else "—")
+    col1.caption("Dotz users who ever messaged")
+    col2.metric("Onboarded users", onboarded_users_count if onboarded_users_count else "—")
+    col2.caption("Dotz users who have a plan")
+    col3.metric("Alive users", alive_count if alive_count is not None else "—")
+    col3.caption(f"↳ {alive_pct}% of onboarded users")
+    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
+    col4.caption(f"↳ {new_7d_pct}% of onboarded users")
+    col5.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
+    col5.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
+
+    st.markdown("---")
+    st.markdown("### 💬 Recent Messages")
+
+    dotz_time_range = st.selectbox(
+        "Filter by time range:",
+        ["Last 20 messages", "Last 1 hour", "Last 24 hours"],
+        key="dotz_recent_messages_range",
+    )
+
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+
+    if dotz_time_range == "Last 20 messages":
+        dotz_recent_query = f"""
+            SELECT
+                m.id AS msg_id,
+                m.sent_at AS timestamp,
+                m.type AS msg_type,
+                u.full_name AS user_name,
+                u.waid AS user_waid,
+                u.timezone AS user_timezone,
+                m.sender,
+                m.message AS raw_message,
+                m.status
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+              {get_user_visible_message_filter_sql("m")}
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
+              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
+            ORDER BY m.sent_at DESC
+            LIMIT 20
+        """
+    elif dotz_time_range == "Last 1 hour":
+        dotz_recent_query = f"""
+            SELECT
+                m.id AS msg_id,
+                m.sent_at AS timestamp,
+                m.type AS msg_type,
+                u.full_name AS user_name,
+                u.waid AS user_waid,
+                u.timezone AS user_timezone,
+                m.sender,
+                m.message AS raw_message,
+                m.status
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+              AND m.sent_at >= NOW() - INTERVAL '1 hour'
+              {get_user_visible_message_filter_sql("m")}
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
+              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
+            ORDER BY m.sent_at DESC
+        """
+    else:
+        dotz_recent_query = f"""
+            SELECT
+                m.id AS msg_id,
+                m.sent_at AS timestamp,
+                m.type AS msg_type,
+                u.full_name AS user_name,
+                u.waid AS user_waid,
+                u.timezone AS user_timezone,
+                m.sender,
+                m.message AS raw_message,
+                m.status
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id
+            WHERE m.sent_at IS NOT NULL
+              AND m.sent_at >= NOW() - INTERVAL '24 hours'
+              {get_user_visible_message_filter_sql("m")}
+              {internal_filter_join if exclude_internal and internal_filter_join else ""}
+              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
+            ORDER BY m.sent_at DESC
+        """
+
+    dotz_recent_messages = run_query(dotz_recent_query)
+
+    if not dotz_recent_messages.empty:
+        st.caption(f"Showing {len(dotz_recent_messages)} message(s)")
+        dotz_display = dotz_recent_messages.copy()
+        dotz_display["Time"] = dotz_display.apply(
+            lambda row: _format_ts_local(row.get("timestamp"), row.get("user_timezone")),
+            axis=1,
+        )
+        dotz_display["User"] = dotz_display.apply(
+            lambda row: format_display_name(row.get("user_name"), row.get("user_waid")),
+            axis=1,
+        )
+        dotz_display["From"] = dotz_display["sender"].apply(lambda s: "👤 User" if s == "user" else "🤖 Bot")
+        dotz_display["Status"] = dotz_display["status"].fillna("—").astype(str).str.lower()
+        dotz_display["Type"] = dotz_display["msg_type"].fillna("—").astype(str)
+        dotz_display["Message"] = dotz_display["raw_message"].fillna("").astype(str)
+        st.dataframe(
+            dotz_display[["Time", "User", "From", "Status", "Type", "Message"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Time": st.column_config.TextColumn(width="small"),
+                "User": st.column_config.TextColumn(width="medium"),
+                "From": st.column_config.TextColumn(width="small"),
+                "Status": st.column_config.TextColumn(width="small"),
+                "Type": st.column_config.TextColumn(width="small"),
+                "Message": st.column_config.TextColumn(width="large"),
+            },
+        )
+    else:
+        st.info("No messages found")
+
+
 # Tab 2: User Deep Dive
 if selected_section == "🔍 User Deep Dive":
     st.markdown("### 🔍 User Deep Dive")
@@ -3527,9 +3602,28 @@ if selected_section == "🔍 User Deep Dive":
     if users_df.empty:
         st.info("No users found")
     else:
-        users_df['label'] = users_df.apply(lambda r: f"{format_display_name(r['full_name'], r['waid'])}{' *' if r.get('is_active_24h') else ''} ({r['waid']})", axis=1)
-        selected_label = st.selectbox("Select user", users_df['label'])
-        selected_row = users_df[users_df['label'] == selected_label].iloc[0]
+        deep_dive_filter = st.selectbox(
+            "User filter",
+            ["All users", "Only users with tags"],
+            key="deep_dive_user_filter",
+        )
+        if deep_dive_filter == "Only users with tags":
+            users_df = users_df[users_df["has_tags"] == True].copy()
+
+        if users_df.empty:
+            st.info("No users match the selected filter")
+            st.stop()
+
+        users_df["label"] = users_df.apply(
+            lambda r: (
+                f"{format_display_name(r['full_name'], r['waid'])}"
+                f"{' [DOTZ]' if r.get('is_dotz') else ''}"
+                f"{' *' if r.get('is_active_24h') else ''} ({r['waid']})"
+            ),
+            axis=1,
+        )
+        selected_label = st.selectbox("Select user", users_df["label"])
+        selected_row = users_df[users_df["label"] == selected_label].iloc[0]
         user_id = int(selected_row['id'])
         user_tz_str = selected_row.get('timezone')
         user_coach = selected_row.get('coach_name', '—')
