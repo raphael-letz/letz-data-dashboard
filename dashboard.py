@@ -314,6 +314,36 @@ def format_display_name(name, waid=None, tag="investor"):
     return name_str
 
 
+def format_display_name_with_tags(name, waid=None, tags=None):
+    """Format display name and append user tags (e.g. [dotz])."""
+    base_name = format_display_name(name, waid)
+    if tags is None or (isinstance(tags, float) and pd.isna(tags)):
+        return base_name
+
+    parsed_tags = []
+    if isinstance(tags, list):
+        parsed_tags = [str(t).strip() for t in tags if str(t).strip()]
+    elif isinstance(tags, str):
+        raw = tags.strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    parsed_tags = [str(t).strip() for t in parsed if str(t).strip()]
+                else:
+                    parsed_tags = [raw]
+            except Exception:
+                parsed_tags = [raw]
+    else:
+        tag_str = str(tags).strip()
+        if tag_str:
+            parsed_tags = [tag_str]
+
+    if not parsed_tags:
+        return base_name
+    return f"{base_name} [{' | '.join(parsed_tags)}]"
+
+
 def render_wrapped_messages_table(df: pd.DataFrame) -> None:
     """Render message rows as a wrapped HTML table for screenshots."""
     if df.empty:
@@ -1125,6 +1155,7 @@ rl_sends AS (
     r.ladder_step,
     u.waid,
     COALESCE(u.full_name, 'Unknown') AS full_name,
+    u.tags,
     r.sent_at,
     EXISTS (
       SELECT 1 FROM messages m
@@ -1142,7 +1173,7 @@ SELECT * FROM rl_sends
 ORDER BY ladder_step DESC, sent_at DESC;
 """
     df = run_query(query)
-    empty = pd.DataFrame(columns=["ladder_step", "waid", "full_name", "sent_at", "reactivated"])
+    empty = pd.DataFrame(columns=["ladder_step", "waid", "full_name", "tags", "sent_at", "reactivated"])
     if df.empty:
         return empty.copy(), empty.copy(), empty.copy()
     rl2 = df[df["ladder_step"] == "recovery_ladder_2"].copy()
@@ -1190,6 +1221,7 @@ recent_inbound AS (
 SELECT
   u.waid,
   COALESCE(u.full_name, 'Unknown') AS full_name,
+  u.tags,
   ri.last_message_at,
   hf.farewell_at
 FROM had_farewell hf
@@ -2508,11 +2540,12 @@ if selected_section == "📊 Quick Insights":
     try:
         new_today_list = run_query(f"""
             {beta_users_cte}
-            SELECT COALESCE(full_name, 'Unknown') AS name, waid, is_beta
+            SELECT COALESCE(full_name, 'Unknown') AS name, waid, tags, is_beta
             FROM (
                 SELECT DISTINCT ON (u.waid)
                     u.full_name,
                     u.waid,
+                    u.tags,
                     u.created_at,
                     EXISTS (
                         SELECT 1
@@ -2545,14 +2578,14 @@ if selected_section == "📊 Quick Insights":
                     st.caption("No users")
                 else:
                     for _, row in beta_new_users.iterrows():
-                        st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'))}")
 
                 st.markdown(f"**Messaging coach, no plan yet** ({len(pre_plan_new_users)})")
                 if pre_plan_new_users.empty:
                     st.caption("No users")
                 else:
                     for _, row in pre_plan_new_users.iterrows():
-                        st.caption(f"• {format_display_name(row['name'], row.get('waid'))}")
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'))}")
     except:
         st.warning("Could not load new users (past 7d) list")
     
@@ -2575,6 +2608,7 @@ if selected_section == "📊 Quick Insights":
             SELECT
                 COALESCE(u.full_name, 'Unknown') AS name,
                 u.waid AS phone,
+                u.tags,
                 u.active_days,
                 TO_CHAR(
                     date_trunc('week', u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo'),
@@ -2604,22 +2638,22 @@ if selected_section == "📊 Quick Insights":
                     st.caption("No users")
                 else:
                     for _, row in still_inactive_df.iterrows():
-                        name = format_display_name(row['name'], row.get('phone'))
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'))
                         phone = row.get('phone', '—')
                         onb_week = row.get('onboarding_week') or '—'
                         active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
+                        st.caption(f"• {name} · 📞 {phone} · 📅 {onb_week} · 🏃 {active_days_val} active days")
 
                 st.markdown("**Came back after farewell**")
                 if came_back_df.empty:
                     st.caption("No users")
                 else:
                     for _, row in came_back_df.iterrows():
-                        name = format_display_name(row['name'], row.get('phone'))
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'))
                         phone = row.get('phone', '—')
                         onb_week = row.get('onboarding_week') or '—'
                         active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 📅 w/c {onb_week} · 🏃 {active_days_val} active days")
+                        st.caption(f"• {name} · 📞 {phone} · 📅 {onb_week} · 🏃 {active_days_val} active days")
     except Exception as e:
         st.warning(f"Could not load inactive users list: {e}")
 
@@ -2638,7 +2672,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in farewell_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
 
             st.markdown("**Recovery Ladder 2** (penultimate step)")
             if rl2_df.empty:
@@ -2647,7 +2681,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in rl2_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
 
             st.markdown("**Recovery Ladder 1**")
             if rl1_df.empty:
@@ -2656,7 +2690,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in rl1_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
@@ -2672,7 +2706,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in reactivated_df.iterrows():
                     last_msg_sp = _format_ts_local(row["last_message_at"], sp_tz)
                     farewell_sp = _format_ts_local(row["farewell_at"], sp_tz)
-                    st.caption(f"• {format_display_name(row['full_name'], row.get('waid'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
     except Exception as e:
         st.warning(f"Could not load Reactivated Users: {e}")
 
