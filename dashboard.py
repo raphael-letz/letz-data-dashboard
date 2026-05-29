@@ -3602,15 +3602,293 @@ if selected_section == "🎯 Dotz":
             except Exception:
                 return str(ts)[:16]
 
-        dotz_display["Time"] = dotz_display.apply(_dotz_format_timestamp_local, axis=1)
-        dotz_display["User"] = dotz_display.apply(
-            lambda row: format_display_name(row.get("user_name"), row.get("user_waid")),
-            axis=1,
-        )
-        dotz_display["From"] = dotz_display["sender"].apply(lambda s: "👤 User" if s == "user" else "🤖 Bot")
-        dotz_display["Status"] = dotz_display["status"].fillna("—").astype(str).str.lower()
-        dotz_display["Type"] = dotz_display["msg_type"].fillna("—").astype(str)
-        dotz_display["Message"] = dotz_display["raw_message"].fillna("").astype(str)
+        def _dotz_extract_message_text(raw_msg):
+            if pd.isna(raw_msg) or raw_msg is None:
+                return ""
+            msg_str = str(raw_msg).strip()
+
+            def parse_json(s):
+                try:
+                    data = json.loads(s)
+                    if isinstance(data, str):
+                        try:
+                            return json.loads(data)
+                        except Exception:
+                            return data
+                    return data
+                except Exception:
+                    return None
+
+            def find_text(obj, depth=0):
+                if depth > 10 or obj is None:
+                    return None
+                if isinstance(obj, str) and len(obj) > 2:
+                    return obj
+                if isinstance(obj, dict):
+                    for key in ["text", "body", "title", "message", "content", "caption", "label", "description", "value"]:
+                        if key in obj:
+                            val = obj[key]
+                            if isinstance(val, str) and len(val) > 2:
+                                return val
+                            found = find_text(val, depth + 1)
+                            if found:
+                                return found
+                    if "payload" in obj:
+                        payload = obj["payload"]
+                        if isinstance(payload, str):
+                            pj = parse_json(payload)
+                            if isinstance(pj, (dict, list)):
+                                found = find_text(pj, depth + 1)
+                                if found:
+                                    return found
+                            elif len(payload) > 2:
+                                return payload
+                        else:
+                            found = find_text(payload, depth + 1)
+                            if found:
+                                return found
+                    for v in obj.values():
+                        found = find_text(v, depth + 1)
+                        if found:
+                            return found
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found = find_text(item, depth + 1)
+                        if found:
+                            return found
+                return None
+
+            data = parse_json(msg_str)
+
+            if isinstance(data, dict):
+                for key in ["flows", "quickReply", "postback", "interactive"]:
+                    if key in data:
+                        found = find_text(data[key])
+                        if found:
+                            return found
+                if "template" in data:
+                    tmpl = data["template"]
+                    template_texts = []
+                    if isinstance(tmpl, dict):
+                        components = tmpl.get("components")
+                        if isinstance(components, list):
+                            for comp in components:
+                                if isinstance(comp, dict):
+                                    params = comp.get("parameters")
+                                    if isinstance(params, list):
+                                        for p in params:
+                                            if isinstance(p, dict) and p.get("type") == "text":
+                                                txt = p.get("text")
+                                                if isinstance(txt, str) and txt.strip():
+                                                    template_texts.append(txt.strip())
+                    if template_texts:
+                        main_body = max(template_texts, key=len)
+                        return re.sub(r"\s+", " ", main_body).strip()
+                for key in ["interactive", "postback", "template"]:
+                    if key in data:
+                        found = find_text(data[key])
+                        if found:
+                            return found
+
+            if data is not None:
+                found = find_text(data)
+                if found:
+                    return found
+
+            if isinstance(data, str) and len(data) > 2:
+                return data
+
+            if msg_str.startswith("{") or msg_str.startswith("["):
+                return msg_str
+            return msg_str
+
+        def _dotz_is_audio_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            return (
+                t == "audio"
+                or "audio/" in t
+                or "audio/ogg" in raw_str
+                or ("opus" in raw_str and "audio" in raw_str.lower())
+            )
+
+        def _dotz_is_sticker_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            if t == "sticker":
+                return True
+            if '"sticker"' in raw_str and "image/webp" in raw_str:
+                return True
+            return False
+
+        def _dotz_is_image_message(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
+            if _dotz_is_sticker_message(msg_type, raw_msg):
+                return False
+            if t in ("image", "photo"):
+                return True
+            if "image/" in t or ('"image"' in raw_str and "image/jpeg" in raw_str):
+                return True
+            return False
+
+        skip_idx = set()
+        transcript_for_audio = {}
+        for i in range(len(dotz_recent_messages)):
+            row = dotz_recent_messages.iloc[i]
+            if not _dotz_is_audio_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            for candidate_idx in [i - 1, i + 1]:
+                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = dotz_recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"] or _dotz_is_audio_message(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        transcript_for_audio[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        interpretation_for_image = {}
+        for i in range(len(dotz_recent_messages)):
+            row = dotz_recent_messages.iloc[i]
+            if not _dotz_is_image_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            for candidate_idx in [i - 1, i + 1]:
+                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = dotz_recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"] or _dotz_is_image_message(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
+                        interpretation_for_image[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        description_for_sticker = {}
+
+        def _dotz_is_text_like_for_sticker(msg_type, raw_msg):
+            if pd.isna(msg_type):
+                msg_type = ""
+            t = str(msg_type).strip().lower()
+            raw = "" if pd.isna(raw_msg) else str(raw_msg)
+            if _dotz_is_sticker_message(msg_type, raw_msg) or _dotz_is_audio_message(msg_type, raw_msg) or _dotz_is_image_message(msg_type, raw_msg):
+                return False
+            if "notification" in raw.lower() or '"template"' in raw.lower():
+                return False
+            return t in ("text", "interactive", "quickreply", "postback", "flows", "") or "text" in raw.lower()
+
+        for i in range(len(dotz_recent_messages)):
+            row = dotz_recent_messages.iloc[i]
+            if not _dotz_is_sticker_message(row.get("msg_type"), row.get("raw_message")):
+                continue
+            try:
+                ts_cur = pd.to_datetime(row["timestamp"])
+            except Exception:
+                continue
+            for candidate_idx in [i - 1]:
+                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
+                    continue
+                if candidate_idx in skip_idx:
+                    continue
+                other = dotz_recent_messages.iloc[candidate_idx]
+                if other["sender"] != row["sender"]:
+                    continue
+                if not _dotz_is_text_like_for_sticker(other.get("msg_type"), other.get("raw_message")):
+                    continue
+                try:
+                    ts_other = pd.to_datetime(other["timestamp"])
+                    if 0 <= (ts_cur - ts_other).total_seconds() <= 30:
+                        description_for_sticker[i] = candidate_idx
+                        skip_idx.add(candidate_idx)
+                        break
+                except Exception:
+                    pass
+
+        def _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_tmpl):
+            if is_tmpl:
+                return "template"
+            if is_audio:
+                return "🎧"
+            if is_sticker:
+                return "sticker"
+            if is_image:
+                return "📷"
+            t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
+            return str(t).strip() or "—"
+
+        def _dotz_get_display_text(idx):
+            if idx in skip_idx:
+                return ""
+            row = dotz_recent_messages.iloc[idx]
+            raw = row.get("raw_message")
+            if _dotz_is_audio_message(row.get("msg_type"), raw):
+                if idx in transcript_for_audio:
+                    trans_idx = transcript_for_audio[idx]
+                    prev = dotz_recent_messages.iloc[trans_idx]
+                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Audio]"
+                return "[Audio]"
+            if _dotz_is_sticker_message(row.get("msg_type"), raw):
+                if idx in description_for_sticker:
+                    desc_idx = description_for_sticker[idx]
+                    prev = dotz_recent_messages.iloc[desc_idx]
+                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Sticker]"
+                return "[Sticker]"
+            if _dotz_is_image_message(row.get("msg_type"), raw):
+                if idx in interpretation_for_image:
+                    interp_idx = interpretation_for_image[idx]
+                    prev = dotz_recent_messages.iloc[interp_idx]
+                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Image]"
+                return "[Image]"
+            return _dotz_extract_message_text(raw)
+
+        rows_display = []
+        for i in range(len(dotz_recent_messages)):
+            if i in skip_idx:
+                continue
+            row = dotz_recent_messages.iloc[i]
+            msg_type_val = row.get("msg_type")
+            raw_msg = row.get("raw_message")
+            is_audio = _dotz_is_audio_message(msg_type_val, raw_msg)
+            is_sticker = _dotz_is_sticker_message(msg_type_val, raw_msg)
+            is_image = _dotz_is_image_message(msg_type_val, raw_msg)
+            text = _dotz_get_display_text(i)
+            rows_display.append({
+                "Time": _dotz_format_timestamp_local(row),
+                "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
+                "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
+                "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
+                "Type": _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
+                "Message": text,
+            })
+
+        dotz_display = pd.DataFrame(rows_display)
         st.dataframe(
             dotz_display[["Time", "User", "From", "Status", "Type", "Message"]],
             use_container_width=True,
