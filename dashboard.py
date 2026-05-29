@@ -3513,6 +3513,21 @@ if selected_section == "🎯 Dotz":
     st.markdown("---")
     st.markdown("### 💬 Recent Messages")
 
+    if GoogleTranslator is None:
+        st.caption("ℹ️ Translation unavailable - install `deep-translator` to enable")
+    dotz_translate_recent_messages = st.checkbox(
+        "Translate recent messages to English",
+        value=False,
+        key="dotz_recent_messages_translate",
+        help="Disabled by default because translating every row can slow this tab.",
+    )
+    dotz_wrap_recent_messages = st.checkbox(
+        "Wrap recent messages for screenshots",
+        value=False,
+        key="dotz_recent_messages_wrap",
+        help="Shows the same table with wrapped message text so it fits in screenshots.",
+    )
+
     dotz_time_range = st.selectbox(
         "Filter by time range:",
         ["Last 20 messages", "Last 1 hour", "Last 24 hours"],
@@ -3702,6 +3717,26 @@ if selected_section == "🎯 Dotz":
                 return msg_str
             return msg_str
 
+        if "recent_msg_translations" not in st.session_state:
+            st.session_state.recent_msg_translations = {}
+
+        def _dotz_translate_to_english(text: str) -> str:
+            if not text or text.strip() == "":
+                return ""
+            if GoogleTranslator is None:
+                return "[Translation unavailable - deep_translator not installed]"
+            cache = st.session_state.recent_msg_translations
+            if text in cache:
+                return cache[text]
+            try:
+                text_to_translate = text[:5000] if len(text) > 5000 else text
+                translated = GoogleTranslator(source="auto", target="en").translate(text_to_translate)
+                cache[text] = translated
+                return translated
+            except Exception:
+                cache[text] = text
+                return text
+
         def _dotz_is_audio_message(msg_type, raw_msg):
             if pd.isna(msg_type):
                 msg_type = ""
@@ -3886,22 +3921,27 @@ if selected_section == "🎯 Dotz":
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
                 "Message": text,
+                "Message (EN)": _dotz_translate_to_english(text) if dotz_translate_recent_messages else "",
             })
 
         dotz_display = pd.DataFrame(rows_display)
-        st.dataframe(
-            dotz_display[["Time", "User", "From", "Status", "Type", "Message"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Time": st.column_config.TextColumn(width="small"),
-                "User": st.column_config.TextColumn(width="medium"),
-                "From": st.column_config.TextColumn(width="small"),
-                "Status": st.column_config.TextColumn(width="small"),
-                "Type": st.column_config.TextColumn(width="small"),
-                "Message": st.column_config.TextColumn(width="large"),
-            },
-        )
+        if dotz_wrap_recent_messages:
+            render_wrapped_messages_table(dotz_display)
+        else:
+            st.dataframe(
+                dotz_display[["Time", "User", "From", "Status", "Type", "Message", "Message (EN)"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Time": st.column_config.TextColumn(width="small"),
+                    "User": st.column_config.TextColumn(width="medium"),
+                    "From": st.column_config.TextColumn(width="small"),
+                    "Status": st.column_config.TextColumn(width="small"),
+                    "Type": st.column_config.TextColumn(width="small"),
+                    "Message": st.column_config.TextColumn(width="large"),
+                    "Message (EN)": st.column_config.TextColumn(width="large"),
+                },
+            )
     else:
         st.info("No messages found")
 
