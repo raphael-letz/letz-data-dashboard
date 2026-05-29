@@ -324,6 +324,7 @@ def render_wrapped_messages_table(df: pd.DataFrame) -> None:
     weights = {
         "Time": 1.2,
         "User": 1.8,
+        "Tag": 1.2,
         "From": 1,
         "Status": 1,
         "Type": 0.8,
@@ -2715,6 +2716,7 @@ if selected_section == "📊 Quick Insights":
                 m.type as msg_type,
                 u.full_name as user_name,
                 u.waid as user_waid,
+                u.tags as user_tags,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message,
@@ -2735,6 +2737,7 @@ if selected_section == "📊 Quick Insights":
                 m.type as msg_type,
                 u.full_name as user_name,
                 u.waid as user_waid,
+                u.tags as user_tags,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message,
@@ -2755,6 +2758,7 @@ if selected_section == "📊 Quick Insights":
                 m.type as msg_type,
                 u.full_name as user_name,
                 u.waid as user_waid,
+                u.tags as user_tags,
                 u.timezone as user_timezone,
                 m.sender,
                 m.message as raw_message,
@@ -2961,6 +2965,26 @@ if selected_section == "📊 Quick Insights":
                     return ts.strftime("%b %d, %H:%M") + " UTC"
             except Exception as e:
                 return str(ts)[:16]
+
+        def format_tags(raw_tags):
+            if isinstance(raw_tags, list):
+                tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+                return ", ".join(tags) if tags else "—"
+            if raw_tags is None or pd.isna(raw_tags):
+                return "—"
+            if isinstance(raw_tags, str):
+                raw_str = raw_tags.strip()
+                if not raw_str:
+                    return "—"
+                try:
+                    parsed = json.loads(raw_str)
+                    if isinstance(parsed, list):
+                        tags = [str(t).strip() for t in parsed if str(t).strip()]
+                        return ", ".join(tags) if tags else "—"
+                except Exception:
+                    pass
+                return raw_str
+            return str(raw_tags).strip() or "—"
         
         # Detect audio messages: type='audio' or MIME like audio/ogg; codecs=opus, or message body
         def is_audio_message(msg_type, raw_msg):
@@ -3159,6 +3183,7 @@ if selected_section == "📊 Quick Insights":
             rows_display.append({
                 "Time": format_timestamp_local(row),
                 "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
+                "Tag": format_tags(row.get("user_tags")),
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
@@ -3185,6 +3210,7 @@ if selected_section == "📊 Quick Insights":
                 column_config={
                     "Time": st.column_config.TextColumn(width="small"),
                     "User": st.column_config.TextColumn(width="medium"),
+                    "Tag": st.column_config.TextColumn(width="small"),
                     "From": st.column_config.TextColumn(width="small"),
                     "Status": st.column_config.TextColumn(width="small"),
                     "Type": st.column_config.TextColumn(width="small"),
@@ -3452,7 +3478,8 @@ ORDER BY wb.week_start
 
 # Tab 1b: Dotz
 if selected_section == "🎯 Dotz":
-    exclude_internal = True
+    # Dotz tab should include all Dotz users (including internal test accounts).
+    exclude_internal = False
     st.markdown("---")
 
     try:
@@ -3494,51 +3521,18 @@ if selected_section == "🎯 Dotz":
 
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
 
+    dotz_time_condition = ""
+    dotz_limit_clause = ""
     if dotz_time_range == "Last 20 messages":
-        dotz_recent_query = f"""
-            SELECT
-                m.id AS msg_id,
-                m.sent_at AS timestamp,
-                m.type AS msg_type,
-                u.full_name AS user_name,
-                u.waid AS user_waid,
-                u.timezone AS user_timezone,
-                m.sender,
-                m.message AS raw_message,
-                m.status
-            FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at IS NOT NULL
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
-            ORDER BY m.sent_at DESC
-            LIMIT 20
-        """
+        dotz_limit_clause = "LIMIT 20"
     elif dotz_time_range == "Last 1 hour":
-        dotz_recent_query = f"""
-            SELECT
-                m.id AS msg_id,
-                m.sent_at AS timestamp,
-                m.type AS msg_type,
-                u.full_name AS user_name,
-                u.waid AS user_waid,
-                u.timezone AS user_timezone,
-                m.sender,
-                m.message AS raw_message,
-                m.status
-            FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at IS NOT NULL
-              AND m.sent_at >= NOW() - INTERVAL '1 hour'
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
-            ORDER BY m.sent_at DESC
-        """
+        dotz_time_condition = "AND m.sent_at >= NOW() - INTERVAL '1 hour'"
     else:
-        dotz_recent_query = f"""
-            SELECT
+        dotz_time_condition = "AND m.sent_at >= NOW() - INTERVAL '24 hours'"
+
+    dotz_recent_query = f"""
+        WITH dotz_messages AS (
+            SELECT DISTINCT ON (m.id)
                 m.id AS msg_id,
                 m.sent_at AS timestamp,
                 m.type AS msg_type,
@@ -3549,24 +3543,66 @@ if selected_section == "🎯 Dotz":
                 m.message AS raw_message,
                 m.status
             FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
+            JOIN users u ON (m.user_id = u.id OR m.waid = u.waid)
             WHERE m.sent_at IS NOT NULL
-              AND m.sent_at >= NOW() - INTERVAL '24 hours'
+              {dotz_time_condition}
               {get_user_visible_message_filter_sql("m")}
               {internal_filter_join if exclude_internal and internal_filter_join else ""}
               AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
-            ORDER BY m.sent_at DESC
-        """
+            ORDER BY m.id, u.created_at DESC, m.sent_at DESC
+        )
+        SELECT *
+        FROM dotz_messages
+        ORDER BY timestamp DESC
+        {dotz_limit_clause}
+    """
 
     dotz_recent_messages = run_query(dotz_recent_query)
 
     if not dotz_recent_messages.empty:
         st.caption(f"Showing {len(dotz_recent_messages)} message(s)")
         dotz_display = dotz_recent_messages.copy()
-        dotz_display["Time"] = dotz_display.apply(
-            lambda row: _format_ts_local(row.get("timestamp"), row.get("user_timezone")),
-            axis=1,
-        )
+
+        # Same timestamp conversion pattern as Quick Insights / Deep Dive.
+        def _dotz_parse_timezone(tz_str):
+            if not tz_str or pd.isna(tz_str):
+                return None
+            tz_str = str(tz_str).strip()
+            try:
+                return pytz.timezone(tz_str)
+            except Exception:
+                pass
+            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
+            if match:
+                sign = -1 if match.group(1) == '-' else 1
+                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
+                    sign = -1
+                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
+                    sign = 1
+                hours = int(match.group(2)) * sign
+                minutes = int(match.group(3) or 0)
+                return timezone(timedelta(hours=hours, minutes=minutes))
+            return None
+
+        def _dotz_format_timestamp_local(row):
+            ts = row["timestamp"]
+            tz_str = row.get("user_timezone")
+            if pd.isna(ts):
+                return ""
+            try:
+                if isinstance(ts, str):
+                    ts = pd.to_datetime(ts)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=pytz.UTC)
+                user_tz = _dotz_parse_timezone(tz_str)
+                if user_tz:
+                    ts = ts.astimezone(user_tz)
+                    return ts.strftime("%b %d, %H:%M")
+                return ts.strftime("%b %d, %H:%M") + " UTC"
+            except Exception:
+                return str(ts)[:16]
+
+        dotz_display["Time"] = dotz_display.apply(_dotz_format_timestamp_local, axis=1)
         dotz_display["User"] = dotz_display.apply(
             lambda row: format_display_name(row.get("user_name"), row.get("user_waid")),
             axis=1,
