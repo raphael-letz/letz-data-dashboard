@@ -298,11 +298,24 @@ def load_investor_waids():
         return []
 
 
-def format_display_name(name, waid=None, tag="investor"):
+def format_display_name(name, waid=None, tag="investor", user_id=None):
     """
     Append [investor] tag to name if user's WAID is in special-users.json.
+    When the user has no name, show "Unknown [<user_id>]" if a user_id is available.
     """
-    if pd.isna(name) or name is None or str(name).strip() == "":
+    name_is_empty = (
+        pd.isna(name)
+        or name is None
+        or str(name).strip() == ""
+        or str(name).strip().lower() == "unknown"
+    )
+    if name_is_empty:
+        if user_id is not None and not (isinstance(user_id, float) and pd.isna(user_id)):
+            uid_str = str(user_id).strip()
+            if uid_str.endswith(".0"):
+                uid_str = uid_str[:-2]
+            if uid_str:
+                return f"Unknown [{uid_str}]"
         return "Unknown"
     name_str = str(name).strip()
     investor_waids = load_investor_waids()
@@ -314,9 +327,21 @@ def format_display_name(name, waid=None, tag="investor"):
     return name_str
 
 
-def format_display_name_with_tags(name, waid=None, tags=None):
+def _append_user_id(display_name, user_id):
+    """Append [<user_id>] to a display name. No-op if user_id is missing or already present."""
+    if user_id is None or (isinstance(user_id, float) and pd.isna(user_id)):
+        return display_name
+    uid_str = str(user_id).strip()
+    if uid_str.endswith(".0"):
+        uid_str = uid_str[:-2]
+    if not uid_str or f"[{uid_str}]" in str(display_name):
+        return display_name
+    return f"{display_name} [{uid_str}]"
+
+
+def format_display_name_with_tags(name, waid=None, tags=None, user_id=None):
     """Format display name and append user tags (e.g. [dotz])."""
-    base_name = format_display_name(name, waid)
+    base_name = format_display_name(name, waid, user_id=user_id)
     if tags is None or (isinstance(tags, float) and pd.isna(tags)):
         return base_name
 
@@ -1153,6 +1178,7 @@ WITH internal_waids AS (
 rl_sends AS (
   SELECT
     r.ladder_step,
+    u.id AS user_id,
     u.waid,
     COALESCE(u.full_name, 'Unknown') AS full_name,
     u.tags,
@@ -1173,7 +1199,7 @@ SELECT * FROM rl_sends
 ORDER BY ladder_step DESC, sent_at DESC;
 """
     df = run_query(query)
-    empty = pd.DataFrame(columns=["ladder_step", "waid", "full_name", "tags", "sent_at", "reactivated"])
+    empty = pd.DataFrame(columns=["ladder_step", "user_id", "waid", "full_name", "tags", "sent_at", "reactivated"])
     if df.empty:
         return empty.copy(), empty.copy(), empty.copy()
     rl2 = df[df["ladder_step"] == "recovery_ladder_2"].copy()
@@ -1219,6 +1245,7 @@ recent_inbound AS (
   GROUP BY u.id
 )
 SELECT
+  u.id AS user_id,
   u.waid,
   COALESCE(u.full_name, 'Unknown') AS full_name,
   u.tags,
@@ -2519,14 +2546,14 @@ if selected_section == "📊 Quick Insights":
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("All users", all_users_count if all_users_count else "—")
     col1.caption("Users who ever messaged")
-    col2.metric("Beta users", beta_users_count if beta_users_count else "—")
+    col2.metric("Onboarded users", beta_users_count if beta_users_count else "—")
     col2.caption("Users who have a plan")
     col3.metric("Alive users", alive_count if alive_count is not None else "—")
-    col3.caption(f"↳ {alive_pct}% of beta users")
+    col3.caption(f"↳ {alive_pct}% of onboarded users")
     col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
-    col4.caption(f"↳ {new_7d_pct}% of beta users")
+    col4.caption(f"↳ {new_7d_pct}% of onboarded users")
     col5.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
-    col5.caption(f"↳ {churned_7d_pct}% of beta users · {churned_7d_came_back} came back")
+    col5.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
 
     c4, c5, c6 = st.columns(3)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
@@ -2540,9 +2567,10 @@ if selected_section == "📊 Quick Insights":
     try:
         new_today_list = run_query(f"""
             {beta_users_cte}
-            SELECT COALESCE(full_name, 'Unknown') AS name, waid, tags, is_beta
+            SELECT id, COALESCE(full_name, 'Unknown') AS name, waid, tags, is_beta
             FROM (
                 SELECT DISTINCT ON (u.waid)
+                    u.id,
                     u.full_name,
                     u.waid,
                     u.tags,
@@ -2573,19 +2601,19 @@ if selected_section == "📊 Quick Insights":
                 beta_new_users = new_today_list[new_today_list["is_beta"] == True]
                 pre_plan_new_users = new_today_list[new_today_list["is_beta"] != True]
 
-                st.markdown(f"**Beta users with a plan** ({len(beta_new_users)})")
+                st.markdown(f"**Onboarded users with a plan** ({len(beta_new_users)})")
                 if beta_new_users.empty:
                     st.caption("No users")
                 else:
                     for _, row in beta_new_users.iterrows():
-                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'))}")
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
 
                 st.markdown(f"**Messaging coach, no plan yet** ({len(pre_plan_new_users)})")
                 if pre_plan_new_users.empty:
                     st.caption("No users")
                 else:
                     for _, row in pre_plan_new_users.iterrows():
-                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'))}")
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
     except:
         st.warning("Could not load new users (past 7d) list")
     
@@ -2606,6 +2634,7 @@ if selected_section == "📊 Quick Insights":
                 ORDER BY rl.user_id, rl.sent_at DESC
             )
             SELECT
+                u.id AS user_id,
                 COALESCE(u.full_name, 'Unknown') AS name,
                 u.waid AS phone,
                 u.tags,
@@ -2638,22 +2667,20 @@ if selected_section == "📊 Quick Insights":
                     st.caption("No users")
                 else:
                     for _, row in still_inactive_df.iterrows():
-                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'))
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
                         phone = row.get('phone', '—')
-                        onb_week = row.get('onboarding_week') or '—'
                         active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 📅 {onb_week} · 🏃 {active_days_val} active days")
+                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
 
                 st.markdown("**Came back after farewell**")
                 if came_back_df.empty:
                     st.caption("No users")
                 else:
                     for _, row in came_back_df.iterrows():
-                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'))
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
                         phone = row.get('phone', '—')
-                        onb_week = row.get('onboarding_week') or '—'
                         active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 📅 {onb_week} · 🏃 {active_days_val} active days")
+                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
     except Exception as e:
         st.warning(f"Could not load inactive users list: {e}")
 
@@ -2672,7 +2699,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in farewell_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
 
             st.markdown("**Recovery Ladder 2** (penultimate step)")
             if rl2_df.empty:
@@ -2681,7 +2708,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in rl2_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
 
             st.markdown("**Recovery Ladder 1**")
             if rl1_df.empty:
@@ -2690,7 +2717,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in rl1_df.iterrows():
                     sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
                     reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — {sent_at_sp}{reactivated_badge}")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
@@ -2706,7 +2733,7 @@ if selected_section == "📊 Quick Insights":
                 for _, row in reactivated_df.iterrows():
                     last_msg_sp = _format_ts_local(row["last_message_at"], sp_tz)
                     farewell_sp = _format_ts_local(row["farewell_at"], sp_tz)
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
     except Exception as e:
         st.warning(f"Could not load Reactivated Users: {e}")
 
@@ -2748,6 +2775,7 @@ if selected_section == "📊 Quick Insights":
                 m.id as msg_id,
                 m.sent_at as timestamp,
                 m.type as msg_type,
+                COALESCE(u.id, m.user_id) as user_id,
                 u.full_name as user_name,
                 u.waid as user_waid,
                 u.tags as user_tags,
@@ -2769,6 +2797,7 @@ if selected_section == "📊 Quick Insights":
                 m.id as msg_id,
                 m.sent_at as timestamp,
                 m.type as msg_type,
+                COALESCE(u.id, m.user_id) as user_id,
                 u.full_name as user_name,
                 u.waid as user_waid,
                 u.tags as user_tags,
@@ -2790,6 +2819,7 @@ if selected_section == "📊 Quick Insights":
                 m.id as msg_id,
                 m.sent_at as timestamp,
                 m.type as msg_type,
+                COALESCE(u.id, m.user_id) as user_id,
                 u.full_name as user_name,
                 u.waid as user_waid,
                 u.tags as user_tags,
@@ -3216,7 +3246,7 @@ if selected_section == "📊 Quick Insights":
             text = get_display_text(i)
             rows_display.append({
                 "Time": format_timestamp_local(row),
-                "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
+                "User": format_display_name(row.get("user_name"), row.get("user_waid"), user_id=row.get("user_id")),
                 "Tag": format_tags(row.get("user_tags")),
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
@@ -3402,7 +3432,7 @@ ORDER BY wb.week_start
                 .properties(height=280)
             )
             st.altair_chart(_churn_chart, use_container_width=True)
-            st.caption("Churn = beta users who received a farewell message that week / active beta users at week start. Weeks start Monday (America/Sao_Paulo).")
+            st.caption("Churn = onboarded users who received a farewell message that week / active onboarded users at week start. Weeks start Monday (America/Sao_Paulo).")
         else:
             st.info("No churn data available for the last 12 weeks.")
     except Exception as e:
@@ -3585,6 +3615,7 @@ if selected_section == "🎯 Dotz":
                 m.id AS msg_id,
                 m.sent_at AS timestamp,
                 m.type AS msg_type,
+                u.id AS user_id,
                 u.full_name AS user_name,
                 u.waid AS user_waid,
                 u.timezone AS user_timezone,
@@ -3950,7 +3981,7 @@ if selected_section == "🎯 Dotz":
             text = _dotz_get_display_text(i)
             rows_display.append({
                 "Time": _dotz_format_timestamp_local(row),
-                "User": format_display_name(row["user_name"], row.get("user_waid")) if pd.notna(row["user_name"]) else "Unknown",
+                "User": format_display_name(row.get("user_name"), row.get("user_waid"), user_id=row.get("user_id")),
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
@@ -4004,7 +4035,7 @@ if selected_section == "🔍 User Deep Dive":
 
         users_df["label"] = users_df.apply(
             lambda r: (
-                f"{format_display_name(r['full_name'], r['waid'])}"
+                f"{format_display_name(r['full_name'], r['waid'], user_id=r.get('id'))}"
                 f"{' [DOTZ]' if r.get('is_dotz') else ''}"
                 f"{' *' if r.get('is_active_24h') else ''} ({r['waid']})"
             ),
@@ -5970,7 +6001,7 @@ if selected_section == "🔔 Alerts":
             .copy()
             .assign(
                 display_name=lambda d: d.apply(
-                    lambda r: format_display_name(r["full_name"], r["waid"]), axis=1
+                    lambda r: _append_user_id(format_display_name(r["full_name"], r["waid"]), r.get("user_id")), axis=1
                 )
             )
             .drop_duplicates(subset=["time_morning", "waid"])
@@ -5992,7 +6023,7 @@ if selected_section == "🔔 Alerts":
             .copy()
             .assign(
                 display_name=lambda d: d.apply(
-                    lambda r: format_display_name(r["full_name"], r["waid"]), axis=1
+                    lambda r: _append_user_id(format_display_name(r["full_name"], r["waid"]), r.get("user_id")), axis=1
                 )
             )
             .drop_duplicates(subset=["time_evening", "waid"])
