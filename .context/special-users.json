@@ -10,6 +10,6 @@
     "5511982884555",
     "491732089223"
   ],
-  "last_updated": "2026-06-03",
-  "notes": "Investors trying the product. Flag with [investor] tag in dashboard. Identified by WAID from database."
+  "last_updated": "2026-06-05",
+  "notes": "Canonical source for investor WAIDs. Flag with [investor] tag in dashboard and daily summary (Query 7). When this list changes, also update special_waids in analysis/daily summary/dotz-surge-daily-queries.sql."
 }
