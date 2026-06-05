@@ -298,6 +298,55 @@ def load_investor_waids():
         return []
 
 
+def _normalize_waid(waid):
+    """Return a clean WAID string, or empty if missing/invalid."""
+    if waid is None or (isinstance(waid, float) and pd.isna(waid)):
+        return ""
+    waid_str = str(waid).strip()
+    if not waid_str or waid_str.lower() in ("nan", "none"):
+        return ""
+    if waid_str.endswith(".0"):
+        waid_str = waid_str[:-2]
+    return waid_str
+
+
+def is_investor_waid(waid):
+    waid_str = _normalize_waid(waid)
+    if not waid_str:
+        return False
+    return waid_str in load_investor_waids()
+
+
+def parse_db_user_tags(raw_tags):
+    """Parse users.tags into a list of tag strings."""
+    if isinstance(raw_tags, list):
+        return [str(t).strip() for t in raw_tags if str(t).strip()]
+    if raw_tags is None or (isinstance(raw_tags, float) and pd.isna(raw_tags)):
+        return []
+    if isinstance(raw_tags, str):
+        raw_str = raw_tags.strip()
+        if not raw_str:
+            return []
+        try:
+            parsed = json.loads(raw_str)
+            if isinstance(parsed, list):
+                return [str(t).strip() for t in parsed if str(t).strip()]
+        except Exception:
+            pass
+        return [raw_str]
+    tag_str = str(raw_tags).strip()
+    return [tag_str] if tag_str else []
+
+
+def format_user_tags_column(raw_tags, waid=None):
+    """Combine investor flag and database user tags for table display."""
+    tags = []
+    if is_investor_waid(waid):
+        tags.append("investor")
+    tags.extend(parse_db_user_tags(raw_tags))
+    return ", ".join(tags) if tags else "—"
+
+
 def format_display_name(name, waid=None, tag="investor", user_id=None):
     """
     Append [investor] tag to name if user's WAID is in special-users.json.
@@ -310,21 +359,22 @@ def format_display_name(name, waid=None, tag="investor", user_id=None):
         or str(name).strip().lower() == "unknown"
     )
     if name_is_empty:
+        base_name = "Unknown"
         if user_id is not None and not (isinstance(user_id, float) and pd.isna(user_id)):
             uid_str = str(user_id).strip()
             if uid_str.endswith(".0"):
                 uid_str = uid_str[:-2]
             if uid_str:
-                return f"Unknown [{uid_str}]"
-        return "Unknown"
-    name_str = str(name).strip()
-    investor_waids = load_investor_waids()
-    if not investor_waids or not waid:
-        return name_str
-    waid_str = str(waid).strip() if waid is not None else ""
-    if waid_str and waid_str in investor_waids:
-        return f"{name_str} [{tag}]"
-    return name_str
+                base_name = f"Unknown [{uid_str}]"
+    else:
+        base_name = str(name).strip()
+
+    waid_str = _normalize_waid(waid)
+    if not waid_str:
+        return base_name
+    if waid_str in load_investor_waids():
+        return f"{base_name} [{tag}]"
+    return base_name
 
 
 def _append_user_id(display_name, user_id):
@@ -2769,71 +2819,84 @@ if selected_section == "📊 Quick Insights":
     # Note: Using CURRENT_TIMESTAMP for timezone-aware comparison
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
     
-    if time_range == "Last 20 messages":
-        query = f"""
-            SELECT 
-                m.id as msg_id,
-                m.sent_at as timestamp,
-                m.type as msg_type,
+    recent_messages_user_select = """
                 COALESCE(u.id, m.user_id) as user_id,
                 u.full_name as user_name,
-                u.waid as user_waid,
+                COALESCE(u.waid, m.waid) as user_waid,
                 u.tags as user_tags,
-                u.timezone as user_timezone,
-                m.sender,
-                m.message as raw_message,
-                m.status
+                u.timezone as user_timezone"""
+
+    recent_messages_base_from = f"""
             FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
+            LEFT JOIN users u ON (m.user_id = u.id OR m.waid = u.waid)
             WHERE m.sent_at IS NOT NULL
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-            ORDER BY m.sent_at DESC
+              {{time_filter}}
+              {{message_filter}}
+              {{internal_filter}}"""
+
+    if time_range == "Last 20 messages":
+        query = f"""
+            SELECT *
+            FROM (
+                SELECT DISTINCT ON (m.id)
+                    m.id as msg_id,
+                    m.sent_at as timestamp,
+                    m.type as msg_type,
+                    {recent_messages_user_select},
+                    m.sender,
+                    m.message as raw_message,
+                    m.status
+                {recent_messages_base_from.format(
+                    time_filter="",
+                    message_filter=get_user_visible_message_filter_sql("m"),
+                    internal_filter=internal_filter_join if exclude_internal and internal_filter_join else "",
+                )}
+                ORDER BY m.id, u.created_at DESC NULLS LAST
+            ) recent_messages_deduped
+            ORDER BY timestamp DESC
             LIMIT 20
         """
     elif time_range == "Last 1 hour":
         query = f"""
-            SELECT 
-                m.id as msg_id,
-                m.sent_at as timestamp,
-                m.type as msg_type,
-                COALESCE(u.id, m.user_id) as user_id,
-                u.full_name as user_name,
-                u.waid as user_waid,
-                u.tags as user_tags,
-                u.timezone as user_timezone,
-                m.sender,
-                m.message as raw_message,
-                m.status
-            FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at IS NOT NULL
-              AND m.sent_at >= NOW() - INTERVAL '1 hour'
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-            ORDER BY m.sent_at DESC
+            SELECT *
+            FROM (
+                SELECT DISTINCT ON (m.id)
+                    m.id as msg_id,
+                    m.sent_at as timestamp,
+                    m.type as msg_type,
+                    {recent_messages_user_select},
+                    m.sender,
+                    m.message as raw_message,
+                    m.status
+                {recent_messages_base_from.format(
+                    time_filter="AND m.sent_at >= NOW() - INTERVAL '1 hour'",
+                    message_filter=get_user_visible_message_filter_sql("m"),
+                    internal_filter=internal_filter_join if exclude_internal and internal_filter_join else "",
+                )}
+                ORDER BY m.id, u.created_at DESC NULLS LAST
+            ) recent_messages_deduped
+            ORDER BY timestamp DESC
         """
     else:  # Last 24 hours
         query = f"""
-            SELECT 
-                m.id as msg_id,
-                m.sent_at as timestamp,
-                m.type as msg_type,
-                COALESCE(u.id, m.user_id) as user_id,
-                u.full_name as user_name,
-                u.waid as user_waid,
-                u.tags as user_tags,
-                u.timezone as user_timezone,
-                m.sender,
-                m.message as raw_message,
-                m.status
-            FROM messages m
-            LEFT JOIN users u ON m.user_id = u.id
-            WHERE m.sent_at IS NOT NULL
-              AND m.sent_at >= NOW() - INTERVAL '24 hours'
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-            ORDER BY m.sent_at DESC
+            SELECT *
+            FROM (
+                SELECT DISTINCT ON (m.id)
+                    m.id as msg_id,
+                    m.sent_at as timestamp,
+                    m.type as msg_type,
+                    {recent_messages_user_select},
+                    m.sender,
+                    m.message as raw_message,
+                    m.status
+                {recent_messages_base_from.format(
+                    time_filter="AND m.sent_at >= NOW() - INTERVAL '24 hours'",
+                    message_filter=get_user_visible_message_filter_sql("m"),
+                    internal_filter=internal_filter_join if exclude_internal and internal_filter_join else "",
+                )}
+                ORDER BY m.id, u.created_at DESC NULLS LAST
+            ) recent_messages_deduped
+            ORDER BY timestamp DESC
         """
     
     recent_messages = run_query(query)
@@ -3247,7 +3310,7 @@ if selected_section == "📊 Quick Insights":
             rows_display.append({
                 "Time": format_timestamp_local(row),
                 "User": format_display_name(row.get("user_name"), row.get("user_waid"), user_id=row.get("user_id")),
-                "Tag": format_tags(row.get("user_tags")),
+                "Tag": format_user_tags_column(row.get("user_tags"), row.get("user_waid")),
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
                 "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
@@ -5479,16 +5542,16 @@ SELECT user_id, full_name, waid, lifetime, active_days, activities_completed FRO
                 if not overview_df.empty:
                     established = overview_df[overview_df['lifetime'] >= 7].copy()
                     new_users = overview_df[overview_df['lifetime'] < 7].copy()
-                    most_active = established.sort_values('activities_completed', ascending=False)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_active['full_name'] = most_active.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    most_active = established.sort_values('activities_completed', ascending=False)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_active['full_name'] = most_active.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
                     most_active = most_active[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     most_active.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    most_inactive = established.sort_values('activities_completed', ascending=True)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_inactive['full_name'] = most_inactive.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    most_inactive = established.sort_values('activities_completed', ascending=True)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    most_inactive['full_name'] = most_inactive.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
                     most_inactive = most_inactive[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     most_inactive.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    new_users_display['full_name'] = new_users_display.apply(lambda r: format_display_name(r['full_name'], r['waid']), axis=1)
+                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
+                    new_users_display['full_name'] = new_users_display.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
                     new_users_display = new_users_display[['full_name', 'activities_completed', 'active_days', 'lifetime']]
                     new_users_display.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
                     st.markdown("#### Quick overview")
@@ -6001,7 +6064,7 @@ if selected_section == "🔔 Alerts":
             .copy()
             .assign(
                 display_name=lambda d: d.apply(
-                    lambda r: _append_user_id(format_display_name(r["full_name"], r["waid"]), r.get("user_id")), axis=1
+                    lambda r: format_display_name(r["full_name"], r["waid"], user_id=r.get("user_id")), axis=1
                 )
             )
             .drop_duplicates(subset=["time_morning", "waid"])
@@ -6023,7 +6086,7 @@ if selected_section == "🔔 Alerts":
             .copy()
             .assign(
                 display_name=lambda d: d.apply(
-                    lambda r: _append_user_id(format_display_name(r["full_name"], r["waid"]), r.get("user_id")), axis=1
+                    lambda r: format_display_name(r["full_name"], r["waid"], user_id=r.get("user_id")), axis=1
                 )
             )
             .drop_duplicates(subset=["time_evening", "waid"])
