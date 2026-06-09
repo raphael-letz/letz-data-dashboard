@@ -617,7 +617,7 @@ def get_quick_insights_headline_metrics(exclude_internal: bool = True) -> pd.Dat
     query = f"""
 {onboarded_users_cte},
 filtered_onboarded_users AS (
-    SELECT DISTINCT u.id, u.waid, u.is_active, u.created_at
+    SELECT DISTINCT u.id, u.waid, u.is_active, u.created_at, COALESCE(u.active_days, 0)::int AS active_days
     FROM onboarded_users ou
     JOIN users u ON u.id = ou.id
     WHERE 1 = 1
@@ -688,6 +688,35 @@ active_users_5d AS (
           AND uah.completed_at IS NOT NULL
           AND uah.completed_at >= NOW() - INTERVAL '5 days'
       )
+),
+active_days_alive AS (
+    SELECT
+        ROUND(AVG(fou.active_days), 1) AS avg_active_days,
+        SUM(fou.active_days) AS total_active_days
+    FROM filtered_onboarded_users fou
+    WHERE fou.is_active = true
+),
+active_days_at_risk AS (
+    SELECT
+        ROUND(AVG(fou.active_days), 1) AS avg_active_days,
+        SUM(fou.active_days) AS total_active_days
+    FROM filtered_onboarded_users fou
+    WHERE fou.is_active = true
+      AND NOT EXISTS (
+        SELECT 1
+        FROM messages m
+        WHERE m.sender = 'user'
+          AND (m.user_id = fou.id OR m.waid = fou.waid)
+          AND m.sent_at >= NOW() - INTERVAL '5 days'
+      )
+),
+active_days_churned AS (
+    SELECT
+        ROUND(AVG(fou.active_days), 1) AS avg_active_days,
+        SUM(fou.active_days) AS total_active_days
+    FROM churn_status cs
+    JOIN filtered_onboarded_users fou ON fou.id = cs.user_id
+    WHERE NOT cs.came_back
 )
 SELECT
     (SELECT COUNT(DISTINCT waid) FROM filtered_onboarded_users) AS onboarded_users_count,
@@ -699,7 +728,13 @@ SELECT
     COALESCE((SELECT messaged_today FROM recent_user_messages), 0) AS messaged_today,
     COALESCE((SELECT completed_today FROM completed_today), 0) AS completed_today,
     COALESCE((SELECT at_risk_5d_count FROM at_risk_5d), 0) AS at_risk_5d_count,
-    COALESCE((SELECT active_users_5d_count FROM active_users_5d), 0) AS active_users_5d_count
+    COALESCE((SELECT active_users_5d_count FROM active_users_5d), 0) AS active_users_5d_count,
+    COALESCE((SELECT avg_active_days FROM active_days_alive), 0) AS alive_avg_active_days,
+    COALESCE((SELECT total_active_days FROM active_days_alive), 0) AS alive_total_active_days,
+    COALESCE((SELECT avg_active_days FROM active_days_at_risk), 0) AS at_risk_avg_active_days,
+    COALESCE((SELECT total_active_days FROM active_days_at_risk), 0) AS at_risk_total_active_days,
+    COALESCE((SELECT avg_active_days FROM active_days_churned), 0) AS churned_avg_active_days,
+    COALESCE((SELECT total_active_days FROM active_days_churned), 0) AS churned_total_active_days
 """
     return run_query(query)
 
@@ -3020,9 +3055,18 @@ if selected_section == "📊 Quick Insights":
         completed_today = int(headline.get("completed_today", 0))
         at_risk_5d_count = int(headline.get("at_risk_5d_count", 0))
         active_users_5d_count = int(headline.get("active_users_5d_count", 0))
+        alive_avg_active_days = float(headline.get("alive_avg_active_days", 0) or 0)
+        alive_total_active_days = int(headline.get("alive_total_active_days", 0) or 0)
+        at_risk_avg_active_days = float(headline.get("at_risk_avg_active_days", 0) or 0)
+        at_risk_total_active_days = int(headline.get("at_risk_total_active_days", 0) or 0)
+        churned_avg_active_days = float(headline.get("churned_avg_active_days", 0) or 0)
+        churned_total_active_days = int(headline.get("churned_total_active_days", 0) or 0)
     except Exception:
         onboarded_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
         inside_24h = messaged_today = completed_today = at_risk_5d_count = active_users_5d_count = 0
+        alive_avg_active_days = alive_total_active_days = 0
+        at_risk_avg_active_days = at_risk_total_active_days = 0
+        churned_avg_active_days = churned_total_active_days = 0
 
     alive_pct = round(100 * alive_count / onboarded_users_count, 1) if onboarded_users_count else 0
     new_7d_pct = round(100 * new_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
@@ -3041,9 +3085,9 @@ if selected_section == "📊 Quick Insights":
     col3.metric("Alive users", alive_count if alive_count is not None else "—")
     col3.caption(f"↳ {alive_pct}% of onboarded users")
     col4.metric("Active users", active_users_5d_count if active_users_5d_count is not None else "—")
-    col4.caption(f"↳ {active_users_5d_pct}% of onboarded · activity in 5d")
+    col4.caption(f"Activity in past 5d · ↳ {active_users_5d_pct}% of onboarded")
     col5.metric("At risk users", at_risk_5d_count if at_risk_5d_count is not None else "—")
-    col5.caption(f"↳ {at_risk_5d_pct}% of onboarded users")
+    col5.caption(f"No message in past 5d · ↳ {at_risk_5d_pct}% of onboarded")
 
     c4, c5, c6, c7 = st.columns(4)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
@@ -3054,6 +3098,14 @@ if selected_section == "📊 Quick Insights":
     c6.caption(f"↳ {completed_today} users")
     c7.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
     c7.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Active Days — Alive", f"{alive_avg_active_days:.1f} avg")
+    d1.caption(f"↳ {alive_total_active_days} total active days across alive users")
+    d2.metric("Active Days — At Risk", f"{at_risk_avg_active_days:.1f} avg")
+    d2.caption(f"↳ {at_risk_total_active_days} total active days across at-risk users")
+    d3.metric("Active Days — Churned (7d)", f"{churned_avg_active_days:.1f} avg")
+    d3.caption(f"↳ {churned_total_active_days} total active days across churned users")
 
     # Expandable simple lists for key metrics
     try:
