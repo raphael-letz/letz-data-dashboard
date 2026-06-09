@@ -1330,13 +1330,12 @@ def get_at_risk_users_detail() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     Returns (silent_df, reengaged_df):
 
-    silent_df — active onboarded users with no inbound message in ≥5 days. Includes
-    their most recent recovery-ladder send since last user message (if any) and whether
-    they replied after that send.
+    silent_df — active onboarded users with no inbound message in ≥5 days, sorted by
+    last message date. Includes whether they received a recovery-ladder send since their
+    last user message.
 
     reengaged_df — active onboarded users who were silent ≥5 days when a recovery-ladder
-    send went out, replied, and have messaged again within the last 5 days (no longer
-    in the silent ≥5d pool).
+    send went out and replied within the last 7 days.
 
     Recovery-ladder rungs: day_{N}_recovery, day_{N}_random_fun_image, farewell, plus
     legacy recovery_ladder_1/2. Excludes internal users.
@@ -1357,7 +1356,13 @@ internal_waids AS (
   SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
 ),
 filtered_onboarded AS (
-  SELECT DISTINCT u.id, u.waid, u.is_active, COALESCE(u.full_name, 'Unknown') AS full_name, u.tags
+  SELECT DISTINCT
+    u.id,
+    u.waid,
+    u.is_active,
+    COALESCE(u.full_name, 'Unknown') AS full_name,
+    u.tags,
+    COALESCE(u.active_days, 0)::int AS active_days
   FROM onboarded_users ou
   JOIN users u ON u.id = ou.id
   WHERE 1 = 1
@@ -1374,7 +1379,7 @@ user_last_msg AS (
   GROUP BY fou.id
 ),
 silent_users AS (
-  SELECT fou.id AS user_id, fou.waid, fou.full_name, fou.tags, ulm.last_msg_at
+  SELECT fou.id AS user_id, fou.waid, fou.full_name, fou.tags, fou.active_days, ulm.last_msg_at
   FROM filtered_onboarded fou
   JOIN user_last_msg ulm ON ulm.user_id = fou.id
   WHERE fou.is_active = true
@@ -1383,14 +1388,7 @@ silent_users AS (
 latest_recovery AS (
   SELECT DISTINCT ON (su.user_id)
     su.user_id,
-    r.ladder_step AS recovery_ladder_step,
-    r.sent_at AS recovery_sent_at,
-    EXISTS (
-      SELECT 1 FROM messages m
-      WHERE m.sender = 'user'
-        AND (m.user_id = su.user_id OR m.waid = su.waid)
-        AND m.sent_at > r.sent_at
-    ) AS replied_after_recovery
+    true AS received_recovery_ladder
   FROM silent_users su
   JOIN recovery_logs r ON r.user_id = su.user_id
   WHERE {recovery_rung_filter}
@@ -1403,11 +1401,13 @@ silent_rows AS (
     su.waid,
     su.full_name,
     su.tags,
+    su.active_days,
     su.last_msg_at,
-    lr.recovery_ladder_step,
-    lr.recovery_sent_at,
-    COALESCE(lr.replied_after_recovery, false) AS replied_after_recovery,
-    NULL::timestamptz AS reengaged_reply_at
+    NULL::varchar AS recovery_ladder_step,
+    NULL::timestamptz AS recovery_sent_at,
+    false AS replied_after_recovery,
+    NULL::timestamptz AS reengaged_reply_at,
+    COALESCE(lr.received_recovery_ladder, false) AS received_recovery_ladder
   FROM silent_users su
   LEFT JOIN latest_recovery lr ON lr.user_id = su.user_id
 ),
@@ -1417,11 +1417,13 @@ reengaged_rows AS (
     fou.waid,
     fou.full_name,
     fou.tags,
+    fou.active_days,
     ulm.last_msg_at,
     r.ladder_step AS recovery_ladder_step,
     r.sent_at AS recovery_sent_at,
     true AS replied_after_recovery,
-    fr.first_reply_at AS reengaged_reply_at
+    fr.first_reply_at AS reengaged_reply_at,
+    true AS received_recovery_ladder
   FROM filtered_onboarded fou
   JOIN user_last_msg ulm ON ulm.user_id = fou.id
   JOIN recovery_logs r ON r.user_id = fou.id
@@ -1441,8 +1443,7 @@ reengaged_rows AS (
   ) lmb
   WHERE fou.is_active = true
     AND {recovery_rung_filter}
-    AND ulm.last_msg_at >= NOW() - INTERVAL '5 days'
-    AND fr.first_reply_at IS NOT NULL
+    AND fr.first_reply_at >= NOW() - INTERVAL '7 days'
     AND (
       lmb.last_msg_before_recovery IS NULL
       OR lmb.last_msg_before_recovery < r.sent_at - INTERVAL '5 days'
@@ -1455,10 +1456,12 @@ SELECT 'reengaged' AS row_type, * FROM reengaged_rows;
 """
     df = run_query(query)
     silent_cols = [
-        "user_id", "waid", "full_name", "tags", "last_msg_at",
-        "recovery_ladder_step", "recovery_sent_at", "replied_after_recovery",
+        "user_id", "waid", "full_name", "tags", "active_days", "last_msg_at", "received_recovery_ladder",
     ]
-    reengaged_cols = silent_cols + ["reengaged_reply_at"]
+    reengaged_cols = [
+        "user_id", "waid", "full_name", "tags", "active_days", "last_msg_at",
+        "recovery_ladder_step", "recovery_sent_at", "reengaged_reply_at",
+    ]
     empty_silent = pd.DataFrame(columns=silent_cols)
     empty_reengaged = pd.DataFrame(columns=reengaged_cols)
     if df.empty:
@@ -1466,11 +1469,7 @@ SELECT 'reengaged' AS row_type, * FROM reengaged_rows;
 
     silent_df = (
         df[df["row_type"] == "silent"][silent_cols]
-        .sort_values(
-            by=["recovery_ladder_step", "recovery_sent_at"],
-            ascending=[False, False],
-            na_position="last",
-        )
+        .sort_values(by="last_msg_at", ascending=True, na_position="first")
         .reset_index(drop=True)
     )
     reengaged_df = (
@@ -3191,17 +3190,15 @@ if selected_section == "📊 Quick Insights":
                     name = format_display_name_with_tags(
                         row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
                     )
+                    active_days_val = row.get("active_days", "—")
                     if pd.notna(row.get("last_msg_at")):
                         last_msg_sp = _format_ts_local(row["last_msg_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
                         line = f"{name} — last message {last_msg_sp}"
                     else:
                         line = f"{name} — never messaged"
-                    if pd.notna(row.get("recovery_ladder_step")):
-                        rung_label = _label_ladder_step(row["recovery_ladder_step"])
-                        recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                        line += f" · 🪜 {rung_label} ({recovery_sp})"
-                    if row.get("replied_after_recovery"):
-                        line += " ✅ replied"
+                    line += f" · 🏃 {active_days_val} active days"
+                    if row.get("received_recovery_ladder"):
+                        line += " 🪜"
                     st.caption(f"• {line}")
 
             st.markdown(f"**Re-engaged after recovery** ({len(reengaged_at_risk_df)})")
@@ -3212,10 +3209,13 @@ if selected_section == "📊 Quick Insights":
                     name = format_display_name_with_tags(
                         row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
                     )
+                    active_days_val = row.get("active_days", "—")
                     rung_label = _label_ladder_step(row.get("recovery_ladder_step"))
                     recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
                     reply_sp = _format_ts_local(row["reengaged_reply_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                    st.caption(f"• {name} — 🪜 {rung_label} ({recovery_sp}) · ✅ replied {reply_sp}")
+                    st.caption(
+                        f"• {name} · 🏃 {active_days_val} active days — 🪜 {rung_label} ({recovery_sp}) · ✅ replied {reply_sp}"
+                    )
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
