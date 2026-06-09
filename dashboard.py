@@ -1172,11 +1172,17 @@ ORDER BY n.last_sent_at ASC;
 
 
 @st.cache_data(ttl=300)
-def get_recovery_ladder_2_alert_detail() -> pd.DataFrame:
+def get_late_stage_recovery_alert_detail() -> pd.DataFrame:
     """
-    Users on penultimate recovery ladder step (recovery_ladder_2) who received a template
+    Users in late-stage recovery (about to churn / just churned) who received a send
     on today, yesterday, or day_before (America/Sao_Paulo). One row per (user, period).
     Excludes internal users.
+
+    Late-stage rungs (new day_* scheme + legacy + farewell):
+      - day_5_recovery    — ≤3 cohort, final recovery message before farewell
+      - day_20_recovery   — >3 cohort, final recovery push (was lose_score)
+      - recovery_ladder_2 — legacy penultimate step (kept during rollout)
+      - farewell          — marked inactive
     """
     internal_waids = load_internal_users()
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
@@ -1197,12 +1203,13 @@ SELECT
   u.waid,
   COALESCE(u.full_name, '—') AS full_name,
   r.sent_at,
+  r.ladder_step,
   COALESCE(r.template_name, 'Unknown') AS template_name,
   COALESCE(NULLIF(TRIM(u.timezone), ''), 'UTC') AS user_timezone
 FROM recovery_logs r
 JOIN users u ON u.id = r.user_id
 CROSS JOIN ref_dates rd
-WHERE r.ladder_step = 'recovery_ladder_2'
+WHERE r.ladder_step IN ('day_5_recovery', 'day_20_recovery', 'recovery_ladder_2', 'farewell')
   AND (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = rd.ref_date
   AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
 ORDER BY rd.ref_date DESC, r.sent_at DESC;
@@ -1210,13 +1217,85 @@ ORDER BY rd.ref_date DESC, r.sent_at DESC;
     return run_query(query)
 
 
+# Recovery-ladder rungs under the new day_{N}_* scheme (rolled out 2026-06).
+# Maps each ladder_step to its cohort and a human-readable label. The day number
+# uniquely identifies the cohort because recovery / fun-image days never collide
+# across cohorts (see the recovery ladder diagram).
+AT_RISK_COHORT_LE3 = "≤3 active days"
+AT_RISK_COHORT_GT3 = ">3 active days"
+AT_RISK_RUNG_SPEC = {
+    # ≤3 active-days cohort
+    "day_2_recovery": (AT_RISK_COHORT_LE3, "Recovery Ladder 1"),
+    "day_3_random_fun_image": (AT_RISK_COHORT_LE3, "Random fun image"),
+    "day_5_recovery": (AT_RISK_COHORT_LE3, "Recovery Ladder 2"),
+    "day_10_random_fun_image": (AT_RISK_COHORT_LE3, "Random fun image"),
+    # >3 active-days cohort
+    "day_3_recovery": (AT_RISK_COHORT_GT3, "Recovery Ladder 1"),
+    "day_5_random_fun_image": (AT_RISK_COHORT_GT3, "Random fun image"),
+    "day_8_recovery": (AT_RISK_COHORT_GT3, "Recovery Ladder 2"),
+    "day_10_recovery": (AT_RISK_COHORT_GT3, "Recovery Ladder 1 (repeat)"),
+    "day_15_random_fun_image": (AT_RISK_COHORT_GT3, "Random fun image"),
+    "day_20_recovery": (AT_RISK_COHORT_GT3, "Recovery (final push, was lose_score)"),
+    "day_25_random_fun_image": (AT_RISK_COHORT_GT3, "Random fun image"),
+    # Shared final step (cohort can't be inferred — Day 20 for ≤3, Day 35 for >3)
+    "farewell": ("Farewell", "Farewell (marked inactive)"),
+}
+_AT_RISK_COHORT_ORDER = {AT_RISK_COHORT_LE3: 0, AT_RISK_COHORT_GT3: 1, "Farewell": 2, "Unknown": 3}
+
+# Canonical recovery-ladder rungs for weekly reach tables (row order).
+RECOVERY_LADDER_TABLE_RUNGS = [
+    ("day_1_morning", "Day 1 — Morning"),
+    ("day_1_evening", "Day 1 — Evening"),
+    ("day_2_morning", "Day 2 — Morning"),
+    ("day_2_evening", "Day 2 — Evening"),
+    ("day_2_recovery", "Day 2 — Recovery"),
+    ("day_3_recovery", "Day 3 — Recovery"),
+    ("day_3_random_fun_image", "Day 3 — Fun image"),
+    ("day_5_recovery", "Day 5 — Recovery"),
+    ("day_5_random_fun_image", "Day 5 — Fun image"),
+    ("day_8_recovery", "Day 8 — Recovery"),
+    ("day_10_recovery", "Day 10 — Recovery"),
+    ("day_10_random_fun_image", "Day 10 — Fun image"),
+    ("day_15_random_fun_image", "Day 15 — Fun image"),
+    ("day_20_recovery", "Day 20 — Recovery"),
+    ("day_25_random_fun_image", "Day 25 — Fun image"),
+    ("farewell", "Farewell"),
+    ("recovery_ladder_1", "Recovery Ladder 1 (legacy)"),
+    ("recovery_ladder_2", "Recovery Ladder 2 (legacy)"),
+]
+
+
+def _recovery_ladder_steps_sql() -> str:
+    return "', '".join(step for step, _ in RECOVERY_LADDER_TABLE_RUNGS)
+
+
+def _parse_at_risk_rung(ladder_step: str) -> tuple[int | None, str, str, str]:
+    """Return (day_num, step_type, cohort, label) for an at-risk ladder_step."""
+    if ladder_step == "farewell":
+        return None, "farewell", "Farewell", "Farewell (marked inactive)"
+    m = re.match(r"^day_(\d+)_(recovery|random_fun_image)$", ladder_step or "")
+    day_num = int(m.group(1)) if m else None
+    step_type = m.group(2) if m else "unknown"
+    cohort, label = AT_RISK_RUNG_SPEC.get(ladder_step, ("Unknown", ladder_step or "Unknown"))
+    return day_num, step_type, cohort, label
+
+
 @st.cache_data(ttl=300)
-def get_at_risk_users_last_24h() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_at_risk_users_last_24h() -> pd.DataFrame:
     """
-    Users who received Recovery Ladder 1 or 2, or farewell, in the last 24 hours.
-    Returns (rl2_df, rl1_df, farewell_df).
-    Each has columns: waid, full_name, sent_at.
-    rl1/rl2 also have: reactivated (bool) — True if user sent a message after receiving the template.
+    Users who received a new-scheme recovery-ladder rung in the last 24 hours.
+
+    New ladder_step scheme (rolled out 2026-06):
+      - day_{N}_recovery          → recovery message on day N
+      - day_{N}_random_fun_image  → fun-image nudge on day N
+      - farewell                  → final farewell (unchanged)
+
+    Legacy steps (recovery_ladder_1 / recovery_ladder_2) and day 1-2 check-ins are
+    intentionally excluded.
+
+    Returns one row per send, ordered by cohort then day then sent_at, with columns:
+      ladder_step, day_num (nullable int), step_type, cohort, step_label,
+      user_id, waid, full_name, tags, sent_at, reactivated (bool).
     Excludes internal users.
     """
     internal_waids = load_internal_users()
@@ -1242,20 +1321,65 @@ rl_sends AS (
   FROM recovery_logs r
   JOIN users u ON u.id = r.user_id
   WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
-    AND r.ladder_step IN ('recovery_ladder_1', 'recovery_ladder_2', 'farewell')
+    AND (
+      r.ladder_step ~ '^day_[0-9]+_(recovery|random_fun_image)$'
+      OR r.ladder_step = 'farewell'
+    )
     AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
 )
 SELECT * FROM rl_sends
-ORDER BY ladder_step DESC, sent_at DESC;
+ORDER BY sent_at DESC;
 """
     df = run_query(query)
-    empty = pd.DataFrame(columns=["ladder_step", "user_id", "waid", "full_name", "tags", "sent_at", "reactivated"])
+    cols = [
+        "ladder_step", "day_num", "step_type", "cohort", "step_label",
+        "user_id", "waid", "full_name", "tags", "sent_at", "reactivated",
+    ]
     if df.empty:
-        return empty.copy(), empty.copy(), empty.copy()
-    rl2 = df[df["ladder_step"] == "recovery_ladder_2"].copy()
-    rl1 = df[df["ladder_step"] == "recovery_ladder_1"].copy()
-    farewell = df[df["ladder_step"] == "farewell"].copy()
-    return rl2, rl1, farewell
+        return pd.DataFrame(columns=cols)
+
+    parsed = df["ladder_step"].apply(_parse_at_risk_rung)
+    df["day_num"] = [p[0] for p in parsed]
+    df["step_type"] = [p[1] for p in parsed]
+    df["cohort"] = [p[2] for p in parsed]
+    df["step_label"] = [p[3] for p in parsed]
+
+    df["_cohort_order"] = df["cohort"].map(_AT_RISK_COHORT_ORDER).fillna(99)
+    # Farewell has no day_num; sort it last within its group.
+    df["_day_sort"] = df["day_num"].fillna(9999)
+    df = df.sort_values(
+        by=["_cohort_order", "_day_sort", "sent_at"],
+        ascending=[True, True, False],
+    ).drop(columns=["_cohort_order", "_day_sort"])
+    return df[cols].reset_index(drop=True)
+
+
+# Friendly labels for any recovery_logs.ladder_step (new day_* scheme, legacy rungs,
+# and routine check-ins). Used to tag message tables and the deep-dive step badge.
+_LADDER_STEP_LABELS = {
+    "recovery_ladder_1": "Recovery Ladder 1 (legacy)",
+    "recovery_ladder_2": "Recovery Ladder 2 (legacy)",
+    "farewell": "Farewell",
+    "morning_checkin_1": "Morning check-in",
+    "morning_checkin_2": "Morning check-in",
+    "daily_digest_1": "Evening digest",
+    "weekly_review": "Weekly review",
+    "onboarding_come_back": "Onboarding come-back",
+}
+
+
+def _label_ladder_step(ladder_step: str | None) -> str:
+    """Human-readable label for a recovery_logs.ladder_step value ('' if empty)."""
+    if not ladder_step or pd.isna(ladder_step):
+        return ""
+    m = re.match(r"^day_(\d+)_(recovery|random_fun_image)$", str(ladder_step))
+    if m:
+        spec = AT_RISK_RUNG_SPEC.get(ladder_step)
+        sub = spec[1] if spec else ("Random fun image" if m.group(2) == "random_fun_image" else "Recovery")
+        return f"Day {int(m.group(1))} — {sub}"
+    if ladder_step in _LADDER_STEP_LABELS:
+        return _LADDER_STEP_LABELS[ladder_step]
+    return str(ladder_step).replace("_", " ").strip().capitalize()
 
 
 @st.cache_data(ttl=300)
@@ -1413,6 +1537,111 @@ FROM conversion_flags
 ORDER BY week_start_sp DESC, template_sent_at_utc DESC;
 """
     return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_recovery_weekly_active_user_reach(weeks_back: int = 6, exclude_internal: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """
+    Weekly reach of recovery-ladder templates among active users.
+
+    Returns (timeline_df, rung_df, active_users):
+      - timeline_df: week_start, users_receiving, pct_active_users (% receiving any rung)
+      - rung_df: week_start, ladder_step, users_receiving, pct_active_users (per rung)
+      - active_users: current active-user denominator (is_active IS NOT FALSE)
+
+    Weeks are Monday-start in America/Sao_Paulo. Excludes internal WAIDs when exclude_internal=True.
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    steps_sql = _recovery_ladder_steps_sql()
+    weeks_interval = max(int(weeks_back) - 1, 0)
+
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', ((now() AT TIME ZONE 'America/Sao_Paulo')::date - interval '{weeks_interval} weeks'))::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+active_base AS (
+  SELECT COUNT(DISTINCT u.id)::bigint AS active_users
+  FROM users u
+  WHERE u.is_active IS NOT FALSE
+    {internal_filter_join}
+),
+rung_sends AS (
+  SELECT
+    date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date AS week_start,
+    r.ladder_step,
+    COUNT(DISTINCT r.user_id)::bigint AS users_receiving
+  FROM recovery_logs r
+  JOIN users u ON u.id = r.user_id
+  WHERE u.is_active IS NOT FALSE
+    AND r.ladder_step IN ('{steps_sql}')
+    {internal_filter_join}
+    AND date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date IN (SELECT week_start FROM weeks)
+  GROUP BY 1, 2
+),
+weekly_any AS (
+  SELECT
+    date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date AS week_start,
+    COUNT(DISTINCT r.user_id)::bigint AS users_receiving
+  FROM recovery_logs r
+  JOIN users u ON u.id = r.user_id
+  WHERE u.is_active IS NOT FALSE
+    AND r.ladder_step IN ('{steps_sql}')
+    {internal_filter_join}
+    AND date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date IN (SELECT week_start FROM weeks)
+  GROUP BY 1
+)
+SELECT
+  'timeline' AS row_type,
+  w.week_start,
+  NULL::varchar AS ladder_step,
+  COALESCE(wa.users_receiving, 0)::bigint AS users_receiving,
+  ab.active_users,
+  ROUND(100.0 * COALESCE(wa.users_receiving, 0) / NULLIF(ab.active_users, 0), 1) AS pct_active_users
+FROM weeks w
+CROSS JOIN active_base ab
+LEFT JOIN weekly_any wa ON wa.week_start = w.week_start
+
+UNION ALL
+
+SELECT
+  'rung' AS row_type,
+  rs.week_start,
+  rs.ladder_step,
+  rs.users_receiving,
+  ab.active_users,
+  ROUND(100.0 * rs.users_receiving / NULLIF(ab.active_users, 0), 1) AS pct_active_users
+FROM rung_sends rs
+CROSS JOIN active_base ab
+
+ORDER BY row_type, week_start, ladder_step;
+"""
+    df = run_query(query)
+    if df.empty:
+        empty_timeline = pd.DataFrame(columns=["week_start", "users_receiving", "pct_active_users"])
+        empty_rung = pd.DataFrame(columns=["week_start", "ladder_step", "users_receiving", "pct_active_users"])
+        return empty_timeline, empty_rung, 0
+
+    active_users = int(df["active_users"].iloc[0]) if "active_users" in df.columns and not df.empty else 0
+    timeline_df = (
+        df[df["row_type"] == "timeline"][["week_start", "users_receiving", "pct_active_users"]]
+        .copy()
+        .sort_values("week_start")
+    )
+    rung_df = (
+        df[df["row_type"] == "rung"][["week_start", "ladder_step", "users_receiving", "pct_active_users"]]
+        .copy()
+    )
+    return timeline_df, rung_df, active_users
 
 
 @st.cache_data(ttl=300)
@@ -2027,6 +2256,17 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
             ORDER BY sent_at DESC
             LIMIT 1
         ),
+        last_recovery_rung AS (
+            SELECT ladder_step, sent_at
+            FROM recovery_logs
+            WHERE user_id = {user_id}
+              AND (
+                ladder_step ~ '^day_[0-9]+_(recovery|random_fun_image)$'
+                OR ladder_step IN ('farewell', 'recovery_ladder_1', 'recovery_ladder_2')
+              )
+            ORDER BY sent_at DESC
+            LIMIT 1
+        ),
         first_reply_after_last_recovery AS (
             SELECT m.sent_at
             FROM messages m
@@ -2050,6 +2290,8 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
             lr.template_name AS last_recovery_template_name,
             lr.ladder_step AS last_recovery_ladder_step,
             lr.sent_at AS last_recovery_sent_at,
+            lrr.ladder_step AS last_rung_step,
+            lrr.sent_at AS last_rung_sent_at,
             (fr.sent_at <= lr.sent_at + INTERVAL '24 hours') AS conv24,
             (fr.sent_at <= lr.sent_at + INTERVAL '72 hours') AS conv72,
             EXTRACT(EPOCH FROM (fr.sent_at - lr.sent_at)) / 3600 AS hours_to_reply,
@@ -2083,6 +2325,7 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
         CROSS JOIN recovery_summary rs
         LEFT JOIN last_completed lc ON true
         LEFT JOIN last_recovery lr ON true
+        LEFT JOIN last_recovery_rung lrr ON true
         LEFT JOIN first_reply_after_last_recovery fr ON true
     """)
 
@@ -2100,15 +2343,63 @@ def get_user_activity_plan(user_id: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=120)
 def get_user_message_history(user_id: int, limit: int | None) -> pd.DataFrame:
-    """Fetch message history for a user."""
+    """Fetch message history for a user, tagged with the nearest recovery_logs send."""
     msg_limit_sql = f"LIMIT {int(limit)}" if limit else ""
     return run_query(f"""
-        SELECT id as msg_id, sent_at, sender, type as msg_type, message, status
-        FROM messages
-        WHERE user_id = {user_id} AND sent_at IS NOT NULL
-          {get_user_visible_message_filter_sql("messages")}
-        ORDER BY sent_at DESC
+        SELECT m.id as msg_id, m.sent_at, m.sender, m.type as msg_type, m.message, m.status,
+               rl.ladder_step as matched_ladder_step
+        FROM messages m
+        LEFT JOIN LATERAL (
+            SELECT rl.ladder_step
+            FROM recovery_logs rl
+            WHERE rl.user_id = {user_id}
+              AND rl.sent_at BETWEEN m.sent_at - INTERVAL '120 seconds'
+                                 AND m.sent_at + INTERVAL '120 seconds'
+            ORDER BY ABS(EXTRACT(EPOCH FROM (rl.sent_at - m.sent_at)))
+            LIMIT 1
+        ) rl ON true
+        WHERE m.user_id = {user_id} AND m.sent_at IS NOT NULL
+          {get_user_visible_message_filter_sql("m")}
+        ORDER BY m.sent_at DESC
         {msg_limit_sql}
+    """)
+
+
+@st.cache_data(ttl=120)
+def get_user_recovery_response_by_type(user_id: int) -> pd.DataFrame:
+    """
+    Per-user response rate to recovery rungs, split into 'Recovery message'
+    (day_N_recovery) vs 'Fun image' (day_N_random_fun_image). Farewell excluded.
+
+    Windowed attribution: a send counts as responded if the user sent a message
+    after it and before their next rung (any type). Returns columns:
+    step_type, sends, responded.
+    """
+    return run_query(f"""
+        WITH sends AS (
+          SELECT
+            CASE
+              WHEN r.ladder_step ~ '_random_fun_image$'     THEN 'Fun image'
+              WHEN r.ladder_step ~ '^day_[0-9]+_recovery$'  THEN 'Recovery message'
+            END AS step_type,
+            r.sent_at,
+            LEAD(r.sent_at) OVER (ORDER BY r.sent_at) AS next_sent_at
+          FROM recovery_logs r
+          WHERE r.user_id = {user_id}
+            AND r.ladder_step ~ '^day_[0-9]+_(recovery|random_fun_image)$'
+        )
+        SELECT
+          s.step_type,
+          COUNT(*)::int AS sends,
+          COUNT(*) FILTER (WHERE EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.user_id = {user_id} AND m.sender = 'user'
+              AND m.sent_at > s.sent_at
+              AND (s.next_sent_at IS NULL OR m.sent_at < s.next_sent_at)
+          ))::int AS responded
+        FROM sends s
+        WHERE s.step_type IS NOT NULL
+        GROUP BY s.step_type
     """)
 
 
@@ -2268,6 +2559,26 @@ def _format_ts_local(ts, tz_str, fmt="%Y-%m-%d %H:%M"):
         return t.strftime(fmt) + " UTC"
     except Exception:
         return str(ts)[:16] if ts is not None else "—"
+
+
+def _journey_blob(prev_pct_val, better: bool | None, worse: bool | None) -> str:
+    """HTML caption comparing a metric to the previous 7-day window."""
+    if better:
+        color = "#0d7d0d"
+    elif worse:
+        color = "#c52222"
+    else:
+        color = "#6b7280"
+    return f'<span style="font-size:0.9em;color:{color}">Prev 7d: {prev_pct_val}%</span>'
+
+
+def _metric_delta(curr, prev, suffix="", precision=1):
+    """Format a +/- delta string for st.metric, or '—' when comparison unavailable."""
+    if curr is None or pd.isna(curr) or prev is None or pd.isna(prev):
+        return "—"
+    diff = curr - prev
+    sign = "+" if diff >= 0 else ""
+    return f"{sign}{round(diff, precision)}{suffix}"
 
 
 def _format_pending_duration(delta):
@@ -2734,40 +3045,29 @@ if selected_section == "📊 Quick Insights":
     except Exception as e:
         st.warning(f"Could not load inactive users list: {e}")
 
-    # At Risk Users: Recovery Ladder 1 & 2 + Farewell (inactive) in last 24h
+    # At Risk Users: new recovery-ladder rungs (day_N_recovery / day_N_random_fun_image) + farewell, last 24h
     try:
-        rl2_df, rl1_df, farewell_df = get_at_risk_users_last_24h()
+        at_risk_df = get_at_risk_users_last_24h()
         sp_tz = "America/Sao_Paulo"
 
         with st.expander("⚠️ At Risk Users"):
-            st.caption("Users who received Recovery Ladder or Farewell templates in the last 24 hours (times in São Paulo). ✅ = responded after.")
+            st.caption("Users who received a recovery-ladder rung or farewell in the last 24 hours, grouped by day threshold (times in São Paulo). ✅ = responded after.")
 
-            st.markdown("**Farewell (marked inactive)**")
-            if farewell_df.empty:
+            if at_risk_df.empty:
                 st.caption("No users")
             else:
-                for _, row in farewell_df.iterrows():
-                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
-
-            st.markdown("**Recovery Ladder 2** (penultimate step)")
-            if rl2_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in rl2_df.iterrows():
-                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
-
-            st.markdown("**Recovery Ladder 1**")
-            if rl1_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in rl1_df.iterrows():
-                    sent_at_sp = _format_ts_local(row["sent_at"], sp_tz)
-                    reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
+                for cohort in at_risk_df["cohort"].drop_duplicates().tolist():
+                    cohort_df = at_risk_df[at_risk_df["cohort"] == cohort]
+                    st.markdown(f"**{cohort}**")
+                    for ladder_step, group in cohort_df.groupby("ladder_step", sort=False):
+                        day_num = group["day_num"].iloc[0]
+                        label = group["step_label"].iloc[0]
+                        header = f"Day {int(day_num)} — {label}" if pd.notna(day_num) else label
+                        st.markdown(f"_{header}_")
+                        for _, row in group.iterrows():
+                            sent_at_sp = _format_ts_local(row["sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                            reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
+                            st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
@@ -2829,6 +3129,15 @@ if selected_section == "📊 Quick Insights":
     recent_messages_base_from = f"""
             FROM messages m
             LEFT JOIN users u ON (m.user_id = u.id OR m.waid = u.waid)
+            LEFT JOIN LATERAL (
+                SELECT rl.ladder_step
+                FROM recovery_logs rl
+                WHERE rl.user_id = COALESCE(u.id, m.user_id)
+                  AND rl.sent_at BETWEEN m.sent_at - INTERVAL '120 seconds'
+                                     AND m.sent_at + INTERVAL '120 seconds'
+                ORDER BY ABS(EXTRACT(EPOCH FROM (rl.sent_at - m.sent_at)))
+                LIMIT 1
+            ) rl ON true
             WHERE m.sent_at IS NOT NULL
               {{time_filter}}
               {{message_filter}}
@@ -2845,7 +3154,8 @@ if selected_section == "📊 Quick Insights":
                     {recent_messages_user_select},
                     m.sender,
                     m.message as raw_message,
-                    m.status
+                    m.status,
+                    rl.ladder_step as matched_ladder_step
                 {recent_messages_base_from.format(
                     time_filter="",
                     message_filter=get_user_visible_message_filter_sql("m"),
@@ -2867,7 +3177,8 @@ if selected_section == "📊 Quick Insights":
                     {recent_messages_user_select},
                     m.sender,
                     m.message as raw_message,
-                    m.status
+                    m.status,
+                    rl.ladder_step as matched_ladder_step
                 {recent_messages_base_from.format(
                     time_filter="AND m.sent_at >= NOW() - INTERVAL '1 hour'",
                     message_filter=get_user_visible_message_filter_sql("m"),
@@ -2888,7 +3199,8 @@ if selected_section == "📊 Quick Insights":
                     {recent_messages_user_select},
                     m.sender,
                     m.message as raw_message,
-                    m.status
+                    m.status,
+                    rl.ladder_step as matched_ladder_step
                 {recent_messages_base_from.format(
                     time_filter="AND m.sent_at >= NOW() - INTERVAL '24 hours'",
                     message_filter=get_user_visible_message_filter_sql("m"),
@@ -3307,13 +3619,17 @@ if selected_section == "📊 Quick Insights":
             is_sticker = is_sticker_message(msg_type_val, raw_msg)
             is_image = is_image_message(msg_type_val, raw_msg)
             text = get_display_text(i)
+            type_label = get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg))
+            step_label = _label_ladder_step(row.get("matched_ladder_step")) if row["sender"] != "user" else ""
+            if step_label:
+                type_label = f"{type_label} · 🪜 {step_label}"
             rows_display.append({
                 "Time": format_timestamp_local(row),
                 "User": format_display_name(row.get("user_name"), row.get("user_waid"), user_id=row.get("user_id")),
                 "Tag": format_user_tags_column(row.get("user_tags"), row.get("user_waid")),
                 "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                 "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
-                "Type": get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
+                "Type": type_label,
                 "Message": text,
                 "Message (EN)": translate_to_english(text) if translate_recent_messages else "",
             })
@@ -3340,7 +3656,7 @@ if selected_section == "📊 Quick Insights":
                     "Tag": st.column_config.TextColumn(width="small"),
                     "From": st.column_config.TextColumn(width="small"),
                     "Status": st.column_config.TextColumn(width="small"),
-                    "Type": st.column_config.TextColumn(width="small"),
+                    "Type": st.column_config.TextColumn(width="medium"),
                     "Message": st.column_config.TextColumn(width="large"),
                     "Message (EN)": st.column_config.TextColumn(width="large"),
                 }
@@ -4187,6 +4503,11 @@ if selected_section == "🔍 User Deep Dive":
         last_recovery_sent_at = summary.get('last_recovery_sent_at')
         last_recovery_time = format_ts_local(last_recovery_sent_at) if pd.notna(last_recovery_sent_at) else "—"
 
+        # Current recovery-ladder rung (latest recovery/fun-image/farewell send; incl legacy steps)
+        last_rung_step = summary.get('last_rung_step') if pd.notna(summary.get('last_rung_step')) else None
+        last_rung_sent_at = summary.get('last_rung_sent_at')
+        recovery_cohort_label = "≤3 active days" if active_days_count <= 3 else ">3 active days"
+
         conv24 = bool(summary.get('conv24')) if pd.notna(summary.get('conv24')) else False
         conv72 = bool(summary.get('conv72')) if pd.notna(summary.get('conv72')) else False
         hrs_reply = summary.get('hours_to_reply')
@@ -4255,7 +4576,22 @@ if selected_section == "🔍 User Deep Dive":
             st.info(f"**Coach:** {user_coach if user_coach and pd.notna(user_coach) else '—'}")
         with info_col2:
             st.info(f"**Slogan / Mantra:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
-        
+
+        # Current recovery-ladder step badge
+        if last_rung_step:
+            rung_label = _label_ladder_step(last_rung_step)
+            rung_time = format_ts_local(last_rung_sent_at) if pd.notna(last_rung_sent_at) else "—"
+            days_since_rung = None
+            try:
+                _t = pd.to_datetime(last_rung_sent_at, utc=True)
+                days_since_rung = (pd.Timestamp.now(tz="UTC") - _t).total_seconds() / 86400
+            except Exception:
+                days_since_rung = None
+            stale_note = " · ⚠️ stale (>7d)" if days_since_rung is not None and days_since_rung > 7 else ""
+            st.markdown(f"🪜 **Recovery step:** {rung_label} · {recovery_cohort_label} · sent {rung_time}{stale_note}")
+        else:
+            st.markdown(f"🪜 **Recovery step:** — (no recovery-ladder sends) · {recovery_cohort_label}")
+
         # Funnel metrics: onboarding completed, slogan set, first activity completed
         st.markdown("#### 🎯 User Journey Funnel")
         funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
@@ -4349,7 +4685,29 @@ if selected_section == "🔍 User Deep Dive":
         m6.metric("Outside 24h", "Yes" if outside_24h_flag else "No")
         m7.metric("Recovery Sends", user_recovery_count, f"Last: {last_recovery_time}")
         m8.metric("Recovery Conversion", "✓ 24h" if conv24 else ("✓ 72h" if conv72 else "—"), hrs_reply_fmt)
-        
+
+        # Recovery response by type (windowed attribution): Fun image vs Recovery message
+        st.markdown("#### 🪜 Recovery Response by Type")
+        try:
+            resp_df = get_user_recovery_response_by_type(user_id)
+        except Exception as e:
+            resp_df = pd.DataFrame()
+            st.caption(f"Could not load recovery response breakdown: {e}")
+        if resp_df is None or resp_df.empty:
+            st.caption("No recovery-ladder sends yet for this user.")
+        else:
+            resp_map = {r["step_type"]: r for _, r in resp_df.iterrows()}
+            rc1, rc2 = st.columns(2)
+            for col, key in ((rc1, "Recovery message"), (rc2, "Fun image")):
+                if key in resp_map:
+                    sends = int(resp_map[key]["sends"])
+                    responded = int(resp_map[key]["responded"])
+                    rate = (100.0 * responded / sends) if sends else 0.0
+                    col.metric(key, f"{rate:.0f}%", f"{responded}/{sends} responded")
+                else:
+                    col.metric(key, "—", "0 sends")
+            st.caption("Windowed attribution: a reply counts only if it lands before the user's next ladder rung.")
+
         # Activity plan weekly calendar
         st.markdown("#### 📅 Activity Plan (weekly)")
         if plan_df.empty:
@@ -4712,11 +5070,15 @@ if selected_section == "🔍 User Deep Dive":
                 is_image = is_image_msg(row.get("msg_type"), row.get("message"))
                 text = get_msg_display_text(i)
                 msg_type_val = row.get("msg_type")
+                type_label = get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_template(row.get("message")))
+                step_label = _label_ladder_step(row.get("matched_ladder_step")) if row["sender"] != "user" else ""
+                if step_label:
+                    type_label = f"{type_label} · 🪜 {step_label}"
                 rows_history.append({
                     "Time": format_ts_local(row["sent_at"]),
                     "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
                     "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
-                    "Type": get_type_label_dd(msg_type_val, is_audio, is_image, is_sticker, is_template(row.get("message"))),
+                    "Type": type_label,
                     "Message": text,
                     "Message (EN)": translate_to_english(text) if translate_deep_dive_messages else "",
                 })
@@ -4741,7 +5103,7 @@ if selected_section == "🔍 User Deep Dive":
                         "Time": st.column_config.TextColumn(width="small"),
                         "From": st.column_config.TextColumn(width="small"),
                         "Status": st.column_config.TextColumn(width="small"),
-                        "Type": st.column_config.TextColumn(width="small"),
+                        "Type": st.column_config.TextColumn(width="medium"),
                         "Message": st.column_config.TextColumn(width="large"),
                         "Message (EN)": st.column_config.TextColumn(width="large"),
                     }
@@ -5999,9 +6361,9 @@ if selected_section == "🔔 Alerts":
         except Exception:
             _onboarding_df = pd.DataFrame()
         try:
-            _recovery_ladder_2_df = get_recovery_ladder_2_alert_detail()
+            _late_recovery_df = get_late_stage_recovery_alert_detail()
         except Exception:
-            _recovery_ladder_2_df = pd.DataFrame()
+            _late_recovery_df = pd.DataFrame()
 
         # Date selector: today / yesterday / day_before (with alert count per date)
         periods = [
@@ -6023,8 +6385,8 @@ if selected_section == "🔔 Alerts":
                 + delivery_df.loc[delivery_df["period"] == key, "missed_evening"].sum()
             )
             onb_count = len(_onboarding_df[_onboarding_df["period"] == key]) if not _onboarding_df.empty else 0
-            rl2_count = len(_recovery_ladder_2_df[_recovery_ladder_2_df["period"] == key]) if not _recovery_ladder_2_df.empty else 0
-            total_alerts = msg_missed + onb_count + rl2_count
+            late_count = len(_late_recovery_df[_late_recovery_df["period"] == key]) if not _late_recovery_df.empty else 0
+            total_alerts = msg_missed + onb_count + late_count
             labels_with_dates.append(date_only_str + f" — {total_alerts} alert{'s' if total_alerts != 1 else ''}")
         selected_idx = st.radio(
             "**Select date**",
@@ -6140,24 +6502,25 @@ if selected_section == "🔔 Alerts":
                 hide_index=True,
             )
 
-        # Recovery Ladder 2 — users on penultimate step who received template on selected date
+        # Late-stage recovery — final recovery push before farewell, or farewell itself
         st.markdown("---")
-        st.markdown("### 🪜 Recovery Ladder 2 — Received in last 24h")
-        st.caption("Users on the penultimate recovery ladder step (recovery_ladder_2) who received a template on the selected date.")
+        st.markdown("### 🪜 Late-stage Recovery — Received in last 24h")
+        st.caption("Users about to churn (final recovery push: day_5_recovery / day_20_recovery, or legacy recovery_ladder_2) or just marked inactive (farewell), who received a send on the selected date.")
 
-        rl2_day = _recovery_ladder_2_df[_recovery_ladder_2_df["period"] == selected_period].copy() if not _recovery_ladder_2_df.empty else pd.DataFrame()
-        if rl2_day.empty:
-            st.success(f"✅ No users on recovery ladder 2 for **{date_label}**.")
+        late_day = _late_recovery_df[_late_recovery_df["period"] == selected_period].copy() if not _late_recovery_df.empty else pd.DataFrame()
+        if late_day.empty:
+            st.success(f"✅ No late-stage recovery sends for **{date_label}**.")
         else:
-            st.info(f"**{len(rl2_day)} user(s)** on recovery ladder 2 received a template on **{date_label}**.")
-            rl2_display = rl2_day[["waid", "full_name", "sent_at", "template_name", "user_timezone"]].copy()
-            rl2_display["full_name"] = rl2_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
-            rl2_display["received at"] = rl2_display.apply(
+            st.info(f"**{len(late_day)} user(s)** in late-stage recovery received a send on **{date_label}**.")
+            late_display = late_day[["waid", "full_name", "sent_at", "ladder_step", "template_name", "user_timezone"]].copy()
+            late_display["full_name"] = late_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
+            late_display["step"] = late_display["ladder_step"].apply(_label_ladder_step)
+            late_display["received at"] = late_display.apply(
                 lambda row: _format_ts_local(row["sent_at"], row.get("user_timezone")) if pd.notna(row["sent_at"]) else "—",
                 axis=1,
             )
             st.dataframe(
-                rl2_display[["waid", "full_name", "received at", "template_name"]],
+                late_display[["waid", "full_name", "received at", "step", "template_name"]],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -6214,304 +6577,53 @@ if selected_section == "🔔 Alerts":
 if selected_section == "🪜 Recovery Ladder":
     st.markdown("### 🪜 Recovery Ladder")
 
-    # Last 7d + prev 7d: template conversion and drop-off
-    st.markdown("#### 📬 Recovery Ladder & Template Sends (Last 7d)")
     try:
-        rec_7d_filter = "r.sent_at >= NOW() - INTERVAL '7 days'"
-        rec_prev_7d_filter = "r.sent_at >= NOW() - INTERVAL '14 days' AND r.sent_at < NOW() - INTERVAL '7 days'"
-
-        internal_filter_join = get_internal_users_filter_join_sql(True, "u")
-
-        # Conversion rates 24h / 72h
-        if internal_filter_join:
-            conversion_7d = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                      {internal_filter_join}
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                      {internal_filter_join}
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-            conversion_prev = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_prev_7d_filter} {internal_filter_join}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                      {internal_filter_join}
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                      {internal_filter_join}
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-        else:
-            conversion_7d = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_7d_filter}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-            conversion_prev = run_query(f"""
-                WITH sent AS (
-                    SELECT DISTINCT r.user_id FROM recovery_logs r WHERE {rec_prev_7d_filter}
-                ),
-                conv24 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '24 hours'
-                ),
-                conv72 AS (
-                    SELECT DISTINCT r.user_id
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id
-                    WHERE {rec_prev_7d_filter} AND m.sender = 'user'
-                      AND m.sent_at > r.sent_at AND m.sent_at <= r.sent_at + INTERVAL '72 hours'
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM sent) AS total_users,
-                    (SELECT COUNT(*) FROM conv24) AS conv24_users,
-                    (SELECT COUNT(*) FROM conv72) AS conv72_users
-            """)
-
-        t_7d = conversion_7d['total_users'].iloc[0] if not conversion_7d.empty else 0
-        c24_7d = conversion_7d['conv24_users'].iloc[0] if not conversion_7d.empty else 0
-        c72_7d = conversion_7d['conv72_users'].iloc[0] if not conversion_7d.empty else 0
-        conv24_pct = round(100 * c24_7d / t_7d, 1) if t_7d else 0
-        conv72_pct = round(100 * c72_7d / t_7d, 1) if t_7d else 0
-        t_prev = conversion_prev['total_users'].iloc[0] if not conversion_prev.empty else 0
-        c24_prev = conversion_prev['conv24_users'].iloc[0] if not conversion_prev.empty else 0
-        c72_prev = conversion_prev['conv72_users'].iloc[0] if not conversion_prev.empty else 0
-        conv24_prev_pct = round(100 * c24_prev / t_prev, 1) if t_prev else 0
-        conv72_prev_pct = round(100 * c72_prev / t_prev, 1) if t_prev else 0
-
-        better_24 = conv24_pct > conv24_prev_pct if t_prev else None
-        better_72 = conv72_pct > conv72_prev_pct if t_prev else None
-
-        # Ladder drop-off by step and template (last 7d only)
-        if internal_filter_join:
-            dropoff_df = run_query(f"""
-                WITH recovery_sends AS (
-                    SELECT 
-                        r.id,
-                        r.ladder_step,
-                        COALESCE(r.template_name, 'Unknown') AS template_name,
-                        r.user_id,
-                        r.sent_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                ),
-                conversions AS (
-                    SELECT DISTINCT r.id
-                    FROM recovery_sends r
-                    JOIN messages m ON m.user_id = r.user_id 
-                        AND m.sender = 'user' 
-                        AND m.sent_at > r.sent_at
-                )
-                SELECT 
-                    r.ladder_step,
-                    r.template_name,
-                    COUNT(*) AS sends,
-                    COUNT(c.id) AS conversions,
-                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
-                FROM recovery_sends r
-                LEFT JOIN conversions c ON r.id = c.id
-                GROUP BY r.ladder_step, r.template_name
-                ORDER BY r.ladder_step, sends DESC
-                LIMIT 50
-            """)
-        else:
-            dropoff_df = run_query(f"""
-                WITH recovery_sends AS (
-                    SELECT 
-                        r.id,
-                        r.ladder_step,
-                        COALESCE(r.template_name, 'Unknown') AS template_name,
-                        r.user_id,
-                        r.sent_at
-                    FROM recovery_logs r
-                    WHERE {rec_7d_filter}
-                ),
-                conversions AS (
-                    SELECT DISTINCT r.id
-                    FROM recovery_sends r
-                    JOIN messages m ON m.user_id = r.user_id 
-                        AND m.sender = 'user' 
-                        AND m.sent_at > r.sent_at
-                )
-                SELECT 
-                    r.ladder_step,
-                    r.template_name,
-                    COUNT(*) AS sends,
-                    COUNT(c.id) AS conversions,
-                    ROUND(100.0 * COUNT(c.id) / COUNT(*), 1) AS conversion_pct
-                FROM recovery_sends r
-                LEFT JOIN conversions c ON r.id = c.id
-                GROUP BY r.ladder_step, r.template_name
-                ORDER BY r.ladder_step, sends DESC
-                LIMIT 50
-            """)
-
-        # Time to reactivation (avg/median hours)
-        if internal_filter_join:
-            reactivation_7d = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_7d_filter} {internal_filter_join}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-            reactivation_prev = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN users u ON r.user_id = u.id
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_prev_7d_filter} {internal_filter_join}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-        else:
-            reactivation_7d = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_7d_filter}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-            reactivation_prev = run_query(f"""
-                WITH first_reply AS (
-                    SELECT r.id AS rec_id, r.user_id, r.sent_at, MIN(m.sent_at) AS reply_at
-                    FROM recovery_logs r
-                    JOIN messages m ON m.user_id = r.user_id AND m.sender = 'user' AND m.sent_at > r.sent_at
-                    WHERE {rec_prev_7d_filter}
-                    GROUP BY r.id, r.user_id, r.sent_at
-                )
-                SELECT 
-                    AVG(EXTRACT(EPOCH FROM (reply_at - sent_at)))/3600 AS avg_hours,
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (reply_at - sent_at))/3600) AS median_hours
-                FROM first_reply
-            """)
-
-        conv24_prev_blob = _journey_blob(conv24_prev_pct, better_24, not better_24 if better_24 is not None else None)
-        conv72_prev_blob = _journey_blob(conv72_prev_pct, better_72, not better_72 if better_72 is not None else None)
-
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Conv 24h (% users)", f"{conv24_pct}%", help="Share of unique users who replied within 24h of a recovery template (last 7 days).")
-        col_a.markdown(conv24_prev_blob, unsafe_allow_html=True)
-        col_b.metric("Conv 72h (% users)", f"{conv72_pct}%", help="Share of unique users who replied within 72h of a recovery template (last 7 days).")
-        col_b.markdown(conv72_prev_blob, unsafe_allow_html=True)
-
-        avg_hours_7d = reactivation_7d['avg_hours'].iloc[0] if not reactivation_7d.empty and reactivation_7d['avg_hours'].iloc[0] is not None else None
-        median_hours_7d = reactivation_7d['median_hours'].iloc[0] if not reactivation_7d.empty and reactivation_7d['median_hours'].iloc[0] is not None else None
-        avg_hours_prev = reactivation_prev['avg_hours'].iloc[0] if not reactivation_prev.empty and reactivation_prev['avg_hours'].iloc[0] is not None else None
-        median_hours_prev = reactivation_prev['median_hours'].iloc[0] if not reactivation_prev.empty and reactivation_prev['median_hours'].iloc[0] is not None else None
-
-        col_c.metric(
-            "Median reply time (hours)",
-            f"{round(median_hours_7d,1)}h" if median_hours_7d is not None else "—",
-            _metric_delta(median_hours_7d, median_hours_prev, "h", precision=1),
-            help="Median time from template send to first user reply (hours).",
-            delta_color="inverse",
-        )
-
-        st.markdown("##### Ladder Drop-off by Step & Template (Last 7d)")
-        if dropoff_df.empty:
-            st.caption("No recovery ladder sends found in the last 7 days.")
-        else:
-            st.dataframe(
-                dropoff_df.rename(
-                    columns={
-                        "ladder_step": "Step",
-                        "template_name": "Template",
-                        "sends": "Sends",
-                        "conversions": "Conversions",
-                        "conversion_pct": "Conv %",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
+        timeline_df, rung_df, active_users = get_recovery_weekly_active_user_reach(weeks_back=6, exclude_internal=True)
     except Exception as e:
-        st.warning(f"Could not load Recovery Ladder & Template Sends stats: {e}")
+        timeline_df = pd.DataFrame()
+        rung_df = pd.DataFrame()
+        active_users = 0
+        st.warning(f"Could not load weekly recovery-ladder reach data: {e}")
 
-    # 12w+ view: ladder performance and reply timeline
+    # Section 1: weekly timeline — % of active users receiving any recovery-ladder template
+    st.markdown("#### 📈 % Active Users Receiving a Template (weekly)")
+    st.caption(
+        "Share of active users (`is_active` not false) who received at least one recovery-ladder "
+        "template that week. Denominator is current active-user count; weeks are Monday-start (São Paulo)."
+    )
+    if timeline_df.empty:
+        st.info("No recovery-ladder sends in the last 6 weeks.")
+    else:
+        try:
+            import altair as alt
+
+            st.caption(f"Active users (denominator): **{active_users}**")
+            chart_df = timeline_df.copy()
+            chart_df["week_start"] = pd.to_datetime(chart_df["week_start"], errors="coerce")
+            chart_df["week_label"] = chart_df["week_start"].dt.strftime("Week of %d-%m-%Y")
+            chart_df["pct_active_users"] = pd.to_numeric(chart_df["pct_active_users"], errors="coerce").fillna(0)
+
+            timeline_chart = (
+                alt.Chart(chart_df)
+                .mark_line(point=True, color="#00d4aa")
+                .encode(
+                    x=alt.X("week_label:N", sort=list(chart_df["week_label"]), title="Week"),
+                    y=alt.Y("pct_active_users:Q", title="% active users receiving a template"),
+                    tooltip=[
+                        alt.Tooltip("week_label:N", title="Week"),
+                        alt.Tooltip("pct_active_users:Q", title="% active users", format=".1f"),
+                        alt.Tooltip("users_receiving:Q", title="Users receiving"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(timeline_chart, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not render weekly template reach timeline: {e}")
+
+    st.markdown("---")
+
+    # Section 2: 12w+ view — ladder performance and reply timeline
     default_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
     try:
         recovery_events = get_recovery_ladder_events(default_start)
@@ -6534,13 +6646,6 @@ if selected_section == "🪜 Recovery Ladder":
 
         def _safe_pct(numerator, denominator):
             return round(100.0 * numerator / denominator, 1) if denominator else 0.0
-
-        def _metric_delta(curr, prev, suffix="", precision=1):
-            if curr is None or pd.isna(curr) or prev is None or pd.isna(prev):
-                return "—"
-            diff = curr - prev
-            sign = "+" if diff >= 0 else ""
-            return f"{sign}{round(diff, precision)}{suffix}"
 
         weekly = (
             df.groupby("week_start_sp")
@@ -6621,6 +6726,42 @@ if selected_section == "🪜 Recovery Ladder":
             k4.metric("Activity 24h (% sends)", "—")
             k5.metric("No-reply rate (% sends)", "—")
             k6.metric("Median reply time (min)", "—")
+
+    st.markdown("---")
+
+    # Section 3: rung-by-week matrix — % of active users receiving each ladder rung
+    st.markdown("#### 🪜 Recovery Ladder Rungs by Week (% active users)")
+    st.caption(
+        "Each cell is the share of active users who received that rung in the given week. "
+        f"Denominator: **{active_users}** active users. Last 6 weeks (Monday-start, São Paulo)."
+    )
+    week_starts = (
+        pd.to_datetime(timeline_df["week_start"], errors="coerce").dropna().sort_values().tolist()
+        if not timeline_df.empty
+        else []
+    )
+    if not week_starts:
+        st.info("No weekly rung data available.")
+    else:
+        week_labels = [pd.to_datetime(w).strftime("Week of %d-%m-%Y") for w in week_starts]
+        rung_lookup = {}
+        if not rung_df.empty:
+            for _, row in rung_df.iterrows():
+                wk = pd.to_datetime(row["week_start"], errors="coerce")
+                if pd.isna(wk):
+                    continue
+                rung_lookup[(row["ladder_step"], wk.date())] = row["pct_active_users"]
+
+        matrix_rows = []
+        for ladder_step, rung_label in RECOVERY_LADDER_TABLE_RUNGS:
+            row_out = {"Rung": rung_label}
+            for wk, wlabel in zip(week_starts, week_labels):
+                wk_date = pd.to_datetime(wk).date()
+                pct = rung_lookup.get((ladder_step, wk_date))
+                row_out[wlabel] = f"{pct:.1f}%" if pct is not None and pd.notna(pct) else "0.0%"
+            matrix_rows.append(row_out)
+
+        st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
 
 # Footer
 st.markdown("---")
