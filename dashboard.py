@@ -587,22 +587,39 @@ WITH beta_users AS (
 """
 
 
+def get_onboarded_users_cte() -> str:
+    """Users who completed onboarding (ai_companion_flows type=onboarding, is_complete=true)."""
+    return """
+WITH onboarded_users AS (
+    SELECT DISTINCT u.id, u.waid
+    FROM users u
+    WHERE EXISTS (
+        SELECT 1
+        FROM ai_companion_flows acf
+        WHERE acf.user_id = u.id
+          AND acf.type = 'onboarding'
+          AND acf.is_complete = 'true'
+    )
+)
+"""
+
+
 @st.cache_data(ttl=300)
 def get_quick_insights_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
     """
     Fetch the top Quick Insights KPIs in one round trip.
 
-    The beta cohort scans plan proposal messages, so keeping all headline counts in
-    a single query avoids repeating that expensive CTE for every metric card.
+    Onboarded users = completed onboarding flow (ai_companion_flows type onboarding,
+    is_complete true). All headline counts use that cohort as the denominator.
     """
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-    beta_users_cte = get_beta_users_cte()
+    onboarded_users_cte = get_onboarded_users_cte()
     query = f"""
-{beta_users_cte},
-filtered_beta_users AS (
+{onboarded_users_cte},
+filtered_onboarded_users AS (
     SELECT DISTINCT u.id, u.waid, u.is_active, u.created_at
-    FROM beta_users bu
-    JOIN users u ON u.id = bu.id
+    FROM onboarded_users ou
+    JOIN users u ON u.id = ou.id
     WHERE 1 = 1
       {internal_filter_join}
 ),
@@ -611,7 +628,7 @@ latest_farewell AS (
         rl.user_id,
         rl.sent_at AS farewell_at
     FROM recovery_logs rl
-    JOIN filtered_beta_users fbu ON fbu.id = rl.user_id
+    JOIN filtered_onboarded_users fou ON fou.id = rl.user_id
     WHERE rl.ladder_step = 'farewell'
       AND rl.sent_at >= NOW() - INTERVAL '7 days'
     ORDER BY rl.user_id, rl.sent_at DESC
@@ -631,43 +648,58 @@ churn_status AS (
 ),
 recent_user_messages AS (
     SELECT
-        COUNT(DISTINCT fbu.waid) FILTER (
+        COUNT(DISTINCT fou.waid) FILTER (
             WHERE m.sent_at >= NOW() - INTERVAL '24 hours'
         ) AS inside_24h,
-        COUNT(DISTINCT fbu.waid) FILTER (
+        COUNT(DISTINCT fou.waid) FILTER (
             WHERE m.sent_at >= CURRENT_DATE
         ) AS messaged_today
-    FROM filtered_beta_users fbu
-    JOIN messages m ON m.sender = 'user' AND (m.user_id = fbu.id OR m.waid = fbu.waid)
+    FROM filtered_onboarded_users fou
+    JOIN messages m ON m.sender = 'user' AND (m.user_id = fou.id OR m.waid = fou.waid)
     WHERE m.sent_at >= NOW() - INTERVAL '24 hours'
 ),
 completed_today AS (
     SELECT COUNT(DISTINCT uah.user_id) AS completed_today
     FROM user_activities_history uah
-    JOIN filtered_beta_users fbu ON fbu.id = uah.user_id
+    JOIN filtered_onboarded_users fou ON fou.id = uah.user_id
     WHERE uah.completed_at >= CURRENT_DATE
       AND uah.completed_at < CURRENT_DATE + INTERVAL '1 day'
+),
+at_risk_5d AS (
+    SELECT COUNT(DISTINCT fou.waid) AS at_risk_5d_count
+    FROM filtered_onboarded_users fou
+    WHERE fou.is_active = true
+      AND NOT EXISTS (
+        SELECT 1
+        FROM messages m
+        WHERE m.sender = 'user'
+          AND (m.user_id = fou.id OR m.waid = fou.waid)
+          AND m.sent_at >= NOW() - INTERVAL '5 days'
+      )
+),
+active_users_5d AS (
+    SELECT COUNT(DISTINCT fou.waid) AS active_users_5d_count
+    FROM filtered_onboarded_users fou
+    WHERE fou.is_active = true
+      AND EXISTS (
+        SELECT 1
+        FROM user_activities_history uah
+        WHERE uah.user_id = fou.id
+          AND uah.completed_at IS NOT NULL
+          AND uah.completed_at >= NOW() - INTERVAL '5 days'
+      )
 )
 SELECT
-    (
-        SELECT COUNT(DISTINCT u.waid)
-        FROM users u
-        WHERE EXISTS (
-            SELECT 1
-            FROM messages m
-            WHERE m.sender = 'user'
-              AND (m.user_id = u.id OR m.waid = u.waid)
-        )
-        {internal_filter_join}
-    ) AS all_users_count,
-    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users) AS beta_users_count,
-    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users WHERE is_active = true) AS alive_count,
-    (SELECT COUNT(DISTINCT waid) FROM filtered_beta_users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_7d_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_onboarded_users) AS onboarded_users_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_onboarded_users WHERE is_active = true) AS alive_count,
+    (SELECT COUNT(DISTINCT waid) FROM filtered_onboarded_users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_7d_count,
     COALESCE((SELECT COUNT(*) FROM churn_status WHERE NOT came_back), 0) AS churned_7d_count,
     COALESCE((SELECT COUNT(*) FROM churn_status WHERE came_back), 0) AS churned_7d_came_back,
     COALESCE((SELECT inside_24h FROM recent_user_messages), 0) AS inside_24h,
     COALESCE((SELECT messaged_today FROM recent_user_messages), 0) AS messaged_today,
-    COALESCE((SELECT completed_today FROM completed_today), 0) AS completed_today
+    COALESCE((SELECT completed_today FROM completed_today), 0) AS completed_today,
+    COALESCE((SELECT at_risk_5d_count FROM at_risk_5d), 0) AS at_risk_5d_count,
+    COALESCE((SELECT active_users_5d_count FROM active_users_5d), 0) AS active_users_5d_count
 """
     return run_query(query)
 
@@ -1269,6 +1301,17 @@ def _recovery_ladder_steps_sql() -> str:
     return "', '".join(step for step, _ in RECOVERY_LADDER_TABLE_RUNGS)
 
 
+def _recovery_ladder_day3_plus_filter_sql(column: str = "r.ladder_step") -> str:
+    """SQL predicate: recovery-ladder rungs from day 3 onward (plus farewell)."""
+    return f"""(
+      {column} = 'farewell'
+      OR (
+        {column} ~ '^day_[0-9]+_'
+        AND (regexp_match({column}, '^day_([0-9]+)_'))[1]::int >= 3
+      )
+    )"""
+
+
 def _parse_at_risk_rung(ladder_step: str) -> tuple[int | None, str, str, str]:
     """Return (day_num, step_type, cohort, label) for an at-risk ladder_step."""
     if ladder_step == "farewell":
@@ -1281,77 +1324,161 @@ def _parse_at_risk_rung(ladder_step: str) -> tuple[int | None, str, str, str]:
 
 
 @st.cache_data(ttl=300)
-def get_at_risk_users_last_24h() -> pd.DataFrame:
+def get_at_risk_users_detail() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Users who received a new-scheme recovery-ladder rung in the last 24 hours.
+    At-risk user detail for Quick Insights expander.
 
-    New ladder_step scheme (rolled out 2026-06):
-      - day_{N}_recovery          → recovery message on day N
-      - day_{N}_random_fun_image  → fun-image nudge on day N
-      - farewell                  → final farewell (unchanged)
+    Returns (silent_df, reengaged_df):
 
-    Legacy steps (recovery_ladder_1 / recovery_ladder_2) and day 1-2 check-ins are
-    intentionally excluded.
+    silent_df — active onboarded users with no inbound message in ≥5 days. Includes
+    their most recent recovery-ladder send since last user message (if any) and whether
+    they replied after that send.
 
-    Returns one row per send, ordered by cohort then day then sent_at, with columns:
-      ladder_step, day_num (nullable int), step_type, cohort, step_label,
-      user_id, waid, full_name, tags, sent_at, reactivated (bool).
-    Excludes internal users.
+    reengaged_df — active onboarded users who were silent ≥5 days when a recovery-ladder
+    send went out, replied, and have messaged again within the last 5 days (no longer
+    in the silent ≥5d pool).
+
+    Recovery-ladder rungs: day_{N}_recovery, day_{N}_random_fun_image, farewell, plus
+    legacy recovery_ladder_1/2. Excludes internal users.
     """
     internal_waids = load_internal_users()
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
-    query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-rl_sends AS (
-  SELECT
-    r.ladder_step,
-    u.id AS user_id,
-    u.waid,
-    COALESCE(u.full_name, 'Unknown') AS full_name,
-    u.tags,
-    r.sent_at,
-    EXISTS (
-      SELECT 1 FROM messages m
-      WHERE m.user_id = r.user_id
-        AND m.sender = 'user'
-        AND m.sent_at > r.sent_at
-    ) AS reactivated
-  FROM recovery_logs r
-  JOIN users u ON u.id = r.user_id
-  WHERE r.sent_at >= NOW() - INTERVAL '24 hours'
-    AND (
+    internal_filter_join = get_internal_users_filter_join_sql(True, "u")
+    onboarded_users_cte = get_onboarded_users_cte()
+    recovery_rung_filter = """(
       r.ladder_step ~ '^day_[0-9]+_(recovery|random_fun_image)$'
       OR r.ladder_step = 'farewell'
+      OR r.ladder_step IN ('recovery_ladder_1', 'recovery_ladder_2')
+    )"""
+
+    query = f"""
+{onboarded_users_cte},
+internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+filtered_onboarded AS (
+  SELECT DISTINCT u.id, u.waid, u.is_active, COALESCE(u.full_name, 'Unknown') AS full_name, u.tags
+  FROM onboarded_users ou
+  JOIN users u ON u.id = ou.id
+  WHERE 1 = 1
+    {internal_filter_join}
+),
+user_last_msg AS (
+  SELECT
+    fou.id AS user_id,
+    MAX(m.sent_at) AS last_msg_at
+  FROM filtered_onboarded fou
+  LEFT JOIN messages m
+    ON m.sender = 'user'
+   AND (m.user_id = fou.id OR m.waid = fou.waid)
+  GROUP BY fou.id
+),
+silent_users AS (
+  SELECT fou.id AS user_id, fou.waid, fou.full_name, fou.tags, ulm.last_msg_at
+  FROM filtered_onboarded fou
+  JOIN user_last_msg ulm ON ulm.user_id = fou.id
+  WHERE fou.is_active = true
+    AND (ulm.last_msg_at IS NULL OR ulm.last_msg_at < NOW() - INTERVAL '5 days')
+),
+latest_recovery AS (
+  SELECT DISTINCT ON (su.user_id)
+    su.user_id,
+    r.ladder_step AS recovery_ladder_step,
+    r.sent_at AS recovery_sent_at,
+    EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.sender = 'user'
+        AND (m.user_id = su.user_id OR m.waid = su.waid)
+        AND m.sent_at > r.sent_at
+    ) AS replied_after_recovery
+  FROM silent_users su
+  JOIN recovery_logs r ON r.user_id = su.user_id
+  WHERE {recovery_rung_filter}
+    AND r.sent_at > COALESCE(su.last_msg_at, '-infinity'::timestamptz)
+  ORDER BY su.user_id, r.sent_at DESC
+),
+silent_rows AS (
+  SELECT
+    su.user_id,
+    su.waid,
+    su.full_name,
+    su.tags,
+    su.last_msg_at,
+    lr.recovery_ladder_step,
+    lr.recovery_sent_at,
+    COALESCE(lr.replied_after_recovery, false) AS replied_after_recovery,
+    NULL::timestamptz AS reengaged_reply_at
+  FROM silent_users su
+  LEFT JOIN latest_recovery lr ON lr.user_id = su.user_id
+),
+reengaged_rows AS (
+  SELECT DISTINCT ON (fou.id)
+    fou.id AS user_id,
+    fou.waid,
+    fou.full_name,
+    fou.tags,
+    ulm.last_msg_at,
+    r.ladder_step AS recovery_ladder_step,
+    r.sent_at AS recovery_sent_at,
+    true AS replied_after_recovery,
+    fr.first_reply_at AS reengaged_reply_at
+  FROM filtered_onboarded fou
+  JOIN user_last_msg ulm ON ulm.user_id = fou.id
+  JOIN recovery_logs r ON r.user_id = fou.id
+  CROSS JOIN LATERAL (
+    SELECT MIN(m.sent_at) AS first_reply_at
+    FROM messages m
+    WHERE m.sender = 'user'
+      AND (m.user_id = fou.id OR m.waid = fou.waid)
+      AND m.sent_at > r.sent_at
+  ) fr
+  CROSS JOIN LATERAL (
+    SELECT MAX(m2.sent_at) AS last_msg_before_recovery
+    FROM messages m2
+    WHERE m2.sender = 'user'
+      AND (m2.user_id = fou.id OR m2.waid = fou.waid)
+      AND m2.sent_at < r.sent_at
+  ) lmb
+  WHERE fou.is_active = true
+    AND {recovery_rung_filter}
+    AND ulm.last_msg_at >= NOW() - INTERVAL '5 days'
+    AND fr.first_reply_at IS NOT NULL
+    AND (
+      lmb.last_msg_before_recovery IS NULL
+      OR lmb.last_msg_before_recovery < r.sent_at - INTERVAL '5 days'
     )
-    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  ORDER BY fou.id, r.sent_at DESC
 )
-SELECT * FROM rl_sends
-ORDER BY sent_at DESC;
+SELECT 'silent' AS row_type, * FROM silent_rows
+UNION ALL
+SELECT 'reengaged' AS row_type, * FROM reengaged_rows;
 """
     df = run_query(query)
-    cols = [
-        "ladder_step", "day_num", "step_type", "cohort", "step_label",
-        "user_id", "waid", "full_name", "tags", "sent_at", "reactivated",
+    silent_cols = [
+        "user_id", "waid", "full_name", "tags", "last_msg_at",
+        "recovery_ladder_step", "recovery_sent_at", "replied_after_recovery",
     ]
+    reengaged_cols = silent_cols + ["reengaged_reply_at"]
+    empty_silent = pd.DataFrame(columns=silent_cols)
+    empty_reengaged = pd.DataFrame(columns=reengaged_cols)
     if df.empty:
-        return pd.DataFrame(columns=cols)
+        return empty_silent, empty_reengaged
 
-    parsed = df["ladder_step"].apply(_parse_at_risk_rung)
-    df["day_num"] = [p[0] for p in parsed]
-    df["step_type"] = [p[1] for p in parsed]
-    df["cohort"] = [p[2] for p in parsed]
-    df["step_label"] = [p[3] for p in parsed]
-
-    df["_cohort_order"] = df["cohort"].map(_AT_RISK_COHORT_ORDER).fillna(99)
-    # Farewell has no day_num; sort it last within its group.
-    df["_day_sort"] = df["day_num"].fillna(9999)
-    df = df.sort_values(
-        by=["_cohort_order", "_day_sort", "sent_at"],
-        ascending=[True, True, False],
-    ).drop(columns=["_cohort_order", "_day_sort"])
-    return df[cols].reset_index(drop=True)
+    silent_df = (
+        df[df["row_type"] == "silent"][silent_cols]
+        .sort_values(
+            by=["recovery_ladder_step", "recovery_sent_at"],
+            ascending=[False, False],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+    reengaged_df = (
+        df[df["row_type"] == "reengaged"][reengaged_cols]
+        .sort_values(by="reengaged_reply_at", ascending=False)
+        .reset_index(drop=True)
+    )
+    return silent_df, reengaged_df
 
 
 # Friendly labels for any recovery_logs.ladder_step (new day_* scheme, legacy rungs,
@@ -1555,6 +1682,7 @@ def get_recovery_weekly_active_user_reach(weeks_back: int = 6, exclude_internal:
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
     steps_sql = _recovery_ladder_steps_sql()
+    day3_plus_filter = _recovery_ladder_day3_plus_filter_sql("r.ladder_step")
     weeks_interval = max(int(weeks_back) - 1, 0)
 
     query = f"""
@@ -1595,7 +1723,7 @@ weekly_any AS (
   FROM recovery_logs r
   JOIN users u ON u.id = r.user_id
   WHERE u.is_active IS NOT FALSE
-    AND r.ladder_step IN ('{steps_sql}')
+    AND {day3_plus_filter}
     {internal_filter_join}
     AND date_trunc('week', (r.sent_at AT TIME ZONE 'America/Sao_Paulo'))::date IN (SELECT week_start FROM weeks)
   GROUP BY 1
@@ -2883,8 +3011,7 @@ if selected_section == "📊 Quick Insights":
     try:
         headline_df = get_quick_insights_headline_metrics(exclude_internal)
         headline = headline_df.iloc[0] if not headline_df.empty else {}
-        all_users_count = int(headline.get("all_users_count", 0))
-        beta_users_count = int(headline.get("beta_users_count", 0))
+        onboarded_users_count = int(headline.get("onboarded_users_count", 0))
         alive_count = int(headline.get("alive_count", 0))
         new_7d_count = int(headline.get("new_7d_count", 0))
         churned_7d_count = int(headline.get("churned_7d_count", 0))
@@ -2892,37 +3019,42 @@ if selected_section == "📊 Quick Insights":
         inside_24h = int(headline.get("inside_24h", 0))
         messaged_today = int(headline.get("messaged_today", 0))
         completed_today = int(headline.get("completed_today", 0))
+        at_risk_5d_count = int(headline.get("at_risk_5d_count", 0))
+        active_users_5d_count = int(headline.get("active_users_5d_count", 0))
     except Exception:
-        all_users_count = beta_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
-        inside_24h = messaged_today = completed_today = 0
+        onboarded_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
+        inside_24h = messaged_today = completed_today = at_risk_5d_count = active_users_5d_count = 0
 
-    beta_pct = round(100 * beta_users_count / all_users_count, 1) if all_users_count else 0
-    alive_pct = round(100 * alive_count / beta_users_count, 1) if beta_users_count else 0
-    new_7d_pct = round(100 * new_7d_count / beta_users_count, 1) if beta_users_count else 0
-    churned_7d_pct = round(100 * churned_7d_count / beta_users_count, 1) if beta_users_count else 0
-    pct_inside_24h = round(100 * inside_24h / beta_users_count, 1) if beta_users_count else 0
-    pct_messaged_today = round(100 * messaged_today / beta_users_count, 1) if beta_users_count else 0
-    pct_activity_complete = round(100 * completed_today / beta_users_count, 1) if beta_users_count else 0
+    alive_pct = round(100 * alive_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    new_7d_pct = round(100 * new_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    churned_7d_pct = round(100 * churned_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    pct_inside_24h = round(100 * inside_24h / onboarded_users_count, 1) if onboarded_users_count else 0
+    pct_messaged_today = round(100 * messaged_today / onboarded_users_count, 1) if onboarded_users_count else 0
+    pct_activity_complete = round(100 * completed_today / onboarded_users_count, 1) if onboarded_users_count else 0
+    at_risk_5d_pct = round(100 * at_risk_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    active_users_5d_pct = round(100 * active_users_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("All users", all_users_count if all_users_count else "—")
-    col1.caption("Users who ever messaged")
-    col2.metric("Onboarded users", beta_users_count if beta_users_count else "—")
-    col2.caption("Users who have a plan")
+    col1.metric("Onboarded users", onboarded_users_count if onboarded_users_count else "—")
+    col1.caption("Completed onboarding flow")
+    col2.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
+    col2.caption(f"↳ {new_7d_pct}% of onboarded users")
     col3.metric("Alive users", alive_count if alive_count is not None else "—")
     col3.caption(f"↳ {alive_pct}% of onboarded users")
-    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
-    col4.caption(f"↳ {new_7d_pct}% of onboarded users")
-    col5.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
-    col5.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
+    col4.metric("Active users", active_users_5d_count if active_users_5d_count is not None else "—")
+    col4.caption(f"↳ {active_users_5d_pct}% of onboarded · activity in 5d")
+    col5.metric("At risk users", at_risk_5d_count if at_risk_5d_count is not None else "—")
+    col5.caption(f"↳ {at_risk_5d_pct}% of onboarded users")
 
-    c4, c5, c6 = st.columns(3)
+    c4, c5, c6, c7 = st.columns(4)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
     c4.caption(f"↳ {inside_24h} users")
     c5.metric("Messaged today", f"{pct_messaged_today}%")
     c5.caption(f"↳ {messaged_today} users")
     c6.metric("Active today", f"{pct_activity_complete}%")
     c6.caption(f"↳ {completed_today} users")
+    c7.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
+    c7.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
 
     # Expandable simple lists for key metrics
     try:
@@ -3045,29 +3177,45 @@ if selected_section == "📊 Quick Insights":
     except Exception as e:
         st.warning(f"Could not load inactive users list: {e}")
 
-    # At Risk Users: new recovery-ladder rungs (day_N_recovery / day_N_random_fun_image) + farewell, last 24h
+    # At Risk Users: silent ≥5d (headline cohort) + recovery-ladder highlights + re-engaged
     try:
-        at_risk_df = get_at_risk_users_last_24h()
+        silent_at_risk_df, reengaged_at_risk_df = get_at_risk_users_detail()
         sp_tz = "America/Sao_Paulo"
 
         with st.expander("⚠️ At Risk Users"):
-            st.caption("Users who received a recovery-ladder rung or farewell in the last 24 hours, grouped by day threshold (times in São Paulo). ✅ = responded after.")
-
-            if at_risk_df.empty:
+            st.markdown(f"**Silent ≥5 days** ({len(silent_at_risk_df)})")
+            if silent_at_risk_df.empty:
                 st.caption("No users")
             else:
-                for cohort in at_risk_df["cohort"].drop_duplicates().tolist():
-                    cohort_df = at_risk_df[at_risk_df["cohort"] == cohort]
-                    st.markdown(f"**{cohort}**")
-                    for ladder_step, group in cohort_df.groupby("ladder_step", sort=False):
-                        day_num = group["day_num"].iloc[0]
-                        label = group["step_label"].iloc[0]
-                        header = f"Day {int(day_num)} — {label}" if pd.notna(day_num) else label
-                        st.markdown(f"_{header}_")
-                        for _, row in group.iterrows():
-                            sent_at_sp = _format_ts_local(row["sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                            reactivated_badge = " ✅ responded" if row.get("reactivated") else ""
-                            st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — {sent_at_sp}{reactivated_badge}")
+                for _, row in silent_at_risk_df.iterrows():
+                    name = format_display_name_with_tags(
+                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
+                    )
+                    if pd.notna(row.get("last_msg_at")):
+                        last_msg_sp = _format_ts_local(row["last_msg_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                        line = f"{name} — last message {last_msg_sp}"
+                    else:
+                        line = f"{name} — never messaged"
+                    if pd.notna(row.get("recovery_ladder_step")):
+                        rung_label = _label_ladder_step(row["recovery_ladder_step"])
+                        recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                        line += f" · 🪜 {rung_label} ({recovery_sp})"
+                    if row.get("replied_after_recovery"):
+                        line += " ✅ replied"
+                    st.caption(f"• {line}")
+
+            st.markdown(f"**Re-engaged after recovery** ({len(reengaged_at_risk_df)})")
+            if reengaged_at_risk_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in reengaged_at_risk_df.iterrows():
+                    name = format_display_name_with_tags(
+                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
+                    )
+                    rung_label = _label_ladder_step(row.get("recovery_ladder_step"))
+                    recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                    reply_sp = _format_ts_local(row["reengaged_reply_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                    st.caption(f"• {name} — 🪜 {rung_label} ({recovery_sp}) · ✅ replied {reply_sp}")
     except Exception as e:
         st.warning(f"Could not load At Risk Users: {e}")
 
@@ -6587,10 +6735,6 @@ if selected_section == "🪜 Recovery Ladder":
 
     # Section 1: weekly timeline — % of active users receiving any recovery-ladder template
     st.markdown("#### 📈 % Active Users Receiving a Template (weekly)")
-    st.caption(
-        "Share of active users (`is_active` not false) who received at least one recovery-ladder "
-        "template that week. Denominator is current active-user count; weeks are Monday-start (São Paulo)."
-    )
     if timeline_df.empty:
         st.info("No recovery-ladder sends in the last 6 weeks.")
     else:
@@ -6731,15 +6875,12 @@ if selected_section == "🪜 Recovery Ladder":
 
     # Section 3: rung-by-week matrix — % of active users receiving each ladder rung
     st.markdown("#### 🪜 Recovery Ladder Rungs by Week (% active users)")
-    st.caption(
-        "Each cell is the share of active users who received that rung in the given week. "
-        f"Denominator: **{active_users}** active users. Last 6 weeks (Monday-start, São Paulo)."
-    )
     week_starts = (
         pd.to_datetime(timeline_df["week_start"], errors="coerce").dropna().sort_values().tolist()
         if not timeline_df.empty
         else []
     )
+    week_starts = week_starts[-3:]
     if not week_starts:
         st.info("No weekly rung data available.")
     else:
