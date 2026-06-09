@@ -717,6 +717,14 @@ active_days_churned AS (
     FROM churn_status cs
     JOIN filtered_onboarded_users fou ON fou.id = cs.user_id
     WHERE NOT cs.came_back
+),
+active_days_churned_lifetime AS (
+    SELECT
+        ROUND(AVG(fou.active_days), 1) AS avg_active_days,
+        COUNT(fou.id) AS churned_count,
+        SUM(fou.active_days) AS total_active_days
+    FROM filtered_onboarded_users fou
+    WHERE fou.is_active = false
 )
 SELECT
     (SELECT COUNT(DISTINCT waid) FROM filtered_onboarded_users) AS onboarded_users_count,
@@ -734,7 +742,10 @@ SELECT
     COALESCE((SELECT avg_active_days FROM active_days_at_risk), 0) AS at_risk_avg_active_days,
     COALESCE((SELECT total_active_days FROM active_days_at_risk), 0) AS at_risk_total_active_days,
     COALESCE((SELECT avg_active_days FROM active_days_churned), 0) AS churned_avg_active_days,
-    COALESCE((SELECT total_active_days FROM active_days_churned), 0) AS churned_total_active_days
+    COALESCE((SELECT total_active_days FROM active_days_churned), 0) AS churned_total_active_days,
+    COALESCE((SELECT avg_active_days FROM active_days_churned_lifetime), 0) AS churned_lifetime_avg_active_days,
+    COALESCE((SELECT total_active_days FROM active_days_churned_lifetime), 0) AS churned_lifetime_total_active_days,
+    COALESCE((SELECT churned_count FROM active_days_churned_lifetime), 0) AS churned_lifetime_count
 """
     return run_query(query)
 
@@ -3061,12 +3072,16 @@ if selected_section == "📊 Quick Insights":
         at_risk_total_active_days = int(headline.get("at_risk_total_active_days", 0) or 0)
         churned_avg_active_days = float(headline.get("churned_avg_active_days", 0) or 0)
         churned_total_active_days = int(headline.get("churned_total_active_days", 0) or 0)
+        churned_lifetime_avg_active_days = float(headline.get("churned_lifetime_avg_active_days", 0) or 0)
+        churned_lifetime_total_active_days = int(headline.get("churned_lifetime_total_active_days", 0) or 0)
+        churned_lifetime_count = int(headline.get("churned_lifetime_count", 0) or 0)
     except Exception:
         onboarded_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
         inside_24h = messaged_today = completed_today = at_risk_5d_count = active_users_5d_count = 0
         alive_avg_active_days = alive_total_active_days = 0
         at_risk_avg_active_days = at_risk_total_active_days = 0
         churned_avg_active_days = churned_total_active_days = 0
+        churned_lifetime_avg_active_days = churned_lifetime_total_active_days = churned_lifetime_count = 0
 
     alive_pct = round(100 * alive_count / onboarded_users_count, 1) if onboarded_users_count else 0
     new_7d_pct = round(100 * new_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
@@ -3089,6 +3104,16 @@ if selected_section == "📊 Quick Insights":
     col5.metric("At risk users", at_risk_5d_count if at_risk_5d_count is not None else "—")
     col5.caption(f"No message in past 5d · ↳ {at_risk_5d_pct}% of onboarded")
 
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Active Days — Alive", f"{alive_avg_active_days:.1f} avg")
+    d1.caption(f"↳ {alive_total_active_days} total active days across alive users")
+    d2.metric("Active Days — At Risk", f"{at_risk_avg_active_days:.1f} avg")
+    d2.caption(f"↳ {at_risk_total_active_days} total active days across at-risk users")
+    d3.metric("Active Days — Churned (7d)", f"{churned_avg_active_days:.1f} avg")
+    d3.caption(f"↳ {churned_total_active_days} total active days across churned users")
+    d4.metric("Active Days — Churned (lifetime)", f"{churned_lifetime_avg_active_days:.1f} avg")
+    d4.caption(f"↳ {churned_lifetime_total_active_days} total · {churned_lifetime_count} users ever churned")
+
     c4, c5, c6, c7 = st.columns(4)
     c4.metric("% inside 24h", f"{pct_inside_24h}%")
     c4.caption(f"↳ {inside_24h} users")
@@ -3098,14 +3123,6 @@ if selected_section == "📊 Quick Insights":
     c6.caption(f"↳ {completed_today} users")
     c7.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
     c7.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
-
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Active Days — Alive", f"{alive_avg_active_days:.1f} avg")
-    d1.caption(f"↳ {alive_total_active_days} total active days across alive users")
-    d2.metric("Active Days — At Risk", f"{at_risk_avg_active_days:.1f} avg")
-    d2.caption(f"↳ {at_risk_total_active_days} total active days across at-risk users")
-    d3.metric("Active Days — Churned (7d)", f"{churned_avg_active_days:.1f} avg")
-    d3.caption(f"↳ {churned_total_active_days} total active days across churned users")
 
     # Expandable simple lists for key metrics
     try:
