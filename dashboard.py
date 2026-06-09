@@ -2218,6 +2218,90 @@ ORDER BY wb.week_start DESC;
 
 
 @st.cache_data(ttl=300)
+@st.cache_data(ttl=300)
+def get_active_days_by_cohort_weekly(weeks_back: int = 12, exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Weekly avg active days (activity completions) per user for three cohorts:
+      alive   — onboarded, is_active = true, messaged within last 5 days
+      at_risk — onboarded, is_active = true, silent ≥5 days
+      churned — onboarded, is_active = false
+
+    Cohort membership is current (snapshot). The denominator for each cohort is its
+    current size so the trend reflects engagement history for those users.
+
+    Returns columns: week_start (str YYYY-MM-DD), cohort, avg_active_days, total_active_days, cohort_size.
+    """
+    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+    onboarded_users_cte = get_onboarded_users_cte()
+    start = (datetime.now() - timedelta(weeks=weeks_back)).strftime("%Y-%m-%d")
+    query = f"""
+{onboarded_users_cte},
+filtered_onboarded AS (
+  SELECT DISTINCT
+    u.id,
+    u.waid,
+    CASE
+      WHEN u.is_active = false THEN 'churned'
+      WHEN u.is_active = true AND NOT EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.sender = 'user'
+          AND (m.user_id = u.id OR m.waid = u.waid)
+          AND m.sent_at >= NOW() - INTERVAL '5 days'
+      ) THEN 'at_risk'
+      ELSE 'alive'
+    END AS cohort
+  FROM onboarded_users ou
+  JOIN users u ON u.id = ou.id
+  WHERE 1 = 1
+    {internal_filter_join}
+),
+cohort_sizes AS (
+  SELECT cohort, COUNT(DISTINCT id)::int AS cohort_size
+  FROM filtered_onboarded
+  GROUP BY cohort
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{start}')::date,
+    date_trunc('week', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+weekly_user_active AS (
+  SELECT
+    fo.cohort,
+    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start,
+    uah.user_id,
+    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) AS active_days_in_week
+  FROM user_activities_history uah
+  JOIN filtered_onboarded fo ON uah.user_id = fo.id
+  WHERE uah.completed_at >= (DATE '{start}'::timestamp AT TIME ZONE 'America/Sao_Paulo')
+  GROUP BY fo.cohort, week_start, uah.user_id
+),
+weekly_totals AS (
+  SELECT cohort, week_start, SUM(active_days_in_week)::bigint AS total_active_days
+  FROM weekly_user_active
+  GROUP BY cohort, week_start
+)
+SELECT
+  TO_CHAR(w.week_start, 'YYYY-MM-DD') AS week_start,
+  cs.cohort,
+  cs.cohort_size,
+  COALESCE(wt.total_active_days, 0) AS total_active_days,
+  CASE
+    WHEN cs.cohort_size > 0
+    THEN ROUND(COALESCE(wt.total_active_days, 0)::numeric / cs.cohort_size, 2)
+    ELSE 0
+  END AS avg_active_days
+FROM weeks w
+CROSS JOIN cohort_sizes cs
+LEFT JOIN weekly_totals wt ON wt.week_start = w.week_start AND wt.cohort = cs.cohort
+ORDER BY w.week_start, cs.cohort;
+"""
+    return run_query(query)
+
+
 def get_beta_weekly_churn_rate_metrics(start_date_sp: str, exclude_internal: bool = True) -> pd.DataFrame:
     """
     Weekly churn chart metrics for Quick Insights, using beta users as denominator.
@@ -4034,6 +4118,44 @@ ORDER BY wb.week_start
     except Exception as e:
         st.warning(f"Could not load churn rate chart: {e}")
     
+    # Avg Active Days by Cohort — week-on-week
+    st.markdown("### 📅 Avg Active Days by Cohort — Week on Week")
+    try:
+        cohort_df = get_active_days_by_cohort_weekly(weeks_back=12, exclude_internal=exclude_internal)
+        if cohort_df.empty:
+            st.info("No activity data found for the last 12 weeks.")
+        else:
+            cohort_df["avg_active_days"] = cohort_df["avg_active_days"].astype(float)
+            cohort_colors = {"alive": "#00E07B", "at_risk": "#FFA500", "churned": "#FF5000"}
+            cohort_titles = {
+                "alive": "Alive users",
+                "at_risk": "At-risk users (silent ≥5d)",
+                "churned": "Churned users (is_active = false)",
+            }
+            ch1, ch2, ch3 = st.columns(3)
+            for col, cohort_key in zip([ch1, ch2, ch3], ["alive", "at_risk", "churned"]):
+                with col:
+                    st.caption(cohort_titles[cohort_key])
+                    _cdf = cohort_df[cohort_df["cohort"] == cohort_key].copy()
+                    if _cdf.empty or _cdf["avg_active_days"].sum() == 0:
+                        st.info("No data")
+                    else:
+                        cohort_size = int(_cdf["cohort_size"].iloc[0])
+                        _chart = (
+                            alt.Chart(_cdf)
+                            .mark_line(point=True, color=cohort_colors[cohort_key])
+                            .encode(
+                                x=alt.X("week_start:N", sort=None, title="Week"),
+                                y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
+                                tooltip=["week_start", "avg_active_days", "total_active_days"],
+                            )
+                            .properties(height=220)
+                        )
+                        st.altair_chart(_chart, use_container_width=True)
+                        st.caption(f"Denominator: {cohort_size} current {cohort_key.replace('_', '-')} users")
+    except Exception as e:
+        st.warning(f"Could not load cohort active days charts: {e}")
+
     # User Activity by Hour chart
     st.markdown("### 📊 User Activity by Hour")
     
