@@ -6888,48 +6888,51 @@ def _eval_one_thread(client, model, thread):
         # Only accept flags that point at an actual user message.
         if not msg or msg["sender"] != "user":
             continue
-        # Build a small context window around the flagged message.
-        context = [
-            {"sender": cm["sender"], "text": cm["text"]}
-            for cm in thread["messages"]
-            if abs(cm["idx"] - idx) <= 2
-        ]
         flags.append(
             {
-                "waid": thread["waid"],
-                "full_name": thread["full_name"],
-                "user_timezone": thread["user_timezone"],
-                "sent_at": msg["sent_at"],
-                "message": msg["text"],
+                "idx": idx,
                 "issue_type": str(f.get("issue_type", "")).strip() or "frustration",
                 "severity": str(f.get("severity", "")).strip().lower() or "med",
                 "explanation": str(f.get("explanation", "")).strip(),
-                "context": context,
             }
         )
     return flags
 
 
 def run_message_eval(threads, api_key, model, progress_callback=None):
-    """Run the LLM eval over all threads. Returns (flags, errors).
+    """Run the LLM eval over all threads. Returns (flagged_users, errors).
 
-    flags: list of flag dicts. errors: list of (user_label, error_str).
+    flagged_users: list of per-user dicts (only users with >=1 flag), each with
+      waid, full_name, user_timezone, messages (the analysed thread), flags, and
+      max_severity. errors: list of (user_label, error_str).
     """
     from openai import OpenAI  # local import so a missing dep doesn't break import
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-    all_flags = []
+    flagged_users = []
     errors = []
     total = len(threads)
     for i, thread in enumerate(threads):
         try:
-            all_flags.extend(_eval_one_thread(client, model, thread))
+            flags = _eval_one_thread(client, model, thread)
+            if flags:
+                max_sev = min(_SEVERITY_ORDER.get(f["severity"], 1) for f in flags)
+                flagged_users.append(
+                    {
+                        "waid": thread["waid"],
+                        "full_name": thread["full_name"],
+                        "user_timezone": thread["user_timezone"],
+                        "messages": thread["messages"],
+                        "flags": flags,
+                        "max_severity_rank": max_sev,
+                    }
+                )
         except Exception as e:  # keep going on per-user failures
             label = thread.get("full_name") or thread.get("waid") or thread.get("key")
             errors.append((str(label), str(e)))
         if progress_callback:
             progress_callback((i + 1) / total if total else 1.0)
-    return all_flags, errors
+    return flagged_users, errors
 
 
 _SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
@@ -6941,9 +6944,10 @@ if selected_section == "🔔 Alerts":
     st.markdown("### 🔔 Alerts — Message Eval")
 
     st.caption(
-        "An LLM reviews every message from the last 24 hours and flags **user** "
-        "messages that show **frustration or confusion**, using the surrounding "
-        "companion conversation as context."
+        "An LLM reviews the last 24 hours of conversations and flags **users** whose "
+        "messages show issues (frustration, confusion, churn risk, unanswered questions, "
+        "bugs, etc.), using the surrounding companion context. Open a user to inspect the "
+        "conversation."
     )
 
     api_key, eval_model = get_openrouter_config()
@@ -6996,7 +7000,7 @@ if selected_section == "🔔 Alerts":
                 "model": eval_model,
                 "n_users": 0,
                 "n_messages": 0,
-                "flags": [],
+                "flagged_users": [],
                 "errors": [],
             }
             st.info("No user conversations found in the last 24 hours.")
@@ -7007,7 +7011,7 @@ if selected_section == "🔔 Alerts":
             def _update(frac):
                 progress.progress(min(frac, 1.0), text=f"Reviewing {len(threads)} conversations…")
 
-            flags, errors = run_message_eval(threads, api_key, eval_model, progress_callback=_update)
+            flagged_users, errors = run_message_eval(threads, api_key, eval_model, progress_callback=_update)
             progress.empty()
 
             st.session_state["alerts_eval"] = {
@@ -7015,7 +7019,7 @@ if selected_section == "🔔 Alerts":
                 "model": eval_model,
                 "n_users": len(threads),
                 "n_messages": n_messages,
-                "flags": flags,
+                "flagged_users": flagged_users,
                 "errors": errors,
             }
         eval_state = st.session_state.get("alerts_eval")
@@ -7025,7 +7029,7 @@ if selected_section == "🔔 Alerts":
     if eval_state is None:
         st.info("Click **Analyse last 24h** to review messages with the LLM.")
     else:
-        flags = eval_state.get("flags", [])
+        flagged_users = eval_state.get("flagged_users", [])
         errors = eval_state.get("errors", [])
 
         if errors:
@@ -7033,36 +7037,57 @@ if selected_section == "🔔 Alerts":
                 for label, err in errors:
                     st.caption(f"**{label}**: {err}")
 
-        if not flags:
-            st.success("✅ No frustration or confusion flagged in the last 24 hours.")
+        if not flagged_users:
+            st.success("✅ No issues flagged in the last 24 hours.")
         else:
-            n_users_flagged = len({f.get("waid") for f in flags})
-            st.markdown(f"#### 🚩 {len(flags)} flagged message(s) across {n_users_flagged} user(s)")
+            total_issues = sum(len(u.get("flags", [])) for u in flagged_users)
+            st.markdown(f"#### 🚩 {len(flagged_users)} user(s) flagged ({total_issues} issue(s))")
+            st.caption("Each user appears once. Open a row to see the conversation and the flagged messages.")
 
-            sorted_flags = sorted(
-                flags,
-                key=lambda f: (_SEVERITY_ORDER.get(f.get("severity", "med"), 1), str(f.get("sent_at"))),
+            sorted_users = sorted(
+                flagged_users,
+                key=lambda u: (u.get("max_severity_rank", 1), str(u.get("full_name") or "")),
             )
 
-            for f in sorted_flags:
-                display_name = format_display_name(f.get("full_name"), f.get("waid"))
-                local_ts = _format_ts_local(f.get("sent_at"), f.get("user_timezone"))
-                badge = _SEVERITY_BADGE.get(f.get("severity", "med"), f.get("severity", "med"))
-                issue = f.get("issue_type", "")
-                header = f"{badge} · {issue} — {display_name} · {local_ts}"
+            for u in sorted_users:
+                display_name = format_display_name(u.get("full_name"), u.get("waid"))
+                flags = u.get("flags", [])
+                top_badge = _SEVERITY_BADGE.get(
+                    next((k for k, v in _SEVERITY_ORDER.items() if v == u.get("max_severity_rank", 1)), "med"),
+                    "med",
+                )
+                issue_types = sorted({f.get("issue_type", "") for f in flags})
+                header = f"{top_badge} · {display_name} — {', '.join(issue_types)} ({len(flags)})"
+
                 with st.expander(header):
-                    st.markdown(f"**User message:** {f.get('message', '')}")
-                    if f.get("explanation"):
-                        st.caption(f"💡 {f['explanation']}")
-                    context = f.get("context") or []
-                    if context:
-                        st.markdown("**Context:**")
-                        ctx_lines = []
-                        for c in context:
-                            who = "🧑 User" if c["sender"] == "user" else "🤖 Companion"
-                            ctx_lines.append(f"- **{who}:** {c['text']}")
-                        st.markdown("\n".join(ctx_lines))
-                    st.caption(f"WAID: {f.get('waid')}")
+                    # Issue summary (one line per flag)
+                    st.markdown("**Flagged issues**")
+                    for f in sorted(flags, key=lambda f: _SEVERITY_ORDER.get(f.get("severity", "med"), 1)):
+                        badge = _SEVERITY_BADGE.get(f.get("severity", "med"), f.get("severity", "med"))
+                        expl = f.get("explanation", "")
+                        st.markdown(f"- {badge} · **{f.get('issue_type', '')}** — {expl}")
+
+                    # Full conversation as a table, with flagged messages marked
+                    flag_by_idx = {f["idx"]: f for f in flags}
+                    rows = []
+                    for m in u.get("messages", []):
+                        fl = flag_by_idx.get(m["idx"])
+                        rows.append(
+                            {
+                                "time": _format_ts_local(m.get("sent_at"), u.get("user_timezone")),
+                                "sender": "🧑 User" if m["sender"] == "user" else "🤖 Companion",
+                                "message": m.get("text", ""),
+                                "flag": (
+                                    f"{_SEVERITY_BADGE.get(fl.get('severity', 'med'), '')} {fl.get('issue_type', '')}"
+                                    if fl
+                                    else ""
+                                ),
+                            }
+                        )
+                    convo_df = pd.DataFrame(rows, columns=["time", "sender", "message", "flag"])
+                    st.markdown("**Conversation**")
+                    st.dataframe(convo_df, use_container_width=True, hide_index=True)
+                    st.caption(f"WAID: {u.get('waid')}")
 
 
 # Tab 5: Recovery Ladder
