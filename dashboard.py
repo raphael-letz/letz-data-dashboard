@@ -6683,233 +6683,392 @@ ORDER BY cohort_week_start DESC
         st.exception(e)
 
 
-# Tab 4: Alerts (message delivery + future: onboarding drop-off)
-if selected_section == "🔔 Alerts":
-    st.markdown("### 🔔 Alerts")
+# =============================================================================
+# Alerts — LLM eval space
+# Reviews the last 24h of messages via OpenRouter and flags user messages that
+# show frustration or confusion, using surrounding companion context.
+# =============================================================================
 
+# Default daily-run time. Stored as a configurable variable only — there is no
+# automated trigger yet (Streamlit Cloud sleeps when idle; a true cron would
+# need an external runner). The "Analyse" button runs the eval on demand.
+ALERTS_DAILY_RUN_TIME = "09:00"
+
+# Default OpenRouter model. Override with OPENROUTER_MODEL in .env / st.secrets.
+ALERTS_DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
+
+# Internal/system message types that should never be shown to a reviewer.
+_EVAL_EXCLUDED_TYPES = ("think", "tool_use", "tool_result", "turn_audit", "weekly_digest")
+
+# Cap on messages per user thread sent to the LLM (keeps token usage bounded).
+_EVAL_MAX_MSGS_PER_USER = 20
+
+
+def get_openrouter_config():
+    """Return (api_key, model) from Streamlit secrets or .env. api_key may be None."""
+    api_key = None
+    model = None
     try:
-        delivery_df = get_message_delivery_detail()
-    except Exception as e:
-        delivery_df = pd.DataFrame()
-        st.error(f"Could not load message delivery data: {e}")
+        if hasattr(st, "secrets"):
+            if "OPENROUTER_API_KEY" in st.secrets:
+                api_key = st.secrets["OPENROUTER_API_KEY"]
+            if "OPENROUTER_MODEL" in st.secrets:
+                model = st.secrets["OPENROUTER_MODEL"]
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+    if not model:
+        model = os.getenv("OPENROUTER_MODEL")
+    return api_key, (model or ALERTS_DEFAULT_MODEL)
 
-    if not delivery_df.empty:
-        # Load onboarding drop-off and recovery ladder 2 for alert counts in date selector
-        try:
-            _onboarding_df = get_onboarding_dropoff_detail()
-        except Exception:
-            _onboarding_df = pd.DataFrame()
-        try:
-            _late_recovery_df = get_late_stage_recovery_alert_detail()
-        except Exception:
-            _late_recovery_df = pd.DataFrame()
 
-        # Date selector: today / yesterday / day_before (with alert count per date)
-        periods = [
-            ("today", "Today"),
-            ("yesterday", "Yesterday"),
-            ("day_before", "Day before yesterday"),
+@st.cache_data(ttl=120)
+def get_recent_messages_for_eval() -> pd.DataFrame:
+    """User + companion messages from the last 24h, excluding internal users and
+    internal trace types. Ordered by user then sent_at so threads stay chronological."""
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    excluded_types_str = "', '".join(_EVAL_EXCLUDED_TYPES)
+
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+)
+SELECT
+  m.user_id,
+  m.waid,
+  u.full_name,
+  u.timezone AS user_timezone,
+  m.sender,
+  m.type,
+  m.message,
+  m.sent_at
+FROM messages m
+LEFT JOIN users u ON u.id = m.user_id
+WHERE m.sent_at >= NOW() - interval '24 hours'
+  AND m.sender IN ('user', 'companion')
+  AND (m.type IS NULL OR m.type NOT IN ('{excluded_types_str}'))
+  AND COALESCE(m.waid, u.waid) NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+ORDER BY COALESCE(m.user_id::text, m.waid), m.sent_at
+"""
+    return run_query(query)
+
+
+def _build_eval_threads(df: pd.DataFrame) -> list:
+    """Group rows into per-user chronological transcripts.
+
+    Returns a list of dicts: {key, waid, full_name, user_timezone, messages:[...]}
+    where each message has {idx, sender, text, sent_at}. Only the last
+    _EVAL_MAX_MSGS_PER_USER messages per user are kept to bound token usage.
+    """
+    if df is None or df.empty:
+        return []
+
+    threads = []
+    df = df.copy()
+    # Stable grouping key: prefer user_id, fall back to waid.
+    df["_group_key"] = df.apply(
+        lambda r: str(r["user_id"]) if pd.notna(r.get("user_id")) else f"waid:{r.get('waid')}",
+        axis=1,
+    )
+
+    for key, group in df.groupby("_group_key", sort=False):
+        group = group.sort_values("sent_at")
+        if len(group) > _EVAL_MAX_MSGS_PER_USER:
+            group = group.tail(_EVAL_MAX_MSGS_PER_USER)
+        first = group.iloc[0]
+        messages = []
+        for i, (_, row) in enumerate(group.iterrows()):
+            text = _extract_message_text_snippet(row["message"], max_len=600)
+            if not text:
+                continue
+            messages.append(
+                {
+                    "idx": i,
+                    "sender": row["sender"],
+                    "text": text,
+                    "sent_at": row["sent_at"],
+                }
+            )
+        # Skip threads with no user messages — nothing to flag.
+        if not any(m["sender"] == "user" for m in messages):
+            continue
+        threads.append(
+            {
+                "key": key,
+                "waid": first.get("waid"),
+                "full_name": first.get("full_name"),
+                "user_timezone": first.get("user_timezone"),
+                "messages": messages,
+            }
+        )
+    return threads
+
+
+_EVAL_SYSTEM_PROMPT = (
+    "You review a WhatsApp conversation between a user and an AI wellness/fitness "
+    "coaching companion. The conversation is mostly in Brazilian Portuguese.\n\n"
+    "Your job: flag USER messages (sender = 'user') that a human reviewer should look "
+    "at. Use the surrounding companion messages as context to judge intent.\n\n"
+    "Flag a message when it shows any of these issue types:\n"
+    "- frustration: annoyance, anger, complaints (e.g. bot repeats itself, broken flow)\n"
+    "- confusion: the user does not understand what to do or what the bot meant\n"
+    "- dissatisfaction: unhappy with the product, coaching, or results\n"
+    "- churn_risk: wants to quit, cancel, stop, or says the app isn't worth it\n"
+    "- unanswered_question: a direct user question the companion ignored or failed to answer\n"
+    "- bug_report: the user reports something broken or not working\n"
+    "- sensitive: health/safety concern, distress, or anything needing human attention\n\n"
+    "Do NOT flag neutral, positive, or simply brief messages. Only flag genuine issues.\n\n"
+    "Return ONLY valid JSON with this exact shape:\n"
+    '{\"flags\": [{\"idx\": <int index of the user message>, '
+    '\"issue_type\": \"frustration\" | \"confusion\" | \"dissatisfaction\" | '
+    '\"churn_risk\" | \"unanswered_question\" | \"bug_report\" | \"sensitive\", '
+    '\"severity\": \"low\" | \"med\" | \"high\", '
+    '\"explanation\": \"<one short sentence, in English>\"}]}\n'
+    "If nothing should be flagged, return {\"flags\": []}."
+)
+
+
+def _parse_llm_json(content):
+    """Parse JSON from an LLM response that may be wrapped in markdown code fences.
+
+    Some providers (e.g. Anthropic via OpenRouter) ignore response_format and wrap
+    output in ```json ... ``` fences, so a plain json.loads would fail.
+    """
+    if not content:
+        return {}
+    s = str(content).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # Fallback: grab the first {...} block anywhere in the text.
+    match = re.search(r"\{.*\}", s, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return {}
+    return {}
+
+
+def _eval_one_thread(client, model, thread):
+    """Call the LLM for a single thread; return list of flag dicts (may be empty)."""
+    lines = []
+    for m in thread["messages"]:
+        role = "USER" if m["sender"] == "user" else "COMPANION"
+        lines.append(f"[{m['idx']}] {role}: {m['text']}")
+    transcript = "\n".join(lines)
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _EVAL_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Conversation transcript:\n\n{transcript}"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=1200,
+    )
+    content = resp.choices[0].message.content or "{}"
+    parsed = _parse_llm_json(content)
+    raw_flags = parsed.get("flags", []) if isinstance(parsed, dict) else []
+    msgs_by_idx = {m["idx"]: m for m in thread["messages"]}
+    flags = []
+    for f in raw_flags:
+        try:
+            idx = int(f.get("idx"))
+        except (TypeError, ValueError):
+            continue
+        msg = msgs_by_idx.get(idx)
+        # Only accept flags that point at an actual user message.
+        if not msg or msg["sender"] != "user":
+            continue
+        # Build a small context window around the flagged message.
+        context = [
+            {"sender": cm["sender"], "text": cm["text"]}
+            for cm in thread["messages"]
+            if abs(cm["idx"] - idx) <= 2
         ]
-        period_options = [p[1] for p in periods]
-        period_keys = [p[0] for p in periods]
-        ref_dates_in_df = delivery_df.groupby("period").agg({"ref_date": "first"}).to_dict().get("ref_date", {})
-        labels_date_only = []  # e.g. "Today (2026-02-03)" — used in body text
-        labels_with_dates = []  # same + " — N alerts" — used in radio only
-        for key, label in periods:
-            d = ref_dates_in_df.get(key, "")
-            date_only_str = f"{label}" + (f" ({d})" if d else "")
-            labels_date_only.append(date_only_str)
-            msg_missed = int(
-                delivery_df.loc[delivery_df["period"] == key, "missed_morning"].sum()
-                + delivery_df.loc[delivery_df["period"] == key, "missed_evening"].sum()
-            )
-            onb_count = len(_onboarding_df[_onboarding_df["period"] == key]) if not _onboarding_df.empty else 0
-            late_count = len(_late_recovery_df[_late_recovery_df["period"] == key]) if not _late_recovery_df.empty else 0
-            total_alerts = msg_missed + onb_count + late_count
-            labels_with_dates.append(date_only_str + f" — {total_alerts} alert{'s' if total_alerts != 1 else ''}")
-        selected_idx = st.radio(
-            "**Select date**",
-            range(len(labels_with_dates)),
-            format_func=lambda i: labels_with_dates[i],
-            horizontal=True,
-            key="alerts_date_radio",
+        flags.append(
+            {
+                "waid": thread["waid"],
+                "full_name": thread["full_name"],
+                "user_timezone": thread["user_timezone"],
+                "sent_at": msg["sent_at"],
+                "message": msg["text"],
+                "issue_type": str(f.get("issue_type", "")).strip() or "frustration",
+                "severity": str(f.get("severity", "")).strip().lower() or "med",
+                "explanation": str(f.get("explanation", "")).strip(),
+                "context": context,
+            }
         )
-        selected_period = period_keys[selected_idx]
-        selected_ref_date = ref_dates_in_df.get(selected_period, "")
+    return flags
 
-        df_day = delivery_df[delivery_df["period"] == selected_period].copy()
-        missed_count = int(df_day["missed_morning"].sum() + df_day["missed_evening"].sum())
-        date_label = labels_date_only[selected_idx]  # date only, no alert count (for body text)
 
-        if missed_count == 0:
-            st.success(f"✅ No missed messages for **{date_label}**.")
-        else:
-            st.info(f"**{missed_count} message(s) missed** for **{date_label}**.")
+def run_message_eval(threads, api_key, model, progress_callback=None):
+    """Run the LLM eval over all threads. Returns (flags, errors).
 
-        st.markdown(f"#### 📬 Message delivery — {date_label}")
-        # One row per (time, slot): Time | Slot | Due | Missed | Users (always show table for verification)
-        df_day["time_morning"] = df_day["check_in_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
-        df_day["time_evening"] = df_day["daily_digest_time"].apply(lambda x: str(x)[:8] if pd.notna(x) else "")
-        # Ensure boolean columns are int so aggregation and display show numbers, not True/False
-        df_day["_due_morning"] = df_day["due_morning"].fillna(False).astype(int)
-        df_day["_missed_morning"] = df_day["missed_morning"].fillna(False).astype(int)
-        df_day["_due_evening"] = df_day["due_evening"].fillna(False).astype(int)
-        df_day["_missed_evening"] = df_day["missed_evening"].fillna(False).astype(int)
-        morning = df_day.groupby("time_morning").agg(
-            due=("_due_morning", "sum"),
-            missed=("_missed_morning", "sum"),
-        ).reset_index()
-        morning["slot"] = "Morning"
-        morning_names = (
-            df_day[df_day["_missed_morning"] > 0]
-            .copy()
-            .assign(
-                display_name=lambda d: d.apply(
-                    lambda r: format_display_name(r["full_name"], r["waid"], user_id=r.get("user_id")), axis=1
-                )
-            )
-            .drop_duplicates(subset=["time_morning", "waid"])
-            .groupby("time_morning")["display_name"]
-            .apply(lambda s: ", ".join(sorted(s)))
-            .reset_index(name="users")
-        )
-        morning = morning.merge(morning_names, on="time_morning", how="left")
-        morning["users"] = morning["users"].fillna("").astype(str)
-        morning["due"] = morning["due"].astype(int)
-        morning["missed"] = morning["missed"].astype(int)
-        evening = df_day.groupby("time_evening").agg(
-            due=("_due_evening", "sum"),
-            missed=("_missed_evening", "sum"),
-        ).reset_index()
-        evening["slot"] = "Evening"
-        evening_names = (
-            df_day[df_day["_missed_evening"] > 0]
-            .copy()
-            .assign(
-                display_name=lambda d: d.apply(
-                    lambda r: format_display_name(r["full_name"], r["waid"], user_id=r.get("user_id")), axis=1
-                )
-            )
-            .drop_duplicates(subset=["time_evening", "waid"])
-            .groupby("time_evening")["display_name"]
-            .apply(lambda s: ", ".join(sorted(s)))
-            .reset_index(name="users")
-        )
-        evening = evening.merge(evening_names, on="time_evening", how="left")
-        evening["users"] = evening["users"].fillna("").astype(str)
-        evening["due"] = evening["due"].astype(int)
-        evening["missed"] = evening["missed"].astype(int)
-        table = pd.concat([
-            morning.rename(columns={"time_morning": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
-            evening.rename(columns={"time_evening": "check-in time"})[["check-in time", "slot", "due", "missed", "users"]],
-        ], ignore_index=True)
-        table = table.sort_values(["check-in time", "slot"])
-        st.markdown("**By check-in time**")
-        st.dataframe(table, use_container_width=True, hide_index=True)
+    flags: list of flag dicts. errors: list of (user_label, error_str).
+    """
+    from openai import OpenAI  # local import so a missing dep doesn't break import
 
-        # Reply pending > 1hr: users whose last message has no companion reply and > 1hr ago
-        st.markdown("---")
-        st.markdown("### ⏳ Reply pending > 1hr")
-        st.caption("Users who sent a message and have not received a reply within 1 hour. Resets once they get a reply.")
-
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    all_flags = []
+    errors = []
+    total = len(threads)
+    for i, thread in enumerate(threads):
         try:
-            pending_df = get_pending_reply_detail()
-        except Exception as e:
-            pending_df = pd.DataFrame()
-            st.error(f"Could not load pending-reply data: {e}")
+            all_flags.extend(_eval_one_thread(client, model, thread))
+        except Exception as e:  # keep going on per-user failures
+            label = thread.get("full_name") or thread.get("waid") or thread.get("key")
+            errors.append((str(label), str(e)))
+        if progress_callback:
+            progress_callback((i + 1) / total if total else 1.0)
+    return all_flags, errors
 
-        if pending_df.empty:
-            st.success("✅ No users waiting for a reply > 1hr.")
+
+_SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
+_SEVERITY_BADGE = {"high": "🔴 high", "med": "🟠 med", "low": "🟡 low"}
+
+
+# Tab 4: Alerts — LLM eval space
+if selected_section == "🔔 Alerts":
+    st.markdown("### 🔔 Alerts — Message Eval")
+
+    st.caption(
+        "An LLM reviews every message from the last 24 hours and flags **user** "
+        "messages that show **frustration or confusion**, using the surrounding "
+        "companion conversation as context."
+    )
+
+    api_key, eval_model = get_openrouter_config()
+
+    # Config + schedule status row
+    cfg_col, sched_col = st.columns([2, 1])
+    with cfg_col:
+        if api_key:
+            st.markdown(f"**LLM:** `{eval_model}` · OpenRouter ✅")
         else:
-            st.info(f"**{len(pending_df)} user(s)** waiting for a reply > 1hr.")
-        if not pending_df.empty:
-            now_utc = pd.Timestamp.utcnow()
-            pending_display = pending_df[["waid", "full_name", "last_sent_at", "last_message"]].copy()
-            pending_display["full_name"] = pending_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
-            pending_display["last message"] = pending_display["last_message"].apply(
-                lambda m: _extract_message_text_snippet(m, max_len=100)
+            st.warning(
+                "No OpenRouter API key found. Add `OPENROUTER_API_KEY` to your `.env` "
+                "(or Streamlit secrets) to enable analysis. Optionally set "
+                "`OPENROUTER_MODEL` to override the default."
             )
-            pending_display["reply pending"] = pd.to_datetime(pending_display["last_sent_at"], utc=True).apply(
-                lambda t: _format_pending_duration(now_utc - t) if pd.notna(t) else "—"
-            )
-            pending_display["last message at"] = pd.to_datetime(pending_display["last_sent_at"], utc=True).apply(
-                lambda t: t.strftime("%Y-%m-%d %H:%M UTC") if pd.notna(t) else "—"
-            )
-            st.dataframe(
-                pending_display[["waid", "full_name", "last message at", "last message", "reply pending"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+    with sched_col:
+        st.markdown(f"**Scheduled run:** `{ALERTS_DAILY_RUN_TIME}` daily")
+        st.caption("Configured value — runs manually for now.")
 
-        # Late-stage recovery — final recovery push before farewell, or farewell itself
-        st.markdown("---")
-        st.markdown("### 🪜 Late-stage Recovery — Received in last 24h")
-        st.caption("Users about to churn (final recovery push: day_5_recovery / day_20_recovery, or legacy recovery_ladder_2) or just marked inactive (farewell), who received a send on the selected date.")
+    st.markdown("---")
 
-        late_day = _late_recovery_df[_late_recovery_df["period"] == selected_period].copy() if not _late_recovery_df.empty else pd.DataFrame()
-        if late_day.empty:
-            st.success(f"✅ No late-stage recovery sends for **{date_label}**.")
+    eval_state = st.session_state.get("alerts_eval")
+
+    # Last-run line + Analyse button
+    run_col, info_col = st.columns([1, 3])
+    with run_col:
+        analyse_clicked = st.button(
+            "🔍 Analyse last 24h",
+            type="primary",
+            disabled=not api_key,
+            use_container_width=True,
+        )
+    with info_col:
+        if eval_state and eval_state.get("last_run"):
+            st.markdown(
+                f"**Last run:** {eval_state['last_run'].strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                f"· model `{eval_state.get('model', '?')}` · "
+                f"{eval_state.get('n_messages', 0)} messages from "
+                f"{eval_state.get('n_users', 0)} users"
+            )
         else:
-            st.info(f"**{len(late_day)} user(s)** in late-stage recovery received a send on **{date_label}**.")
-            late_display = late_day[["waid", "full_name", "sent_at", "ladder_step", "template_name", "user_timezone"]].copy()
-            late_display["full_name"] = late_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
-            late_display["step"] = late_display["ladder_step"].apply(_label_ladder_step)
-            late_display["received at"] = late_display.apply(
-                lambda row: _format_ts_local(row["sent_at"], row.get("user_timezone")) if pd.notna(row["sent_at"]) else "—",
-                axis=1,
-            )
-            st.dataframe(
-                late_display[["waid", "full_name", "received at", "step", "template_name"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.markdown("**Last run:** _never run yet_")
 
-        # Onboarding drop-off (same date selector; reuse _onboarding_df from date selector)
-        st.markdown("---")
-        st.markdown("### 🚪 Onboarding drop-off")
-        st.caption("Users who messaged on the selected date but dropped off at onboarding (WAID only), or completed onboarding but didn't set a slogan.")
+    if analyse_clicked:
+        with st.spinner("Loading last 24h of messages…"):
+            try:
+                msgs_df = get_recent_messages_for_eval()
+            except Exception as e:
+                msgs_df = pd.DataFrame()
+                st.error(f"Could not load messages: {e}")
+            threads = _build_eval_threads(msgs_df)
 
-        onboarding_df = _onboarding_df if not _onboarding_df.empty else pd.DataFrame()
-        if not onboarding_df.empty:
-            od_day = onboarding_df[onboarding_df["period"] == selected_period].copy()
-            dropped = od_day[od_day["issue_type"] == "dropped_off_onboarding"]
-            no_slogan = od_day[od_day["issue_type"] == "no_slogan"]
-            n_dropped = len(dropped)
-            n_slogan = len(no_slogan)
-
-            if n_dropped == 0:
-                st.success(f"✅ No users dropped off at onboarding for **{date_label}**.")
-            else:
-                st.info(f"**{n_dropped} user(s) dropped off at onboarding** for **{date_label}** (messaged but did not complete onboarding).")
-            st.markdown("**Dropped off at onboarding** (WAID, onboarding started = first user message)")
-            if dropped.empty:
-                st.caption("None")
-            else:
-                dropped_display = dropped[["waid", "onboarding_started_at", "user_timezone"]].copy()
-                dropped_display["onboarding started"] = dropped_display.apply(
-                    lambda row: _format_ts_local(row["onboarding_started_at"], row["user_timezone"]), axis=1
-                )
-                st.dataframe(dropped_display[["waid", "onboarding started"]], use_container_width=True, hide_index=True)
-
-            if n_slogan == 0:
-                st.success(f"✅ No users without slogan for **{date_label}**.")
-            else:
-                st.info(f"**{n_slogan} user(s) without slogan** for **{date_label}**.")
-            st.markdown("**Didn't set slogan** (completed onboarding on selected day but no slogan in post_onboarding flow)")
-            if no_slogan.empty:
-                st.caption("None")
-            else:
-                slogan_display = no_slogan[["waid", "full_name", "onboarding_completed_at", "user_timezone"]].copy()
-                slogan_display["full_name"] = slogan_display.apply(lambda r: format_display_name(r["full_name"], r["waid"]), axis=1)
-                slogan_display["onboarding completed"] = slogan_display.apply(
-                    lambda row: _format_ts_local(row["onboarding_completed_at"], row["user_timezone"]), axis=1
-                )
-                st.dataframe(slogan_display[["waid", "full_name", "onboarding completed"]], use_container_width=True, hide_index=True)
+        if not threads:
+            st.session_state["alerts_eval"] = {
+                "last_run": datetime.now(pytz.timezone("America/Sao_Paulo")),
+                "model": eval_model,
+                "n_users": 0,
+                "n_messages": 0,
+                "flags": [],
+                "errors": [],
+            }
+            st.info("No user conversations found in the last 24 hours.")
         else:
-            st.info("No onboarding drop-off data available.")
+            n_messages = int(sum(len(t["messages"]) for t in threads))
+            progress = st.progress(0.0, text=f"Reviewing {len(threads)} conversations…")
 
+            def _update(frac):
+                progress.progress(min(frac, 1.0), text=f"Reviewing {len(threads)} conversations…")
+
+            flags, errors = run_message_eval(threads, api_key, eval_model, progress_callback=_update)
+            progress.empty()
+
+            st.session_state["alerts_eval"] = {
+                "last_run": datetime.now(pytz.timezone("America/Sao_Paulo")),
+                "model": eval_model,
+                "n_users": len(threads),
+                "n_messages": n_messages,
+                "flags": flags,
+                "errors": errors,
+            }
+        eval_state = st.session_state.get("alerts_eval")
+        st.rerun()
+
+    # Render results from session state
+    if eval_state is None:
+        st.info("Click **Analyse last 24h** to review messages with the LLM.")
     else:
-        st.info("No message delivery data available. Check database connection and that users/messages/reschedule tables exist.")
+        flags = eval_state.get("flags", [])
+        errors = eval_state.get("errors", [])
+
+        if errors:
+            with st.expander(f"⚠️ {len(errors)} conversation(s) failed during analysis"):
+                for label, err in errors:
+                    st.caption(f"**{label}**: {err}")
+
+        if not flags:
+            st.success("✅ No frustration or confusion flagged in the last 24 hours.")
+        else:
+            n_users_flagged = len({f.get("waid") for f in flags})
+            st.markdown(f"#### 🚩 {len(flags)} flagged message(s) across {n_users_flagged} user(s)")
+
+            sorted_flags = sorted(
+                flags,
+                key=lambda f: (_SEVERITY_ORDER.get(f.get("severity", "med"), 1), str(f.get("sent_at"))),
+            )
+
+            for f in sorted_flags:
+                display_name = format_display_name(f.get("full_name"), f.get("waid"))
+                local_ts = _format_ts_local(f.get("sent_at"), f.get("user_timezone"))
+                badge = _SEVERITY_BADGE.get(f.get("severity", "med"), f.get("severity", "med"))
+                issue = f.get("issue_type", "")
+                header = f"{badge} · {issue} — {display_name} · {local_ts}"
+                with st.expander(header):
+                    st.markdown(f"**User message:** {f.get('message', '')}")
+                    if f.get("explanation"):
+                        st.caption(f"💡 {f['explanation']}")
+                    context = f.get("context") or []
+                    if context:
+                        st.markdown("**Context:**")
+                        ctx_lines = []
+                        for c in context:
+                            who = "🧑 User" if c["sender"] == "user" else "🤖 Companion"
+                            ctx_lines.append(f"- **{who}:** {c['text']}")
+                        st.markdown("\n".join(ctx_lines))
+                    st.caption(f"WAID: {f.get('waid')}")
 
 
 # Tab 5: Recovery Ladder
