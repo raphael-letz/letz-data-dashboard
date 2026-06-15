@@ -6948,20 +6948,14 @@ if selected_section == "🔔 Alerts":
 
     api_key, eval_model = get_openrouter_config()
 
-    # Config + schedule status row
-    cfg_col, sched_col = st.columns([2, 1])
-    with cfg_col:
-        if api_key:
-            st.markdown(f"**LLM:** `{eval_model}` · OpenRouter ✅")
-        else:
-            st.warning(
-                "No OpenRouter API key found. Add `OPENROUTER_API_KEY` to your `.env` "
-                "(or Streamlit secrets) to enable analysis. Optionally set "
-                "`OPENROUTER_MODEL` to override the default."
-            )
-    with sched_col:
-        st.markdown(f"**Scheduled run:** `{ALERTS_DAILY_RUN_TIME}` daily")
-        st.caption("Configured value — runs manually for now.")
+    if api_key:
+        st.markdown(f"**LLM:** `{eval_model}` · OpenRouter ✅")
+    else:
+        st.warning(
+            "No OpenRouter API key found. Add `OPENROUTER_API_KEY` to your `.env` "
+            "(or Streamlit secrets) to enable analysis. Optionally set "
+            "`OPENROUTER_MODEL` to override the default."
+        )
 
     st.markdown("---")
 
