@@ -1544,14 +1544,147 @@ def _label_ladder_step(ladder_step: str | None) -> str:
     """Human-readable label for a recovery_logs.ladder_step value ('' if empty)."""
     if not ladder_step or pd.isna(ladder_step):
         return ""
-    m = re.match(r"^day_(\d+)_(recovery|random_fun_image)$", str(ladder_step))
+    m = re.match(r"^day_(\d+)_(recovery|random_fun_image|farewell)$", str(ladder_step))
     if m:
         spec = AT_RISK_RUNG_SPEC.get(ladder_step)
-        sub = spec[1] if spec else ("Random fun image" if m.group(2) == "random_fun_image" else "Recovery")
+        if m.group(2) == "farewell":
+            sub = "Farewell"
+        elif spec:
+            sub = spec[1]
+        else:
+            sub = "Random fun image" if m.group(2) == "random_fun_image" else "Recovery"
         return f"Day {int(m.group(1))} — {sub}"
+    m_shift = re.match(r"^day_(\d+)_(morning|evening)$", str(ladder_step))
+    if m_shift:
+        return f"Day {int(m_shift.group(1))} — {m_shift.group(2).capitalize()}"
     if ladder_step in _LADDER_STEP_LABELS:
         return _LADDER_STEP_LABELS[ladder_step]
     return str(ladder_step).replace("_", " ").strip().capitalize()
+
+
+# PDF recovery-ladder milestones (Letz Recovery Ladder diagram).
+_RECOVERY_MILESTONES_LE3 = [
+    (1, "day_1_morning/evening"),
+    (2, "day_2_recovery"),
+    (3, "day_3_random_fun_image"),
+    (5, "day_5_recovery"),
+    (10, "day_10_random_fun_image"),
+    (20, "day_20_farewell"),
+]
+_RECOVERY_MILESTONES_GT3 = [
+    (1, "day_1_morning/evening"),
+    (2, "day_2_morning/evening"),
+    (3, "day_3_recovery"),
+    (5, "day_5_random_fun_image"),
+    (8, "day_8_recovery"),
+    (10, "day_10_recovery"),
+    (15, "day_15_random_fun_image"),
+    (20, "day_20_recovery"),
+    (25, "day_25_random_fun_image"),
+    (35, "day_35_farewell"),
+]
+
+
+def _recovery_milestones(active_days: int) -> list[tuple[int, str]]:
+    return _RECOVERY_MILESTONES_LE3 if int(active_days or 0) <= 3 else _RECOVERY_MILESTONES_GT3
+
+
+def _pdf_ladder_step(active_days: int, days_afk: int) -> str | None:
+    """Exact PDF ladder step for today's days_afk (None if between milestones)."""
+    for day_num, step in _recovery_milestones(active_days):
+        if days_afk == day_num:
+            return step
+    return None
+
+
+def _next_ladder_step(active_days: int, days_afk: int) -> str | None:
+    """Next PDF milestone step after the user's current days_afk."""
+    farewell_day = 20 if int(active_days or 0) <= 3 else 35
+    if days_afk >= farewell_day:
+        return None
+    for day_num, step in _recovery_milestones(active_days):
+        if day_num > days_afk:
+            return step
+    return None
+
+
+def _ladder_position_label(active_days: int, days_afk: int) -> str:
+    """Human-readable ladder position (past milestone + next milestone)."""
+    milestones = _recovery_milestones(active_days)
+    farewell_day = milestones[-1][0]
+    if days_afk <= 0:
+        return "Active (not AFK)"
+    if days_afk >= farewell_day:
+        return f"Past farewell (day {farewell_day})"
+    past = None
+    nxt = None
+    for day_num, _step in milestones:
+        if day_num <= days_afk:
+            past = day_num
+        elif nxt is None:
+            nxt = day_num
+            break
+    if past is None:
+        return "Before first ladder step"
+    if nxt is None:
+        return f"Past day {past}"
+    if days_afk in {m[0] for m in milestones}:
+        return f"On day {days_afk} ladder"
+    return f"Past day {past}, next: day {nxt}"
+
+
+def _format_milestone_step(step: str | None) -> str:
+    """Format a PDF milestone step id for display."""
+    if not step:
+        return "—"
+    if "/" in step:
+        return step.replace("_", " ").replace("/", " / ")
+    labeled = _label_ladder_step(step)
+    return labeled if labeled else step.replace("_", " ")
+
+
+@st.cache_data(ttl=300)
+def get_afk_users_distribution(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Snapshot of active AFK users (no user message in 24h+) grouped by days_afk.
+    Matches FETCH_RECOVERY_TARGETS days_afk logic (waid-based last user message).
+    """
+    internal_filter = get_internal_users_filter_join_sql(exclude_internal=True, table_alias="u")
+    return run_query(f"""
+WITH base AS (
+  SELECT
+    u.id,
+    COALESCE(u.active_days, 0)::int AS active_days,
+    EXTRACT(DAY FROM NOW() - last_msg.last_user_message_at)::int AS days_afk
+  FROM users u
+  CROSS JOIN LATERAL (
+    SELECT MAX(me.sent_at) AS last_user_message_at
+    FROM messages me
+    WHERE me.waid = u.waid
+      AND me.sender = 'user'
+      AND me.type NOT IN ('think', 'tool_use', 'tool_result', 'turn_audit')
+  ) last_msg
+  WHERE u.is_active = true
+    {internal_filter}
+    AND last_msg.last_user_message_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM messages me
+      WHERE me.waid = u.waid
+        AND me.sender = 'user'
+        AND me.sent_at > NOW() - INTERVAL '24 hours'
+        AND me.type NOT IN ('think', 'tool_use', 'tool_result', 'turn_audit')
+    )
+)
+SELECT
+  days_afk,
+  COUNT(*)::int AS users,
+  COUNT(*) FILTER (WHERE active_days <= 3)::int AS low_active_users,
+  COUNT(*) FILTER (WHERE active_days > 3)::int AS high_active_users
+FROM base
+WHERE days_afk >= 1
+GROUP BY days_afk
+ORDER BY days_afk
+""")
 
 
 @st.cache_data(ttl=300)
@@ -2475,12 +2608,21 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
         WITH user_base AS (
             SELECT
                 id,
+                waid,
+                timezone,
                 COALESCE(active_days, 0)::int AS active_days,
                 active_days_goal::int AS active_days_goal,
                 onboarding_timestamp,
                 metadata
             FROM users
             WHERE id = {user_id}
+        ),
+        last_user_msg AS (
+            SELECT MAX(me.sent_at) AS last_user_message_at
+            FROM messages me
+            JOIN user_base ub ON me.waid = ub.waid
+            WHERE me.sender = 'user'
+              AND me.type NOT IN ('think', 'tool_use', 'tool_result', 'turn_audit')
         ),
         message_stats AS (
             SELECT
@@ -2524,6 +2666,23 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
             ORDER BY sent_at DESC
             LIMIT 1
         ),
+        last_ladder_since_afk AS (
+            SELECT rl.ladder_step, rl.sent_at
+            FROM recovery_logs rl
+            JOIN last_user_msg lum ON true
+            WHERE rl.user_id = {user_id}
+              AND rl.ladder_step != 'weekly_review'
+              AND rl.created_at > lum.last_user_message_at
+            ORDER BY rl.created_at DESC
+            LIMIT 1
+        ),
+        recovery_attempts_since_afk AS (
+            SELECT COUNT(*)::int AS recovery_attempts
+            FROM recovery_logs rl
+            JOIN last_user_msg lum ON true
+            WHERE rl.user_id = {user_id}
+              AND rl.created_at > lum.last_user_message_at
+        ),
         first_reply_after_last_recovery AS (
             SELECT m.sent_at
             FROM messages m
@@ -2549,6 +2708,13 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
             lr.sent_at AS last_recovery_sent_at,
             lrr.ladder_step AS last_rung_step,
             lrr.sent_at AS last_rung_sent_at,
+            CASE
+                WHEN lum.last_user_message_at IS NULL THEN NULL
+                ELSE EXTRACT(DAY FROM NOW() - lum.last_user_message_at)::int
+            END AS days_afk,
+            llsa.ladder_step AS last_ladder_step_since_afk,
+            llsa.sent_at AS last_ladder_step_since_afk_at,
+            COALESCE(rasa.recovery_attempts, 0)::int AS recovery_attempts_since_afk,
             (fr.sent_at <= lr.sent_at + INTERVAL '24 hours') AS conv24,
             (fr.sent_at <= lr.sent_at + INTERVAL '72 hours') AS conv72,
             EXTRACT(EPOCH FROM (fr.sent_at - lr.sent_at)) / 3600 AS hours_to_reply,
@@ -2583,6 +2749,9 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
         LEFT JOIN last_completed lc ON true
         LEFT JOIN last_recovery lr ON true
         LEFT JOIN last_recovery_rung lrr ON true
+        LEFT JOIN last_user_msg lum ON true
+        LEFT JOIN last_ladder_since_afk llsa ON true
+        LEFT JOIN recovery_attempts_since_afk rasa ON true
         LEFT JOIN first_reply_after_last_recovery fr ON true
     """)
 
@@ -4842,7 +5011,17 @@ if selected_section == "🔍 User Deep Dive":
         last_recovery_sent_at = summary.get('last_recovery_sent_at')
         last_recovery_time = format_ts_local(last_recovery_sent_at) if pd.notna(last_recovery_sent_at) else "—"
 
-        # Current recovery-ladder rung (latest recovery/fun-image/farewell send; incl legacy steps)
+        # Recovery ladder position (PDF milestones + last send since AFK)
+        days_afk = int(summary.get('days_afk', 0) or 0) if pd.notna(summary.get('days_afk')) else 0
+        is_afk = outside_24h_flag and days_afk >= 1
+        pdf_step = _pdf_ladder_step(active_days_count, days_afk) if is_afk else None
+        next_ladder_step = _next_ladder_step(active_days_count, days_afk) if is_afk else None
+        ladder_position = _ladder_position_label(active_days_count, days_afk) if is_afk else "Active (not AFK)"
+
+        last_ladder_since_afk = summary.get('last_ladder_step_since_afk') if pd.notna(summary.get('last_ladder_step_since_afk')) else None
+        last_ladder_since_afk_at = summary.get('last_ladder_step_since_afk_at')
+        recovery_attempts_since_afk = int(summary.get('recovery_attempts_since_afk', 0) or 0)
+
         last_rung_step = summary.get('last_rung_step') if pd.notna(summary.get('last_rung_step')) else None
         last_rung_sent_at = summary.get('last_rung_sent_at')
         recovery_cohort_label = "≤3 active days" if active_days_count <= 3 else ">3 active days"
@@ -4916,20 +5095,35 @@ if selected_section == "🔍 User Deep Dive":
         with info_col2:
             st.info(f"**Slogan / Mantra:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
 
-        # Current recovery-ladder step badge
-        if last_rung_step:
+        st.markdown("#### 🪜 Recovery Ladder Position")
+        afk_col1, afk_col2, afk_col3 = st.columns(3)
+        with afk_col1:
+            st.metric("Days AFK", days_afk if is_afk else 0, "No user msg in 24h+" if is_afk else "Active")
+        with afk_col2:
+            next_label = _format_milestone_step(next_ladder_step)
+            st.metric("Next Ladder Step", next_label, ladder_position)
+        with afk_col3:
+            if pdf_step:
+                st.metric("Today's PDF Step", _format_milestone_step(pdf_step), recovery_cohort_label)
+            else:
+                st.metric("Today's PDF Step", "—" if is_afk else "N/A", recovery_cohort_label)
+
+        if is_afk:
+            if last_ladder_since_afk:
+                since_afk_label = _label_ladder_step(last_ladder_since_afk)
+                since_afk_time = format_ts_local(last_ladder_since_afk_at) if pd.notna(last_ladder_since_afk_at) else "—"
+                st.markdown(
+                    f"**Last step since AFK:** {since_afk_label} · sent {since_afk_time}"
+                    f" · {recovery_attempts_since_afk} recovery attempt(s) this AFK period"
+                )
+            else:
+                st.markdown(f"**Last step since AFK:** — (none yet) · {recovery_cohort_label}")
+        elif last_rung_step:
             rung_label = _label_ladder_step(last_rung_step)
             rung_time = format_ts_local(last_rung_sent_at) if pd.notna(last_rung_sent_at) else "—"
-            days_since_rung = None
-            try:
-                _t = pd.to_datetime(last_rung_sent_at, utc=True)
-                days_since_rung = (pd.Timestamp.now(tz="UTC") - _t).total_seconds() / 86400
-            except Exception:
-                days_since_rung = None
-            stale_note = " · ⚠️ stale (>7d)" if days_since_rung is not None and days_since_rung > 7 else ""
-            st.markdown(f"🪜 **Recovery step:** {rung_label} · {recovery_cohort_label} · sent {rung_time}{stale_note}")
+            st.markdown(f"**Most recent recovery send:** {rung_label} · sent {rung_time} · {recovery_cohort_label}")
         else:
-            st.markdown(f"🪜 **Recovery step:** — (no recovery-ladder sends) · {recovery_cohort_label}")
+            st.markdown(f"**Recovery ladder:** — (no recovery sends) · {recovery_cohort_label}")
 
         # Funnel metrics: onboarding completed, slogan set, first activity completed
         st.markdown("#### 🎯 User Journey Funnel")
@@ -5021,7 +5215,7 @@ if selected_section == "🔍 User Deep Dive":
         m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
         m4.metric("⏱️ Last Active", last_active)
         m5.metric("💬 Messages Sent (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
-        m6.metric("Outside 24h", "Yes" if outside_24h_flag else "No")
+        m6.metric("Days AFK", days_afk if is_afk else 0, "Active" if not is_afk else "24h+ silent")
         m7.metric("Recovery Sends", user_recovery_count, f"Last: {last_recovery_time}")
         m8.metric("Recovery Conversion", "✓ 24h" if conv24 else ("✓ 72h" if conv72 else "—"), hrs_reply_fmt)
 
@@ -7093,6 +7287,57 @@ if selected_section == "🔔 Alerts":
 # Tab 5: Recovery Ladder
 if selected_section == "🪜 Recovery Ladder":
     st.markdown("### 🪜 Recovery Ladder")
+
+    # Section 0: current AFK snapshot — distribution by days AFK (FETCH_RECOVERY_TARGETS logic)
+    st.markdown("#### 📊 AFK Users by Days Silent (current snapshot)")
+    st.caption("Active users with no inbound message in 24h+. Days AFK = days since last user message (waid-based). Internal users excluded.")
+    try:
+        afk_dist_df = get_afk_users_distribution(exclude_internal=True)
+    except Exception as e:
+        afk_dist_df = pd.DataFrame()
+        st.warning(f"Could not load AFK distribution: {e}")
+
+    if afk_dist_df.empty:
+        st.info("No AFK users right now.")
+    else:
+        total_afk = int(afk_dist_df["users"].sum())
+        low_active_total = int(afk_dist_df["low_active_users"].sum())
+        high_active_total = int(afk_dist_df["high_active_users"].sum())
+        k_afk1, k_afk2, k_afk3 = st.columns(3)
+        k_afk1.metric("Total AFK users", total_afk)
+        k_afk2.metric("≤3 active days", low_active_total)
+        k_afk3.metric(">3 active days", high_active_total)
+
+        try:
+            import altair as alt
+
+            chart_src = afk_dist_df.copy()
+            chart_src["days_afk_num"] = chart_src["days_afk"].astype(int)
+            chart_src["days_afk_label"] = chart_src["days_afk_num"].astype(str)
+            bar_chart = (
+                alt.Chart(chart_src)
+                .mark_bar(color="#00d4aa")
+                .encode(
+                    x=alt.X("days_afk_label:N", sort=alt.EncodingSortField(field="days_afk_num", order="ascending"), title="Days AFK"),
+                    y=alt.Y("users:Q", title="Users"),
+                    tooltip=[
+                        alt.Tooltip("days_afk_label:N", title="Days AFK"),
+                        alt.Tooltip("users:Q", title="Users"),
+                        alt.Tooltip("low_active_users:Q", title="≤3 active days"),
+                        alt.Tooltip("high_active_users:Q", title=">3 active days"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(bar_chart, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not render AFK distribution chart: {e}")
+
+        display_df = afk_dist_df.copy()
+        display_df.columns = ["Days AFK", "Users", "≤3 active days", ">3 active days"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
 
     try:
         timeline_df, rung_df, active_users = get_recovery_weekly_active_user_reach(weeks_back=6, exclude_internal=True)
