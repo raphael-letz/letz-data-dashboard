@@ -780,6 +780,21 @@ daily_completions AS (
   WHERE uah.completed_at >= ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 84)
   GROUP BY d
 ),
+mau_windows AS (
+  SELECT
+    COUNT(DISTINCT uah.user_id) FILTER (
+      WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
+            >= (now() AT TIME ZONE 'America/Sao_Paulo')::date - 30
+    ) AS mau_current,
+    COUNT(DISTINCT uah.user_id) FILTER (
+      WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
+            >= (now() AT TIME ZONE 'America/Sao_Paulo')::date - 60
+        AND (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
+            <  (now() AT TIME ZONE 'America/Sao_Paulo')::date - 30
+    ) AS mau_prev
+  FROM user_activities_history uah
+  JOIN base_users bu ON bu.id = uah.user_id
+),
 days_14 AS (
   SELECT gs::date AS d
   FROM generate_series(
@@ -792,9 +807,12 @@ daily_series AS (
   SELECT
     d.d::text AS activity_date,
     COALESCE(dc.dau, 0)::numeric AS dau,
+    mw.mau_current::numeric AS mau,
+    mw.mau_prev::numeric AS mau_prev,
     'daily'::text AS row_type
   FROM days_14 d
   LEFT JOIN daily_completions dc ON dc.d = d.d
+  CROSS JOIN mau_windows mw
 ),
 weeks AS (
   SELECT gs::date AS week_start
@@ -808,6 +826,8 @@ weekly_series AS (
   SELECT
     TO_CHAR(w.week_start, 'YYYY-MM-DD') AS activity_date,
     ROUND(AVG(COALESCE(dc.dau, 0)), 1) AS dau,
+    NULL::numeric AS mau,
+    NULL::numeric AS mau_prev,
     'weekly'::text AS row_type
   FROM weeks w
   CROSS JOIN LATERAL (
@@ -817,9 +837,9 @@ weekly_series AS (
   LEFT JOIN daily_completions dc ON dc.d = dow.d
   GROUP BY w.week_start
 )
-SELECT activity_date, dau, row_type FROM daily_series
+SELECT activity_date, dau, mau, mau_prev, row_type FROM daily_series
 UNION ALL
-SELECT activity_date, dau, row_type FROM weekly_series
+SELECT activity_date, dau, mau, mau_prev, row_type FROM weekly_series
 ORDER BY row_type, activity_date
 """
     return run_query(query)
@@ -3640,7 +3660,7 @@ if selected_section == "📊 Quick Insights":
     at_risk_5d_pct = round(100 * at_risk_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
     active_users_5d_pct = round(100 * active_users_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
 
-    # ── DAU data loading ─────────────────────────────────────────────────────
+    # ── DAU / MAU data loading ────────────────────────────────────────────────
     try:
         _dau_df = get_dau_metrics(exclude_internal)
         _dau_daily = _dau_df[_dau_df["row_type"] == "daily"].copy() if not _dau_df.empty else pd.DataFrame()
@@ -3648,21 +3668,32 @@ if selected_section == "📊 Quick Insights":
         _dau_daily["dau"] = pd.to_numeric(_dau_daily["dau"], errors="coerce").fillna(0)
         dau_7d = float(_dau_daily.tail(7)["dau"].mean()) if len(_dau_daily) >= 7 else 0.0
         dau_prev_7d = float(_dau_daily.head(7)["dau"].mean()) if len(_dau_daily) >= 14 else 0.0
+        _mau_row = _dau_daily.iloc[-1] if not _dau_daily.empty else None
+        mau_current = float(_mau_row["mau"]) if _mau_row is not None and pd.notna(_mau_row.get("mau")) else 0.0
+        mau_prev = float(_mau_row["mau_prev"]) if _mau_row is not None and pd.notna(_mau_row.get("mau_prev")) else 0.0
+        dau_mau = round(dau_7d / mau_current, 3) if mau_current else 0.0
+        dau_mau_prev = round(dau_prev_7d / mau_prev, 3) if mau_prev else 0.0
     except Exception as _dau_err:
         _dau_weekly = pd.DataFrame()
-        dau_7d = dau_prev_7d = 0.0
+        dau_7d = dau_prev_7d = mau_current = mau_prev = dau_mau = dau_mau_prev = 0.0
         st.warning(f"Could not load DAU metrics: {_dau_err}")
 
-    # ── 1. DAU single metric ─────────────────────────────────────────────────
+    # ── 1. DAU + DAU/MAU metrics ─────────────────────────────────────────────
     _dau_delta = round(dau_7d - dau_prev_7d, 1)
-    _dau_col, _ = st.columns([1, 3])
-    _dau_col.metric(
+    _dau_mau_delta = round(dau_mau - dau_mau_prev, 3)
+    _mc1, _mc2, _ = st.columns([1, 1, 2])
+    _mc1.metric(
         "DAU — avg last 7d",
         f"{dau_7d:.1f}",
         delta=f"{_dau_delta:+.1f} vs prev 7d",
-        help="Daily Active Users: distinct users who completed at least one activity that day, averaged over the last 7 days.",
+        help="Avg daily distinct users who completed ≥1 activity, over the last 7 days vs the prior 7 days.",
     )
-    _dau_col.caption("Active = ≥1 activity completion (user_activities_history) · external users only")
+    _mc2.metric(
+        "DAU/MAU",
+        f"{dau_mau:.1%}",
+        delta=f"{_dau_mau_delta:+.1%} vs prev",
+        help="DAU (avg last 7d) ÷ MAU (distinct active users last 30d). Prev compares avg DAU days 8–14 ÷ MAU days 31–60.",
+    )
 
     st.markdown("---")
 
