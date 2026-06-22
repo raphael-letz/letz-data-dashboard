@@ -751,6 +751,81 @@ SELECT
 
 
 @st.cache_data(ttl=300)
+def get_dau_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Daily Active Users (DAU) for Quick Insights.
+    Active = distinct users with ≥1 activity completion (user_activities_history) on that day.
+
+    Returns two row_types in one DataFrame:
+      'daily'  — last 14 days (for 7d vs prev-7d metric comparison)
+      'weekly' — last 12 weeks with avg_dau per week (for the trend chart)
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+base_users AS (
+  SELECT u.id
+  FROM users u
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+),
+daily_completions AS (
+  SELECT
+    (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS d,
+    COUNT(DISTINCT uah.user_id) AS dau
+  FROM user_activities_history uah
+  JOIN base_users bu ON bu.id = uah.user_id
+  WHERE uah.completed_at >= ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 84)
+  GROUP BY d
+),
+days_14 AS (
+  SELECT gs::date AS d
+  FROM generate_series(
+    (now() AT TIME ZONE 'America/Sao_Paulo')::date - 14,
+    (now() AT TIME ZONE 'America/Sao_Paulo')::date - 1,
+    interval '1 day'
+  ) AS gs
+),
+daily_series AS (
+  SELECT
+    d.d::text AS activity_date,
+    COALESCE(dc.dau, 0)::numeric AS dau,
+    'daily'::text AS row_type
+  FROM days_14 d
+  LEFT JOIN daily_completions dc ON dc.d = d.d
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date - 84)::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+weekly_series AS (
+  SELECT
+    TO_CHAR(w.week_start, 'YYYY-MM-DD') AS activity_date,
+    ROUND(AVG(COALESCE(dc.dau, 0)), 1) AS dau,
+    'weekly'::text AS row_type
+  FROM weeks w
+  CROSS JOIN LATERAL (
+    SELECT gs::date AS d
+    FROM generate_series(w.week_start, (w.week_start + 6)::date, interval '1 day') AS gs
+  ) dow
+  LEFT JOIN daily_completions dc ON dc.d = dow.d
+  GROUP BY w.week_start
+)
+SELECT activity_date, dau, row_type FROM daily_series
+UNION ALL
+SELECT activity_date, dau, row_type FROM weekly_series
+ORDER BY row_type, activity_date
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
 def get_dotz_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
     """
     Fetch Dotz-only headline KPIs for the Dotz tab.
@@ -1291,6 +1366,226 @@ WHERE r.ladder_step IN ('day_5_recovery', 'day_20_recovery', 'recovery_ladder_2'
   AND (r.sent_at AT TIME ZONE 'America/Sao_Paulo')::date = rd.ref_date
   AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
 ORDER BY rd.ref_date DESC, r.sent_at DESC;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_recovery_alert_effectiveness_7d(exclude_internal: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Recovery alert effectiveness for Stack B: last 7 days vs previous 7 days.
+
+    A "recovery alert" is any recovery_logs row whose ladder_step contains 'recovery'
+    or equals 'onboarding_come_back'. Stack B only, external users only.
+
+    summary_df columns: window_name, users_reached, came_back_count, recovery_rate_pct,
+                        avg_active_days_all, avg_active_days_recovered, avg_active_days_not_recovered
+
+    by_step_df columns (last_7d only): ladder_step, template_name, users_reached,
+                                       came_back_count, recovery_rate_pct, avg_active_days
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    uv_msg_filter = get_user_visible_message_filter_sql("m")
+
+    summary_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+windows AS (
+  SELECT 'last_7d'::text AS window_name,
+         ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 7) AS w_start,
+         (now() AT TIME ZONE 'America/Sao_Paulo')::date       AS w_end
+  UNION ALL
+  SELECT 'prev_7d',
+         ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 14),
+         ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 7)
+),
+recovery_sends AS (
+  SELECT
+    rl.user_id,
+    w.window_name,
+    w.w_start,
+    w.w_end,
+    MIN(rl.sent_at AT TIME ZONE 'America/Sao_Paulo') AS first_alert_at
+  FROM recovery_logs rl
+  JOIN users u ON u.id = rl.user_id
+  CROSS JOIN windows w
+  WHERE u.stack_variant = 'B'
+    AND u.is_active = true
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+    AND (rl.ladder_step LIKE '%recovery%' OR rl.ladder_step = 'onboarding_come_back')
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= w.w_start
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < w.w_end
+  GROUP BY rl.user_id, w.window_name, w.w_start, w.w_end
+),
+with_profile AS (
+  SELECT rs.*, u.active_days
+  FROM recovery_sends rs
+  JOIN users u ON u.id = rs.user_id
+),
+came_back AS (
+  SELECT
+    wp.user_id,
+    wp.window_name,
+    CASE WHEN COUNT(m.id) > 0 THEN 1 ELSE 0 END AS came_back
+  FROM with_profile wp
+  LEFT JOIN messages m
+    ON m.user_id = wp.user_id
+    AND m.sender = 'user'
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo') > wp.first_alert_at
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < wp.w_end
+    {uv_msg_filter}
+  GROUP BY wp.user_id, wp.window_name
+)
+SELECT
+  wp.window_name,
+  COUNT(DISTINCT wp.user_id)                                                      AS users_reached,
+  SUM(cb.came_back)                                                               AS came_back_count,
+  ROUND(100.0 * SUM(cb.came_back) / NULLIF(COUNT(DISTINCT wp.user_id), 0), 1)   AS recovery_rate_pct,
+  ROUND(AVG(wp.active_days), 1)                                                   AS avg_active_days_all,
+  ROUND(AVG(CASE WHEN cb.came_back = 1 THEN wp.active_days END), 1)               AS avg_active_days_recovered,
+  ROUND(AVG(CASE WHEN cb.came_back = 0 THEN wp.active_days END), 1)               AS avg_active_days_not_recovered
+FROM with_profile wp
+LEFT JOIN came_back cb ON cb.user_id = wp.user_id AND cb.window_name = wp.window_name
+GROUP BY wp.window_name
+ORDER BY wp.window_name DESC
+"""
+
+    by_step_query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+w_start AS (
+  SELECT ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 7) AS d_start,
+         (now() AT TIME ZONE 'America/Sao_Paulo')::date        AS d_end
+),
+recovery_sends AS (
+  SELECT
+    rl.user_id,
+    rl.ladder_step,
+    COALESCE(rl.template_name, 'unknown') AS template_name,
+    MIN(rl.sent_at AT TIME ZONE 'America/Sao_Paulo') AS first_alert_at,
+    (SELECT d_end FROM w_start) AS w_end
+  FROM recovery_logs rl
+  JOIN users u ON u.id = rl.user_id
+  CROSS JOIN w_start ws
+  WHERE u.stack_variant = 'B'
+    AND u.is_active = true
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+    AND (rl.ladder_step LIKE '%recovery%' OR rl.ladder_step = 'onboarding_come_back')
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= ws.d_start
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < ws.d_end
+  GROUP BY rl.user_id, rl.ladder_step, rl.template_name
+),
+came_back AS (
+  SELECT
+    rs.user_id,
+    rs.ladder_step,
+    rs.template_name,
+    CASE WHEN COUNT(m.id) > 0 THEN 1 ELSE 0 END AS came_back
+  FROM recovery_sends rs
+  LEFT JOIN messages m
+    ON m.user_id = rs.user_id
+    AND m.sender = 'user'
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo') > rs.first_alert_at
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < rs.w_end
+    {uv_msg_filter}
+  GROUP BY rs.user_id, rs.ladder_step, rs.template_name
+)
+SELECT
+  cb.ladder_step,
+  cb.template_name,
+  COUNT(DISTINCT cb.user_id)                                                      AS users_reached,
+  SUM(cb.came_back)                                                               AS came_back_count,
+  ROUND(100.0 * SUM(cb.came_back) / NULLIF(COUNT(DISTINCT cb.user_id), 0), 1)   AS recovery_rate_pct,
+  ROUND(AVG(u.active_days), 1)                                                    AS avg_active_days
+FROM came_back cb
+JOIN users u ON u.id = cb.user_id
+GROUP BY cb.ladder_step, cb.template_name
+ORDER BY users_reached DESC
+"""
+    return run_query(summary_query), run_query(by_step_query)
+
+
+@st.cache_data(ttl=300)
+def get_recovery_rate_weekly_since(start_date_sp: str, exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Weekly recovery rate for Stack B recovery alerts since start_date_sp.
+
+    For each Monday-start week: users who received a recovery alert AND came back
+    (sent a user message after the first alert in the same week).
+
+    Returns columns: week_start, users_reached, came_back_count, recovery_rate_pct,
+                     avg_active_days_all, avg_active_days_recovered
+    """
+    internal_waids = load_internal_users()
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    uv_msg_filter = get_user_visible_message_filter_sql("m")
+
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM generate_series(
+    date_trunc('week', DATE '{start_date_sp}')::date,
+    date_trunc('week', (now() AT TIME ZONE 'America/Sao_Paulo')::date),
+    interval '7 days'
+  ) AS gs
+),
+week_bounds AS (
+  SELECT week_start, (week_start + interval '7 days')::date AS week_end
+  FROM weeks
+),
+recovery_sends AS (
+  SELECT
+    wb.week_start,
+    wb.week_end,
+    rl.user_id,
+    MIN(rl.sent_at AT TIME ZONE 'America/Sao_Paulo') AS first_alert_at
+  FROM recovery_logs rl
+  JOIN users u ON u.id = rl.user_id
+  CROSS JOIN week_bounds wb
+  WHERE u.stack_variant = 'B'
+    AND u.is_active = true
+    AND u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+    AND (rl.ladder_step LIKE '%recovery%' OR rl.ladder_step = 'onboarding_come_back')
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date >= wb.week_start
+    AND (rl.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < wb.week_end
+  GROUP BY wb.week_start, wb.week_end, rl.user_id
+),
+with_profile AS (
+  SELECT rs.*, u.active_days
+  FROM recovery_sends rs
+  JOIN users u ON u.id = rs.user_id
+),
+came_back AS (
+  SELECT
+    wp.week_start,
+    wp.user_id,
+    CASE WHEN COUNT(m.id) > 0 THEN 1 ELSE 0 END AS came_back
+  FROM with_profile wp
+  LEFT JOIN messages m
+    ON m.user_id = wp.user_id
+    AND m.sender = 'user'
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo') > wp.first_alert_at
+    AND (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date < wp.week_end
+    {uv_msg_filter}
+  GROUP BY wp.week_start, wp.user_id
+)
+SELECT
+  TO_CHAR(wp.week_start, 'YYYY-MM-DD')                                            AS week_start,
+  COUNT(DISTINCT wp.user_id)                                                       AS users_reached,
+  SUM(cb.came_back)                                                                AS came_back_count,
+  ROUND(100.0 * SUM(cb.came_back) / NULLIF(COUNT(DISTINCT wp.user_id), 0), 1)    AS recovery_rate_pct,
+  ROUND(AVG(wp.active_days), 1)                                                    AS avg_active_days_all,
+  ROUND(AVG(CASE WHEN cb.came_back = 1 THEN wp.active_days END), 1)               AS avg_active_days_recovered
+FROM with_profile wp
+LEFT JOIN came_back cb ON cb.user_id = wp.user_id AND cb.week_start = wp.week_start
+GROUP BY wp.week_start
+ORDER BY wp.week_start
 """
     return run_query(query)
 
@@ -3345,6 +3640,33 @@ if selected_section == "📊 Quick Insights":
     at_risk_5d_pct = round(100 * at_risk_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
     active_users_5d_pct = round(100 * active_users_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
 
+    # ── DAU data loading ─────────────────────────────────────────────────────
+    try:
+        _dau_df = get_dau_metrics(exclude_internal)
+        _dau_daily = _dau_df[_dau_df["row_type"] == "daily"].copy() if not _dau_df.empty else pd.DataFrame()
+        _dau_weekly = _dau_df[_dau_df["row_type"] == "weekly"].copy() if not _dau_df.empty else pd.DataFrame()
+        _dau_daily["dau"] = pd.to_numeric(_dau_daily["dau"], errors="coerce").fillna(0)
+        dau_7d = float(_dau_daily.tail(7)["dau"].mean()) if len(_dau_daily) >= 7 else 0.0
+        dau_prev_7d = float(_dau_daily.head(7)["dau"].mean()) if len(_dau_daily) >= 14 else 0.0
+    except Exception as _dau_err:
+        _dau_weekly = pd.DataFrame()
+        dau_7d = dau_prev_7d = 0.0
+        st.warning(f"Could not load DAU metrics: {_dau_err}")
+
+    # ── 1. DAU single metric ─────────────────────────────────────────────────
+    _dau_delta = round(dau_7d - dau_prev_7d, 1)
+    _dau_col, _ = st.columns([1, 3])
+    _dau_col.metric(
+        "DAU — avg last 7d",
+        f"{dau_7d:.1f}",
+        delta=f"{_dau_delta:+.1f} vs prev 7d",
+        help="Daily Active Users: distinct users who completed at least one activity that day, averaged over the last 7 days.",
+    )
+    _dau_col.caption("Active = ≥1 activity completion (user_activities_history) · external users only")
+
+    st.markdown("---")
+
+    # ── 2. Onboarded → at-risk stats row ─────────────────────────────────────
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Onboarded users", onboarded_users_count if onboarded_users_count else "—")
     col1.caption("Completed onboarding flow")
@@ -3357,205 +3679,35 @@ if selected_section == "📊 Quick Insights":
     col5.metric("At risk users", at_risk_5d_count if at_risk_5d_count is not None else "—")
     col5.caption(f"No message in past 5d · ↳ {at_risk_5d_pct}% of onboarded")
 
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Active Days — Alive", f"{alive_avg_active_days:.1f} avg")
-    d1.caption(f"↳ {alive_total_active_days} total active days across alive users")
-    d2.metric("Active Days — At Risk", f"{at_risk_avg_active_days:.1f} avg")
-    d2.caption(f"↳ {at_risk_total_active_days} total active days across at-risk users")
-    d3.metric("Active Days — Churned (7d)", f"{churned_avg_active_days:.1f} avg")
-    d3.caption(f"↳ {churned_total_active_days} total active days across churned users")
-    d4.metric("Active Days — Churned (lifetime)", f"{churned_lifetime_avg_active_days:.1f} avg")
-    d4.caption(f"↳ {churned_lifetime_total_active_days} total · {churned_lifetime_count} users ever churned")
+    st.markdown("---")
 
-    c4, c5, c6, c7 = st.columns(4)
-    c4.metric("% inside 24h", f"{pct_inside_24h}%")
-    c4.caption(f"↳ {inside_24h} users")
-    c5.metric("Messaged today", f"{pct_messaged_today}%")
-    c5.caption(f"↳ {messaged_today} users")
-    c6.metric("Active today", f"{pct_activity_complete}%")
-    c6.caption(f"↳ {completed_today} users")
-    c7.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
-    c7.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
-
-    # Expandable simple lists for key metrics
-    try:
-        new_today_list = run_query(f"""
-            {beta_users_cte}
-            SELECT id, COALESCE(full_name, 'Unknown') AS name, waid, tags, is_beta
-            FROM (
-                SELECT DISTINCT ON (u.waid)
-                    u.id,
-                    u.full_name,
-                    u.waid,
-                    u.tags,
-                    u.created_at,
-                    EXISTS (
-                        SELECT 1
-                        FROM beta_users bu
-                        WHERE bu.id = u.id OR bu.waid = u.waid
-                    ) AS is_beta
-                FROM users u
-                WHERE u.created_at >= NOW() - INTERVAL '7 days'
-                  AND EXISTS (
-                      SELECT 1
-                      FROM messages m
-                      WHERE m.sender = 'user'
-                        AND (m.user_id = u.id OR m.waid = u.waid)
-                  )
-                  {internal_filter_join}
-                ORDER BY u.waid, u.created_at DESC
-            ) unique_users
-            ORDER BY created_at DESC
-            LIMIT 200
-        """)
-        with st.expander("New users - names"):
-            if new_today_list.empty:
-                st.caption("No users")
-            else:
-                beta_new_users = new_today_list[new_today_list["is_beta"] == True]
-                pre_plan_new_users = new_today_list[new_today_list["is_beta"] != True]
-
-                st.markdown(f"**Onboarded users with a plan** ({len(beta_new_users)})")
-                if beta_new_users.empty:
-                    st.caption("No users")
-                else:
-                    for _, row in beta_new_users.iterrows():
-                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
-
-                st.markdown(f"**Messaging coach, no plan yet** ({len(pre_plan_new_users)})")
-                if pre_plan_new_users.empty:
-                    st.caption("No users")
-                else:
-                    for _, row in pre_plan_new_users.iterrows():
-                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
-    except:
-        st.warning("Could not load new users (past 7d) list")
-    
-    try:
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        inactive_7d_list = run_query(f"""
-            {beta_users_cte},
-            latest_farewell AS (
-                SELECT DISTINCT ON (rl.user_id)
-                    rl.user_id,
-                    rl.sent_at AS farewell_at
-                FROM recovery_logs rl
-                JOIN beta_users bu ON bu.id = rl.user_id
-                JOIN users u ON rl.user_id = u.id
-                WHERE rl.ladder_step = 'farewell'
-                  AND rl.sent_at >= NOW() - INTERVAL '7 days'
-                  {internal_filter_join}
-                ORDER BY rl.user_id, rl.sent_at DESC
+    # ── 3. DAU weekly chart ──────────────────────────────────────────────────
+    st.markdown("#### 📈 DAU — avg per week")
+    st.caption("Distinct users completing ≥1 activity per day, averaged per week (last 12 weeks). External users only.")
+    if not _dau_weekly.empty:
+        try:
+            import altair as alt
+            _dau_wk = _dau_weekly.copy()
+            _dau_wk["dau"] = pd.to_numeric(_dau_wk["dau"], errors="coerce").fillna(0)
+            _dau_wk["week_label"] = pd.to_datetime(_dau_wk["activity_date"], errors="coerce").dt.strftime("w/o %d %b")
+            _dau_chart = (
+                alt.Chart(_dau_wk)
+                .mark_line(point=True, color="#00d4aa")
+                .encode(
+                    x=alt.X("week_label:N", sort=list(_dau_wk["week_label"]), title="Week"),
+                    y=alt.Y("dau:Q", title="Avg DAU", scale=alt.Scale(zero=True)),
+                    tooltip=[
+                        alt.Tooltip("week_label:N", title="Week"),
+                        alt.Tooltip("dau:Q", title="Avg DAU", format=".1f"),
+                    ],
+                )
+                .properties(height=280)
             )
-            SELECT
-                u.id AS user_id,
-                COALESCE(u.full_name, 'Unknown') AS name,
-                u.waid AS phone,
-                u.tags,
-                u.active_days,
-                TO_CHAR(
-                    date_trunc('week', u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo'),
-                    'YYYY-MM-DD'
-                ) AS onboarding_week,
-                lf.farewell_at,
-                EXISTS (
-                    SELECT 1
-                    FROM messages m
-                    WHERE (m.user_id = u.id OR m.waid = u.waid)
-                      AND m.sender = 'user'
-                      AND m.sent_at > lf.farewell_at
-                ) AS came_back
-            FROM latest_farewell lf
-            JOIN users u ON u.id = lf.user_id
-            ORDER BY lf.farewell_at DESC
-        """)
-        still_inactive_df = inactive_7d_list[inactive_7d_list["came_back"] == False] if not inactive_7d_list.empty else pd.DataFrame()
-        came_back_df = inactive_7d_list[inactive_7d_list["came_back"] == True] if not inactive_7d_list.empty else pd.DataFrame()
-        inactive_7d_count = len(still_inactive_df) if not still_inactive_df.empty else 0
-        with st.expander(f"Churned users (past 7d) — ({inactive_7d_count})"):
-            if inactive_7d_list.empty:
-                st.caption("No users")
-            else:
-                st.markdown("**Still inactive**")
-                if still_inactive_df.empty:
-                    st.caption("No users")
-                else:
-                    for _, row in still_inactive_df.iterrows():
-                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
-                        phone = row.get('phone', '—')
-                        active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
-
-                st.markdown("**Came back after farewell**")
-                if came_back_df.empty:
-                    st.caption("No users")
-                else:
-                    for _, row in came_back_df.iterrows():
-                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
-                        phone = row.get('phone', '—')
-                        active_days_val = row.get('active_days', '—')
-                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
-    except Exception as e:
-        st.warning(f"Could not load inactive users list: {e}")
-
-    # At Risk Users: silent ≥5d (headline cohort) + recovery-ladder highlights + re-engaged
-    try:
-        silent_at_risk_df, reengaged_at_risk_df = get_at_risk_users_detail()
-        sp_tz = "America/Sao_Paulo"
-
-        with st.expander("⚠️ At Risk Users"):
-            st.markdown(f"**Silent ≥5 days** ({len(silent_at_risk_df)})")
-            if silent_at_risk_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in silent_at_risk_df.iterrows():
-                    name = format_display_name_with_tags(
-                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
-                    )
-                    active_days_val = row.get("active_days", "—")
-                    if pd.notna(row.get("last_msg_at")):
-                        last_msg_sp = _format_ts_local(row["last_msg_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                        line = f"{name} — last message {last_msg_sp}"
-                    else:
-                        line = f"{name} — never messaged"
-                    line += f" · 🏃 {active_days_val} active days"
-                    if row.get("received_recovery_ladder"):
-                        line += " 🪜"
-                    st.caption(f"• {line}")
-
-            st.markdown(f"**Re-engaged after recovery** ({len(reengaged_at_risk_df)})")
-            if reengaged_at_risk_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in reengaged_at_risk_df.iterrows():
-                    name = format_display_name_with_tags(
-                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
-                    )
-                    active_days_val = row.get("active_days", "—")
-                    rung_label = _label_ladder_step(row.get("recovery_ladder_step"))
-                    recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                    reply_sp = _format_ts_local(row["reengaged_reply_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
-                    st.caption(
-                        f"• {name} · 🏃 {active_days_val} active days — 🪜 {rung_label} ({recovery_sp}) · ✅ replied {reply_sp}"
-                    )
-    except Exception as e:
-        st.warning(f"Could not load At Risk Users: {e}")
-
-    # Reactivated Users: previously inactive (received farewell) who messaged in the last 24h
-    try:
-        reactivated_df = get_reactivated_users_last_24h()
-        sp_tz = "America/Sao_Paulo"
-        with st.expander("🔄 Reactivated Users"):
-            st.caption("Previously inactive users (received farewell) who sent a message to the coach in the last 24 hours.")
-            if reactivated_df.empty:
-                st.caption("No users")
-            else:
-                for _, row in reactivated_df.iterrows():
-                    last_msg_sp = _format_ts_local(row["last_message_at"], sp_tz)
-                    farewell_sp = _format_ts_local(row["farewell_at"], sp_tz)
-                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
-    except Exception as e:
-        st.warning(f"Could not load Reactivated Users: {e}")
+            st.altair_chart(_dau_chart, use_container_width=True)
+        except Exception as _dau_chart_err:
+            st.warning(f"Could not render DAU chart: {_dau_chart_err}")
+    else:
+        st.info("No activity data available for DAU chart.")
 
     st.markdown("---")
     
@@ -4135,296 +4287,212 @@ if selected_section == "📊 Quick Insights":
         st.info("No messages found")
     
     st.markdown("---")
-    
-    # Active Days Timeline — avg active days per active user per week (last 12 weeks)
-    # Active users denominator = waterfall active_stock definition (not inactive = no unresolved farewell)
-    import altair as alt
 
-    st.markdown("### 📅 Avg Active Days per Active User — Weekly")
-    try:
-        internal_waids = load_internal_users()
-        internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
-        _ad_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
-        active_days_weekly_df = run_query(f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-base_users AS (
-  SELECT u.id, u.waid, u.created_at
-  FROM users u
-  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
-),
-weeks AS (
-  SELECT gs::date AS week_start
-  FROM generate_series(
-    date_trunc('week', DATE '{_ad_start}')::date,
-    date_trunc('week', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date),
-    interval '7 days'
-  ) AS gs
-),
-week_bounds AS (
-  SELECT
-    week_start,
-    (week_start::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_start_ts,
-    ((week_start + interval '7 days')::timestamp AT TIME ZONE 'America/Sao_Paulo') AS week_end_ts
-  FROM weeks
-),
-inbound_msgs AS (
-  SELECT bu.id AS user_id, m.sent_at
-  FROM base_users bu
-  JOIN messages m ON m.sender = 'user' AND (m.user_id = bu.id OR m.waid = bu.waid)
-),
-farewell_events AS (
-  SELECT r.user_id, r.sent_at AS farewell_at,
-    LEAD(r.sent_at) OVER (PARTITION BY r.user_id ORDER BY r.sent_at) AS next_farewell_at
-  FROM recovery_logs r
-  JOIN base_users bu ON bu.id = r.user_id
-  WHERE r.ladder_step = 'farewell'
-),
-farewell_cycles AS (
-  SELECT fe.user_id, fe.farewell_at,
-    (
-      SELECT MIN(im.sent_at)
-      FROM inbound_msgs im
-      WHERE im.user_id = fe.user_id
-        AND im.sent_at > fe.farewell_at
-        AND (fe.next_farewell_at IS NULL OR im.sent_at < fe.next_farewell_at)
-    ) AS reactivated_at
-  FROM farewell_events fe
-),
-active_stock AS (
-  SELECT
-    wb.week_start,
-    COUNT(DISTINCT bu.id) FILTER (
-      WHERE bu.created_at < wb.week_start_ts
-        AND NOT EXISTS (
-          SELECT 1 FROM farewell_cycles fc
-          WHERE fc.user_id = bu.id
-            AND fc.farewell_at < wb.week_start_ts
-            AND (fc.reactivated_at IS NULL OR fc.reactivated_at > wb.week_start_ts)
-        )
-    )::bigint AS active_users_start
-  FROM week_bounds wb
-  CROSS JOIN base_users bu
-  GROUP BY wb.week_start
-),
-weekly_user_active AS (
-  SELECT
-    date_trunc('week', uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS week_start,
-    uah.user_id,
-    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) AS active_days_in_week
-  FROM user_activities_history uah
-  JOIN base_users bu ON uah.user_id = bu.id
-  WHERE uah.completed_at >= (DATE '{_ad_start}'::timestamp AT TIME ZONE 'America/Sao_Paulo')
-  GROUP BY week_start, uah.user_id
-),
-weekly_totals AS (
-  SELECT
-    week_start,
-    SUM(active_days_in_week)::bigint AS total_active_days,
-    COUNT(DISTINCT user_id)::bigint AS users_with_completions
-  FROM weekly_user_active
-  GROUP BY week_start
-)
-SELECT
-  TO_CHAR(wb.week_start, 'YYYY-MM-DD') AS week_start,
-  COALESCE(ast.active_users_start, 0)::bigint AS active_users_start,
-  COALESCE(wt.users_with_completions, 0)::bigint AS users_with_completions,
-  CASE
-    WHEN COALESCE(ast.active_users_start, 0) > 0
-    THEN ROUND(COALESCE(wt.total_active_days, 0)::numeric / ast.active_users_start, 2)
-    ELSE 0
-  END AS avg_active_days
-FROM week_bounds wb
-LEFT JOIN active_stock ast ON ast.week_start = wb.week_start
-LEFT JOIN weekly_totals wt ON wt.week_start = wb.week_start
-ORDER BY wb.week_start
-        """)
-        if not active_days_weekly_df.empty:
-            _ad_df = active_days_weekly_df.copy()
-            _ad_df["avg_active_days"] = _ad_df["avg_active_days"].astype(float)
-            _ad_chart = (
-                alt.Chart(_ad_df)
-                .mark_line(point=True, color="#00E07B")
-                .encode(
-                    x=alt.X("week_start:N", sort=None, title="Week"),
-                    y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
-                )
-                .properties(height=280)
-            )
-            st.altair_chart(_ad_chart, use_container_width=True)
-        else:
-            st.info("No activity data found for the last 12 weeks.")
-    except Exception as e:
-        st.warning(f"Could not load active days chart: {e}")
+    # ── 5. Active Days stats ─────────────────────────────────────────────────
+    st.markdown("#### Active Days & Engagement")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Active Days — Alive", f"{alive_avg_active_days:.1f} avg")
+    d1.caption(f"↳ {alive_total_active_days} total active days across alive users")
+    d2.metric("Active Days — At Risk", f"{at_risk_avg_active_days:.1f} avg")
+    d2.caption(f"↳ {at_risk_total_active_days} total active days across at-risk users")
+    d3.metric("Active Days — Churned (7d)", f"{churned_avg_active_days:.1f} avg")
+    d3.caption(f"↳ {churned_total_active_days} total active days across churned users")
+    d4.metric("Active Days — Churned (lifetime)", f"{churned_lifetime_avg_active_days:.1f} avg")
+    d4.caption(f"↳ {churned_lifetime_total_active_days} total · {churned_lifetime_count} users ever churned")
 
-    # Churn Rate — % of active users who became inactive each week
-    st.markdown("### 📉 Weekly Churn Rate — % Active Users Who Left")
-    try:
-        _churn_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
-        _churn_wf_df = get_beta_weekly_churn_rate_metrics(_churn_start, exclude_internal)
-        if not _churn_wf_df.empty:
-            _churn_df = _churn_wf_df.copy()
-            _churn_df = _churn_df.sort_values("week_start")
-            _churn_df["churn_rate"] = _churn_df.apply(
-                lambda r: round(100.0 * r["became_inactive_users"] / r["start_active_users"], 1)
-                if r["start_active_users"] > 0 else 0.0,
-                axis=1,
-            )
-            _churn_chart = (
-                alt.Chart(_churn_df)
-                .mark_line(point=True, color="#FF5000")
-                .encode(
-                    x=alt.X("week_start:N", sort=None, title="Week"),
-                    y=alt.Y("churn_rate:Q", title="Churn rate (%)", scale=alt.Scale(zero=True)),
-                )
-                .properties(height=280)
-            )
-            st.altair_chart(_churn_chart, use_container_width=True)
-            st.caption("Churn = onboarded users who received a farewell message that week / active onboarded users at week start. Weeks start Monday (America/Sao_Paulo).")
-        else:
-            st.info("No churn data available for the last 12 weeks.")
-    except Exception as e:
-        st.warning(f"Could not load churn rate chart: {e}")
-    
-    # Avg Active Days by Cohort — week-on-week
-    st.markdown("### 📅 Avg Active Days by Cohort — Week on Week")
-    try:
-        cohort_df = get_active_days_by_cohort_weekly(weeks_back=12, exclude_internal=exclude_internal)
-        if cohort_df.empty:
-            st.info("No activity data found for the last 12 weeks.")
-        else:
-            cohort_df["avg_active_days"] = cohort_df["avg_active_days"].astype(float)
-            cohort_colors = {"alive": "#00E07B", "at_risk": "#FFA500", "churned": "#FF5000"}
-            cohort_titles = {
-                "alive": "Alive users",
-                "at_risk": "At-risk users (silent ≥5d)",
-                "churned": "Churned users (is_active = false)",
-            }
-            ch1, ch2, ch3 = st.columns(3)
-            for col, cohort_key in zip([ch1, ch2, ch3], ["alive", "at_risk", "churned"]):
-                with col:
-                    st.caption(cohort_titles[cohort_key])
-                    _cdf = cohort_df[cohort_df["cohort"] == cohort_key].copy()
-                    if _cdf.empty or _cdf["avg_active_days"].sum() == 0:
-                        st.info("No data")
-                    else:
-                        cohort_size = int(_cdf["cohort_size"].iloc[0])
-                        _chart = (
-                            alt.Chart(_cdf)
-                            .mark_line(point=True, color=cohort_colors[cohort_key])
-                            .encode(
-                                x=alt.X("week_start:N", sort=None, title="Week"),
-                                y=alt.Y("avg_active_days:Q", title="Avg active days", scale=alt.Scale(zero=True)),
-                                tooltip=["week_start", "avg_active_days", "total_active_days"],
-                            )
-                            .properties(height=220)
-                        )
-                        st.altair_chart(_chart, use_container_width=True)
-                        st.caption(f"Denominator: {cohort_size} current {cohort_key.replace('_', '-')} users")
-    except Exception as e:
-        st.warning(f"Could not load cohort active days charts: {e}")
+    c4, c5, c6, c7 = st.columns(4)
+    c4.metric("% inside 24h", f"{pct_inside_24h}%")
+    c4.caption(f"↳ {inside_24h} users")
+    c5.metric("Messaged today", f"{pct_messaged_today}%")
+    c5.caption(f"↳ {messaged_today} users")
+    c6.metric("Active today", f"{pct_activity_complete}%")
+    c6.caption(f"↳ {completed_today} users")
+    c7.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
+    c7.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
 
-    # User Activity by Hour chart
-    st.markdown("### 📊 User Activity by Hour")
-    
-    # Date range selector
-    date_col1, date_col2 = st.columns(2)
-    with date_col1:
-        default_start = datetime.now() - timedelta(days=7)
-        start_date = st.date_input("Start date", value=default_start, key="activity_start")
-    with date_col2:
-        end_date = st.date_input("End date", value=datetime.now(), key="activity_end")
-    
+    st.markdown("---")
+
+    # ── 6. Deep dive expandables ─────────────────────────────────────────────
     try:
-        # Query message activity by hour for the selected date range (user messages only)
-        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-        if exclude_internal and internal_filter_join:
-            activity_by_hour = run_query(f"""
-                SELECT 
-                    EXTRACT(HOUR FROM m.sent_at) as hour,
-                    COUNT(*) as message_count
-                FROM messages m
-                JOIN users u ON m.user_id = u.id
-                WHERE m.sent_at >= '{start_date}'::date
-                  AND m.sent_at < '{end_date}'::date + INTERVAL '1 day'
-                  AND m.sender = 'user'
-                  AND m.sent_at IS NOT NULL
+        new_today_list = run_query(f"""
+            {beta_users_cte}
+            SELECT id, COALESCE(full_name, 'Unknown') AS name, waid, tags, is_beta
+            FROM (
+                SELECT DISTINCT ON (u.waid)
+                    u.id,
+                    u.full_name,
+                    u.waid,
+                    u.tags,
+                    u.created_at,
+                    EXISTS (
+                        SELECT 1
+                        FROM beta_users bu
+                        WHERE bu.id = u.id OR bu.waid = u.waid
+                    ) AS is_beta
+                FROM users u
+                WHERE u.created_at >= NOW() - INTERVAL '7 days'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM messages m
+                      WHERE m.sender = 'user'
+                        AND (m.user_id = u.id OR m.waid = u.waid)
+                  )
                   {internal_filter_join}
-                GROUP BY EXTRACT(HOUR FROM m.sent_at)
-                ORDER BY hour
-            """)
-        else:
-            activity_by_hour = run_query(f"""
-                SELECT 
-                    EXTRACT(HOUR FROM sent_at) as hour,
-                    COUNT(*) as message_count
-                FROM messages
-                WHERE sent_at >= '{start_date}'::date
-                  AND sent_at < '{end_date}'::date + INTERVAL '1 day'
-                  AND sender = 'user'
-                  AND sent_at IS NOT NULL
-                GROUP BY EXTRACT(HOUR FROM sent_at)
-                ORDER BY hour
-            """)
-        
-        if not activity_by_hour.empty:
-            # Fill in missing hours with 0
-            all_hours = pd.DataFrame({'hour': range(24)})
-            activity_by_hour['hour'] = activity_by_hour['hour'].astype(int)
-            activity_data = all_hours.merge(activity_by_hour, on='hour', how='left').fillna(0)
-            activity_data['message_count'] = activity_data['message_count'].astype(int)
-            
-            # Format hour labels (e.g., "6am", "2pm")
-            def format_hour(h):
-                if h == 0:
-                    return "12am"
-                elif h < 12:
-                    return f"{h}am"
-                elif h == 12:
-                    return "12pm"
+                ORDER BY u.waid, u.created_at DESC
+            ) unique_users
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
+        with st.expander("New users - names"):
+            if new_today_list.empty:
+                st.caption("No users")
+            else:
+                beta_new_users = new_today_list[new_today_list["is_beta"] == True]
+                pre_plan_new_users = new_today_list[new_today_list["is_beta"] != True]
+
+                st.markdown(f"**Onboarded users with a plan** ({len(beta_new_users)})")
+                if beta_new_users.empty:
+                    st.caption("No users")
                 else:
-                    return f"{h-12}pm"
-            
-            activity_data['hour_label'] = activity_data['hour'].apply(format_hour)
-            
-            # Create bar chart using Altair for better control
-            import altair as alt
-            
-            chart = alt.Chart(activity_data).mark_bar(
-                color='#00d4aa',
-                cornerRadiusTopLeft=3,
-                cornerRadiusTopRight=3
-            ).encode(
-                x=alt.X('hour_label:N', 
-                        sort=list(activity_data['hour_label']),
-                        title='Hour of Day',
-                        axis=alt.Axis(labelAngle=-45)),
-                y=alt.Y('message_count:Q', title='Messages'),
-                tooltip=[
-                    alt.Tooltip('hour_label:N', title='Hour'),
-                    alt.Tooltip('message_count:Q', title='Messages')
-                ]
-            ).properties(
-                height=300
-            ).configure_axis(
-                grid=True,
-                gridColor='#2d3748'
-            ).configure_view(
-                strokeWidth=0
+                    for _, row in beta_new_users.iterrows():
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
+
+                st.markdown(f"**Messaging coach, no plan yet** ({len(pre_plan_new_users)})")
+                if pre_plan_new_users.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in pre_plan_new_users.iterrows():
+                        st.caption(f"• {format_display_name_with_tags(row['name'], row.get('waid'), row.get('tags'), user_id=row.get('id'))}")
+    except:
+        st.warning("Could not load new users (past 7d) list")
+
+    try:
+        internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        inactive_7d_list = run_query(f"""
+            {beta_users_cte},
+            latest_farewell AS (
+                SELECT DISTINCT ON (rl.user_id)
+                    rl.user_id,
+                    rl.sent_at AS farewell_at
+                FROM recovery_logs rl
+                JOIN beta_users bu ON bu.id = rl.user_id
+                JOIN users u ON rl.user_id = u.id
+                WHERE rl.ladder_step = 'farewell'
+                  AND rl.sent_at >= NOW() - INTERVAL '7 days'
+                  {internal_filter_join}
+                ORDER BY rl.user_id, rl.sent_at DESC
             )
-            
-            st.altair_chart(chart, use_container_width=True)
-            
-            # Show summary stats
-            total_msgs = activity_data['message_count'].sum()
-            peak_hour = activity_data.loc[activity_data['message_count'].idxmax()]
-            st.caption(f"Total: {total_msgs:,} user messages • Peak hour: {peak_hour['hour_label']} ({int(peak_hour['message_count'])} messages)")
-        else:
-            st.info("No message activity found for the selected date range")
+            SELECT
+                u.id AS user_id,
+                COALESCE(u.full_name, 'Unknown') AS name,
+                u.waid AS phone,
+                u.tags,
+                u.active_days,
+                TO_CHAR(
+                    date_trunc('week', u.onboarding_timestamp AT TIME ZONE 'America/Sao_Paulo'),
+                    'YYYY-MM-DD'
+                ) AS onboarding_week,
+                lf.farewell_at,
+                EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    WHERE (m.user_id = u.id OR m.waid = u.waid)
+                      AND m.sender = 'user'
+                      AND m.sent_at > lf.farewell_at
+                ) AS came_back
+            FROM latest_farewell lf
+            JOIN users u ON u.id = lf.user_id
+            ORDER BY lf.farewell_at DESC
+        """)
+        still_inactive_df = inactive_7d_list[inactive_7d_list["came_back"] == False] if not inactive_7d_list.empty else pd.DataFrame()
+        came_back_df = inactive_7d_list[inactive_7d_list["came_back"] == True] if not inactive_7d_list.empty else pd.DataFrame()
+        inactive_7d_count = len(still_inactive_df) if not still_inactive_df.empty else 0
+        with st.expander(f"Churned users (past 7d) — ({inactive_7d_count})"):
+            if inactive_7d_list.empty:
+                st.caption("No users")
+            else:
+                st.markdown("**Still inactive**")
+                if still_inactive_df.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in still_inactive_df.iterrows():
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
+                        phone = row.get('phone', '—')
+                        active_days_val = row.get('active_days', '—')
+                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
+
+                st.markdown("**Came back after farewell**")
+                if came_back_df.empty:
+                    st.caption("No users")
+                else:
+                    for _, row in came_back_df.iterrows():
+                        name = format_display_name_with_tags(row['name'], row.get('phone'), row.get('tags'), user_id=row.get('user_id'))
+                        phone = row.get('phone', '—')
+                        active_days_val = row.get('active_days', '—')
+                        st.caption(f"• {name} · 📞 {phone} · 🏃 {active_days_val} active days")
     except Exception as e:
-        st.warning(f"Could not load activity chart: {e}")
-    
+        st.warning(f"Could not load inactive users list: {e}")
+
+    # At Risk Users: silent ≥5d (headline cohort) + recovery-ladder highlights + re-engaged
+    try:
+        silent_at_risk_df, reengaged_at_risk_df = get_at_risk_users_detail()
+        sp_tz = "America/Sao_Paulo"
+
+        with st.expander("⚠️ At Risk Users"):
+            st.markdown(f"**Silent ≥5 days** ({len(silent_at_risk_df)})")
+            if silent_at_risk_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in silent_at_risk_df.iterrows():
+                    name = format_display_name_with_tags(
+                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
+                    )
+                    active_days_val = row.get("active_days", "—")
+                    if pd.notna(row.get("last_msg_at")):
+                        last_msg_sp = _format_ts_local(row["last_msg_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                        line = f"{name} — last message {last_msg_sp}"
+                    else:
+                        line = f"{name} — never messaged"
+                    line += f" · 🏃 {active_days_val} active days"
+                    if row.get("received_recovery_ladder"):
+                        line += " 🪜"
+                    st.caption(f"• {line}")
+
+            st.markdown(f"**Re-engaged after recovery** ({len(reengaged_at_risk_df)})")
+            if reengaged_at_risk_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in reengaged_at_risk_df.iterrows():
+                    name = format_display_name_with_tags(
+                        row["full_name"], row.get("waid"), row.get("tags"), user_id=row.get("user_id")
+                    )
+                    active_days_val = row.get("active_days", "—")
+                    rung_label = _label_ladder_step(row.get("recovery_ladder_step"))
+                    recovery_sp = _format_ts_local(row["recovery_sent_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                    reply_sp = _format_ts_local(row["reengaged_reply_at"], sp_tz, fmt="%d-%m-%Y, %H:%M")
+                    st.caption(
+                        f"• {name} · 🏃 {active_days_val} active days — 🪜 {rung_label} ({recovery_sp}) · ✅ replied {reply_sp}"
+                    )
+    except Exception as e:
+        st.warning(f"Could not load At Risk Users: {e}")
+
+    # Reactivated Users: previously inactive (received farewell) who messaged in the last 24h
+    try:
+        reactivated_df = get_reactivated_users_last_24h()
+        sp_tz = "America/Sao_Paulo"
+        with st.expander("🔄 Reactivated Users"):
+            st.caption("Previously inactive users (received farewell) who sent a message to the coach in the last 24 hours.")
+            if reactivated_df.empty:
+                st.caption("No users")
+            else:
+                for _, row in reactivated_df.iterrows():
+                    last_msg_sp = _format_ts_local(row["last_message_at"], sp_tz)
+                    farewell_sp = _format_ts_local(row["farewell_at"], sp_tz)
+                    st.caption(f"• {format_display_name_with_tags(row['full_name'], row.get('waid'), row.get('tags'), user_id=row.get('user_id'))} — messaged {last_msg_sp} (farewell: {farewell_sp})")
+    except Exception as e:
+        st.warning(f"Could not load Reactivated Users: {e}")
+
+
 
 
 # Tab 1b: Dotz
@@ -7336,6 +7404,120 @@ if selected_section == "🪜 Recovery Ladder":
         display_df = afk_dist_df.copy()
         display_df.columns = ["Days AFK", "Users", "≤3 active days", ">3 active days"]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Section 1: Recovery Alert Effectiveness (Stack B) ──────────────────────
+    st.markdown("#### 📬 Recovery Alert Effectiveness — Stack B")
+    st.caption(
+        "Stack B only. A 'recovery alert' is any send whose `ladder_step` contains 'recovery' or equals "
+        "`onboarding_come_back`. 'Came back' = user sent at least one message after the alert within the same window. "
+        "Last 7d vs previous 7d."
+    )
+
+    try:
+        rae_summary_df, rae_step_df = get_recovery_alert_effectiveness_7d(exclude_internal=True)
+    except Exception as _e:
+        rae_summary_df, rae_step_df = pd.DataFrame(), pd.DataFrame()
+        st.warning(f"Could not load recovery alert effectiveness: {_e}")
+
+    if not rae_summary_df.empty:
+        _rae_last = rae_summary_df[rae_summary_df["window_name"] == "last_7d"].iloc[0] if "last_7d" in rae_summary_df["window_name"].values else None
+        _rae_prev = rae_summary_df[rae_summary_df["window_name"] == "prev_7d"].iloc[0] if "prev_7d" in rae_summary_df["window_name"].values else None
+
+        _rae_c1, _rae_c2, _rae_c3, _rae_c4, _rae_c5, _rae_c6 = st.columns(6)
+        if _rae_last is not None:
+            _rae_c1.metric(
+                "Users reached",
+                int(_rae_last["users_reached"]),
+                _metric_delta(int(_rae_last["users_reached"]), int(_rae_prev["users_reached"]) if _rae_prev is not None else None),
+            )
+            _rae_c2.metric(
+                "Came back",
+                int(_rae_last["came_back_count"]),
+                _metric_delta(int(_rae_last["came_back_count"]), int(_rae_prev["came_back_count"]) if _rae_prev is not None else None),
+            )
+            _rae_c3.metric(
+                "Recovery rate",
+                f"{_rae_last['recovery_rate_pct']}%",
+                _metric_delta(float(_rae_last["recovery_rate_pct"]), float(_rae_prev["recovery_rate_pct"]) if _rae_prev is not None else None, "pp"),
+            )
+            _rae_c4.metric(
+                "Avg active days (all)",
+                _rae_last["avg_active_days_all"],
+                _metric_delta(float(_rae_last["avg_active_days_all"]) if _rae_last["avg_active_days_all"] is not None else None, float(_rae_prev["avg_active_days_all"]) if _rae_prev is not None and _rae_prev["avg_active_days_all"] is not None else None),
+            )
+            _rae_c5.metric(
+                "Avg active days (recovered)",
+                _rae_last["avg_active_days_recovered"] if _rae_last["avg_active_days_recovered"] is not None else "—",
+                _metric_delta(float(_rae_last["avg_active_days_recovered"]) if _rae_last["avg_active_days_recovered"] is not None else None, float(_rae_prev["avg_active_days_recovered"]) if _rae_prev is not None and _rae_prev["avg_active_days_recovered"] is not None else None),
+            )
+            _rae_c6.metric(
+                "Avg active days (not recovered)",
+                _rae_last["avg_active_days_not_recovered"] if _rae_last["avg_active_days_not_recovered"] is not None else "—",
+                _metric_delta(float(_rae_last["avg_active_days_not_recovered"]) if _rae_last["avg_active_days_not_recovered"] is not None else None, float(_rae_prev["avg_active_days_not_recovered"]) if _rae_prev is not None and _rae_prev["avg_active_days_not_recovered"] is not None else None),
+                delta_color="inverse",
+            )
+        else:
+            st.info("No recovery alerts in the last 7 days.")
+
+    # Per-step breakdown table (last 7d)
+    if not rae_step_df.empty:
+        st.markdown("**Last 7d — by ladder step**")
+        _rae_display = rae_step_df.rename(columns={
+            "ladder_step": "Ladder step",
+            "template_name": "Template",
+            "users_reached": "Users reached",
+            "came_back_count": "Came back",
+            "recovery_rate_pct": "Recovery rate (%)",
+            "avg_active_days": "Avg active days",
+        })
+        st.dataframe(_rae_display, use_container_width=True, hide_index=True)
+
+    # Weekly recovery rate chart (Stack B, since Jun 1)
+    st.markdown("**Recovery rate over time (Stack B · weekly · from Jun 1)**")
+    try:
+        rae_weekly_df = get_recovery_rate_weekly_since("2026-06-01", exclude_internal=True)
+    except Exception as _e:
+        rae_weekly_df = pd.DataFrame()
+        st.warning(f"Could not load weekly recovery rate: {_e}")
+
+    if not rae_weekly_df.empty:
+        try:
+            import altair as alt
+
+            _rae_wk = rae_weekly_df.copy()
+            _rae_wk["week_start"] = pd.to_datetime(_rae_wk["week_start"], errors="coerce")
+            _rae_wk["week_label"] = _rae_wk["week_start"].dt.strftime("w/o %d %b")
+            _rae_wk["recovery_rate_pct"] = pd.to_numeric(_rae_wk["recovery_rate_pct"], errors="coerce").fillna(0)
+            _rae_wk["users_reached"] = pd.to_numeric(_rae_wk["users_reached"], errors="coerce").fillna(0)
+            _rae_wk["came_back_count"] = pd.to_numeric(_rae_wk["came_back_count"], errors="coerce").fillna(0)
+            _rae_wk["avg_active_days_all"] = pd.to_numeric(_rae_wk["avg_active_days_all"], errors="coerce")
+
+            _rae_base = alt.Chart(_rae_wk).encode(
+                x=alt.X("week_label:N", sort=list(_rae_wk["week_label"]), title="Week"),
+            )
+            _rae_rate_line = _rae_base.mark_line(point=True, color="#00d4aa").encode(
+                y=alt.Y("recovery_rate_pct:Q", title="Recovery rate (%)", axis=alt.Axis(titleColor="#00d4aa")),
+                tooltip=[
+                    alt.Tooltip("week_label:N", title="Week"),
+                    alt.Tooltip("recovery_rate_pct:Q", title="Recovery rate (%)", format=".1f"),
+                    alt.Tooltip("users_reached:Q", title="Users reached"),
+                    alt.Tooltip("came_back_count:Q", title="Came back"),
+                    alt.Tooltip("avg_active_days_all:Q", title="Avg active days", format=".1f"),
+                ],
+            )
+            _rae_bar = _rae_base.mark_bar(opacity=0.3, color="#4a9eff").encode(
+                y=alt.Y("users_reached:Q", title="Users reached", axis=alt.Axis(titleColor="#4a9eff")),
+            )
+            _rae_chart = alt.layer(_rae_bar, _rae_rate_line).resolve_scale(y="independent").properties(height=320)
+            st.altair_chart(_rae_chart, use_container_width=True)
+            st.caption("Bars = users reached (left axis) · Line = recovery rate % (right axis) · Stack B · external users only")
+        except Exception as _e:
+            st.warning(f"Could not render weekly recovery rate chart: {_e}")
+            st.dataframe(rae_weekly_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No data for weekly recovery rate chart.")
 
     st.markdown("---")
 

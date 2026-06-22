@@ -12,14 +12,16 @@
     "491732089223",
     "5511963266361",
     "5511981129977",
-    "5511981223030"
+    "5511981223030",
+    "5511943682069"
   ],
   "known_identities": {
     "556193835151": { "name": "Ricardo Guerra" },
     "5511963266361": { "name": "Guilherme Kato" },
     "5511960580808": { "name": "Rodolfo Chung" },
     "5511981129977": { "name": "Guilherme Grisi" },
-    "5511981223030": { "name": "Massanoori (Massa)" }
+    "5511981223030": { "name": "Massanoori (Massa)" },
+    "5511943682069": { "name": "Allan Finkel" }
   },
   "last_updated": "2026-06-12",
   "notes": "Canonical source for investor WAIDs. Flag with [investor] tag in dashboard and dotz daily summary (Query 7). When this list changes, also update special_waids in analysis/dotz_daily_summary/dotz-surge-daily-queries.sql."
