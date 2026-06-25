@@ -755,10 +755,12 @@ def get_dau_metrics(exclude_internal: bool = True) -> pd.DataFrame:
     """
     Daily Active Users (DAU) for Quick Insights.
     Active = distinct users with ≥1 activity completion (user_activities_history) on that day.
+    MAU = distinct users with ≥1 activity completion in the rolling 30-day window ending on that day.
 
-    Returns two row_types in one DataFrame:
-      'daily'  — last 14 days (for 7d vs prev-7d metric comparison)
-      'weekly' — last 12 weeks with avg_dau per week (for the trend chart)
+    Returns three row_types in one DataFrame:
+      'daily'       — last 14 days (for last-7d vs prev-7d metric comparison)
+      'ratio_daily' — last 84 days with daily rolling DAU/MAU trend
+      'weekly'      — last 12 weeks with avg_dau per week
     """
     internal_waids = load_internal_users()
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
@@ -771,29 +773,40 @@ base_users AS (
   FROM users u
   WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
 ),
+activity_events AS (
+  SELECT DISTINCT
+    uah.user_id,
+    (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS d
+  FROM user_activities_history uah
+  JOIN base_users bu ON bu.id = uah.user_id
+  WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
+        BETWEEN (now() AT TIME ZONE 'America/Sao_Paulo')::date - 113
+            AND (now() AT TIME ZONE 'America/Sao_Paulo')::date - 1
+),
 daily_completions AS (
   SELECT
-    (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS d,
-    COUNT(DISTINCT uah.user_id) AS dau
-  FROM user_activities_history uah
-  JOIN base_users bu ON bu.id = uah.user_id
-  WHERE uah.completed_at >= ((now() AT TIME ZONE 'America/Sao_Paulo')::date - 84)
+    d,
+    COUNT(DISTINCT user_id) AS dau
+  FROM activity_events
   GROUP BY d
 ),
-mau_windows AS (
+days_84 AS (
+  SELECT gs::date AS d
+  FROM generate_series(
+    (now() AT TIME ZONE 'America/Sao_Paulo')::date - 84,
+    (now() AT TIME ZONE 'America/Sao_Paulo')::date - 1,
+    interval '1 day'
+  ) AS gs
+),
+daily_activity AS (
   SELECT
-    COUNT(DISTINCT uah.user_id) FILTER (
-      WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
-            >= (now() AT TIME ZONE 'America/Sao_Paulo')::date - 30
-    ) AS mau_current,
-    COUNT(DISTINCT uah.user_id) FILTER (
-      WHERE (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
-            >= (now() AT TIME ZONE 'America/Sao_Paulo')::date - 60
-        AND (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date
-            <  (now() AT TIME ZONE 'America/Sao_Paulo')::date - 30
-    ) AS mau_prev
-  FROM user_activities_history uah
-  JOIN base_users bu ON bu.id = uah.user_id
+    d.d,
+    COALESCE(dc.dau, 0)::numeric AS dau,
+    COUNT(DISTINCT ae.user_id)::numeric AS rolling_mau_30d
+  FROM days_84 d
+  LEFT JOIN daily_completions dc ON dc.d = d.d
+  LEFT JOIN activity_events ae ON ae.d BETWEEN d.d - 29 AND d.d
+  GROUP BY d.d, dc.dau
 ),
 days_14 AS (
   SELECT gs::date AS d
@@ -806,13 +819,21 @@ days_14 AS (
 daily_series AS (
   SELECT
     d.d::text AS activity_date,
-    COALESCE(dc.dau, 0)::numeric AS dau,
-    mw.mau_current::numeric AS mau,
-    mw.mau_prev::numeric AS mau_prev,
+    da.dau,
+    da.rolling_mau_30d AS mau,
+    NULL::numeric AS mau_prev,
     'daily'::text AS row_type
   FROM days_14 d
-  LEFT JOIN daily_completions dc ON dc.d = d.d
-  CROSS JOIN mau_windows mw
+  JOIN daily_activity da ON da.d = d.d
+),
+ratio_daily_series AS (
+  SELECT
+    d::text AS activity_date,
+    dau,
+    rolling_mau_30d AS mau,
+    NULL::numeric AS mau_prev,
+    'ratio_daily'::text AS row_type
+  FROM daily_activity
 ),
 weeks AS (
   SELECT gs::date AS week_start
@@ -834,10 +855,12 @@ weekly_series AS (
     SELECT gs::date AS d
     FROM generate_series(w.week_start, (w.week_start + 6)::date, interval '1 day') AS gs
   ) dow
-  LEFT JOIN daily_completions dc ON dc.d = dow.d
+  LEFT JOIN daily_activity dc ON dc.d = dow.d
   GROUP BY w.week_start
 )
 SELECT activity_date, dau, mau, mau_prev, row_type FROM daily_series
+UNION ALL
+SELECT activity_date, dau, mau, mau_prev, row_type FROM ratio_daily_series
 UNION ALL
 SELECT activity_date, dau, mau, mau_prev, row_type FROM weekly_series
 ORDER BY row_type, activity_date
@@ -3664,17 +3687,21 @@ if selected_section == "📊 Quick Insights":
     try:
         _dau_df = get_dau_metrics(exclude_internal)
         _dau_daily = _dau_df[_dau_df["row_type"] == "daily"].copy() if not _dau_df.empty else pd.DataFrame()
+        _dau_ratio_daily = _dau_df[_dau_df["row_type"] == "ratio_daily"].copy() if not _dau_df.empty else pd.DataFrame()
         _dau_weekly = _dau_df[_dau_df["row_type"] == "weekly"].copy() if not _dau_df.empty else pd.DataFrame()
         _dau_daily["dau"] = pd.to_numeric(_dau_daily["dau"], errors="coerce").fillna(0)
+        _dau_daily["mau"] = pd.to_numeric(_dau_daily["mau"], errors="coerce").fillna(0)
+        _dau_daily = _dau_daily.sort_values("activity_date")
         dau_7d = float(_dau_daily.tail(7)["dau"].mean()) if len(_dau_daily) >= 7 else 0.0
         dau_prev_7d = float(_dau_daily.head(7)["dau"].mean()) if len(_dau_daily) >= 14 else 0.0
-        _mau_row = _dau_daily.iloc[-1] if not _dau_daily.empty else None
-        mau_current = float(_mau_row["mau"]) if _mau_row is not None and pd.notna(_mau_row.get("mau")) else 0.0
-        mau_prev = float(_mau_row["mau_prev"]) if _mau_row is not None and pd.notna(_mau_row.get("mau_prev")) else 0.0
+        _mau_current_row = _dau_daily.iloc[-1] if not _dau_daily.empty else None
+        _mau_prev_row = _dau_daily.iloc[6] if len(_dau_daily) >= 14 else None
+        mau_current = float(_mau_current_row["mau"]) if _mau_current_row is not None and pd.notna(_mau_current_row.get("mau")) else 0.0
+        mau_prev = float(_mau_prev_row["mau"]) if _mau_prev_row is not None and pd.notna(_mau_prev_row.get("mau")) else 0.0
         dau_mau = round(dau_7d / mau_current, 3) if mau_current else 0.0
         dau_mau_prev = round(dau_prev_7d / mau_prev, 3) if mau_prev else 0.0
     except Exception as _dau_err:
-        _dau_weekly = pd.DataFrame()
+        _dau_weekly = _dau_ratio_daily = pd.DataFrame()
         dau_7d = dau_prev_7d = mau_current = mau_prev = dau_mau = dau_mau_prev = 0.0
         st.warning(f"Could not load DAU metrics: {_dau_err}")
 
@@ -3692,7 +3719,7 @@ if selected_section == "📊 Quick Insights":
         "DAU/MAU",
         f"{dau_mau:.1%}",
         delta=f"{_dau_mau_delta:+.1%} vs prev",
-        help="DAU (avg last 7d) ÷ MAU (distinct active users last 30d). Prev compares avg DAU days 8–14 ÷ MAU days 31–60.",
+        help="DAU (avg last 7d) ÷ rolling 30-day MAU ending yesterday. Prev compares avg DAU days 8–14 ÷ rolling 30-day MAU at the end of that prior 7-day period.",
     )
 
     st.markdown("---")
@@ -3712,24 +3739,34 @@ if selected_section == "📊 Quick Insights":
 
     st.markdown("---")
 
-    # ── 3. DAU weekly chart ──────────────────────────────────────────────────
-    st.markdown("#### 📈 DAU — avg per week")
-    st.caption("Distinct users completing ≥1 activity per day, averaged per week (last 12 weeks). External users only.")
-    if not _dau_weekly.empty:
+    # ── 3. DAU daily comparison + DAU/MAU trend ──────────────────────────────
+    st.markdown("#### 📈 DAU — last 7d vs previous 7d")
+    st.caption("Distinct external users completing ≥1 activity per local day. Lines align day 1–7 in each 7-day period.")
+    if len(_dau_daily) >= 14:
         try:
             import altair as alt
-            _dau_wk = _dau_weekly.copy()
-            _dau_wk["dau"] = pd.to_numeric(_dau_wk["dau"], errors="coerce").fillna(0)
-            _dau_wk["week_label"] = pd.to_datetime(_dau_wk["activity_date"], errors="coerce").dt.strftime("w/o %d %b")
+
+            _dau_compare = _dau_daily.copy().sort_values("activity_date").reset_index(drop=True)
+            _dau_compare["activity_dt"] = pd.to_datetime(_dau_compare["activity_date"], errors="coerce")
+            _dau_compare["period"] = ["Previous 7d"] * 7 + ["Last 7d"] * 7
+            _dau_compare["day_in_period"] = (_dau_compare.index % 7) + 1
+            _dau_compare["date_label"] = _dau_compare["activity_dt"].dt.strftime("%d %b")
+
             _dau_chart = (
-                alt.Chart(_dau_wk)
-                .mark_line(point=True, color="#00d4aa")
+                alt.Chart(_dau_compare)
+                .mark_line(point=True)
                 .encode(
-                    x=alt.X("week_label:N", sort=list(_dau_wk["week_label"]), title="Week"),
-                    y=alt.Y("dau:Q", title="Avg DAU", scale=alt.Scale(zero=True)),
+                    x=alt.X("day_in_period:O", title="Day in 7-day period"),
+                    y=alt.Y("dau:Q", title="DAU", scale=alt.Scale(zero=True)),
+                    color=alt.Color(
+                        "period:N",
+                        title="Period",
+                        scale=alt.Scale(domain=["Last 7d", "Previous 7d"], range=["#00d4aa", "#7aa2ff"]),
+                    ),
                     tooltip=[
-                        alt.Tooltip("week_label:N", title="Week"),
-                        alt.Tooltip("dau:Q", title="Avg DAU", format=".1f"),
+                        alt.Tooltip("period:N", title="Period"),
+                        alt.Tooltip("date_label:N", title="Date"),
+                        alt.Tooltip("dau:Q", title="DAU", format=".0f"),
                     ],
                 )
                 .properties(height=280)
@@ -3738,7 +3775,42 @@ if selected_section == "📊 Quick Insights":
         except Exception as _dau_chart_err:
             st.warning(f"Could not render DAU chart: {_dau_chart_err}")
     else:
-        st.info("No activity data available for DAU chart.")
+        st.info("Need at least 14 days of activity data for DAU comparison.")
+
+    st.markdown("#### DAU/MAU — rolling 30d trend")
+    st.caption("Daily DAU divided by that day's rolling 30-day MAU. The bold line is a 7-day moving average to reduce weekday noise.")
+    if not _dau_ratio_daily.empty:
+        try:
+            import altair as alt
+
+            _ratio = _dau_ratio_daily.copy().sort_values("activity_date")
+            _ratio["activity_dt"] = pd.to_datetime(_ratio["activity_date"], errors="coerce")
+            _ratio["dau"] = pd.to_numeric(_ratio["dau"], errors="coerce").fillna(0)
+            _ratio["mau"] = pd.to_numeric(_ratio["mau"], errors="coerce").fillna(0)
+            _ratio["dau_mau"] = _ratio.apply(lambda row: row["dau"] / row["mau"] if row["mau"] else 0, axis=1)
+            _ratio["dau_mau_7d_avg"] = _ratio["dau_mau"].rolling(window=7, min_periods=1).mean()
+
+            _ratio_base = alt.Chart(_ratio).encode(
+                x=alt.X("activity_dt:T", title="Date"),
+                tooltip=[
+                    alt.Tooltip("activity_dt:T", title="Date", format="%d %b"),
+                    alt.Tooltip("dau:Q", title="DAU", format=".0f"),
+                    alt.Tooltip("mau:Q", title="Rolling 30d MAU", format=".0f"),
+                    alt.Tooltip("dau_mau:Q", title="DAU/MAU", format=".1%"),
+                    alt.Tooltip("dau_mau_7d_avg:Q", title="7d avg", format=".1%"),
+                ],
+            )
+            _ratio_daily_line = _ratio_base.mark_line(opacity=0.35, color="#7aa2ff").encode(
+                y=alt.Y("dau_mau:Q", title="DAU/MAU", axis=alt.Axis(format="%"), scale=alt.Scale(zero=True))
+            )
+            _ratio_smoothed_line = _ratio_base.mark_line(point=False, strokeWidth=3, color="#00d4aa").encode(
+                y=alt.Y("dau_mau_7d_avg:Q", title="DAU/MAU", axis=alt.Axis(format="%"), scale=alt.Scale(zero=True))
+            )
+            st.altair_chart((_ratio_daily_line + _ratio_smoothed_line).properties(height=280), use_container_width=True)
+        except Exception as _ratio_chart_err:
+            st.warning(f"Could not render DAU/MAU chart: {_ratio_chart_err}")
+    else:
+        st.info("No activity data available for DAU/MAU trend.")
 
     st.markdown("---")
     
