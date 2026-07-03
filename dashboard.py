@@ -868,72 +868,122 @@ ORDER BY row_type, activity_date
     return run_query(query)
 
 
-@st.cache_data(ttl=300)
-def get_dotz_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+def get_llm_cost_base_cte(exclude_internal: bool = True) -> str:
     """
-    Fetch Dotz-only headline KPIs for the Dotz tab.
+    Base CTE for Stack B LLM turn-level cost analysis (messages.type = 'turn_audit').
 
-    Dotz users are identified via users.tags containing the "dotz" value.
+    "real_users" = Stack B users who have sent at least one message themselves
+    (sender = 'user'). Per-user cost stats should only be computed over this
+    population so "ghost" users -- who only ever received proactive/automated
+    companion sends that happened to trigger an LLM call -- don't distort the
+    denominator (or numerator) for avg/median/p25/p75 metrics.
     """
     internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
-    beta_users_cte = get_beta_users_cte()
-    query = f"""
-{beta_users_cte},
-dotz_users AS (
-    SELECT DISTINCT
-        u.id,
-        u.waid,
-        u.is_active,
-        u.created_at
+    return f"""
+WITH real_users AS (
+    SELECT DISTINCT u.id AS user_id, u.waid, u.timezone, u.created_at
     FROM users u
-    WHERE COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
+    WHERE u.stack_variant = 'B'
       {internal_filter_join}
+      AND EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.sender = 'user' AND (m.user_id = u.id OR m.waid = u.waid)
+      )
 ),
-dotz_users_with_messages AS (
-    SELECT DISTINCT du.id, du.waid
-    FROM dotz_users du
-    WHERE EXISTS (
-        SELECT 1
-        FROM messages m
-        WHERE m.sender = 'user'
-          AND (m.user_id = du.id OR m.waid = du.waid)
-    )
-),
-dotz_onboarded_users AS (
-    SELECT DISTINCT du.id, du.waid, du.is_active, du.created_at
-    FROM dotz_users du
-    JOIN beta_users bu ON bu.id = du.id
-),
-latest_farewell AS (
-    SELECT DISTINCT ON (rl.user_id)
-        rl.user_id,
-        rl.sent_at AS farewell_at
-    FROM recovery_logs rl
-    JOIN dotz_onboarded_users dou ON dou.id = rl.user_id
-    WHERE rl.ladder_step = 'farewell'
-      AND rl.sent_at >= NOW() - INTERVAL '7 days'
-    ORDER BY rl.user_id, rl.sent_at DESC
-),
-churn_status AS (
+llm_cost_base AS (
     SELECT
-        lf.user_id,
-        EXISTS (
-            SELECT 1
-            FROM messages m
-            JOIN dotz_onboarded_users dou ON dou.id = lf.user_id
-            WHERE (m.user_id = dou.id OR m.waid = dou.waid)
-              AND m.sender = 'user'
-              AND m.sent_at > lf.farewell_at
-        ) AS came_back
-    FROM latest_farewell lf
+        ta.id AS turn_audit_id,
+        ru.user_id,
+        ta.sent_at AS date_time_utc,
+        ta.sent_at AT TIME ZONE COALESCE(ru.timezone, 'America/Sao_Paulo') AS date_time_local,
+        (
+            (ta.sent_at AT TIME ZONE COALESCE(ru.timezone, 'America/Sao_Paulo'))::date
+            - (ru.created_at AT TIME ZONE COALESCE(ru.timezone, 'America/Sao_Paulo'))::date
+            + 1
+        ) AS user_life_day,
+        (ta.message::jsonb ->> 'usd')::numeric AS usd_cost
+    FROM messages ta
+    JOIN real_users ru ON ru.user_id = ta.user_id
+    WHERE ta.type = 'turn_audit'
+      AND ta.message IS NOT NULL
+      AND ta.message LIKE '{{%'
+)
+"""
+
+
+@st.cache_data(ttl=300)
+def get_llm_cost_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """Rolling current-7d vs prior-7d LLM cost totals and distinct real users with cost."""
+    base_cte = get_llm_cost_base_cte(exclude_internal)
+    query = f"""
+{base_cte}
+SELECT
+    COALESCE(SUM(usd_cost) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '7 days'), 0) AS current_7d_total,
+    COALESCE(SUM(usd_cost) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '14 days' AND date_time_utc < NOW() - INTERVAL '7 days'), 0) AS prior_7d_total,
+    COUNT(DISTINCT user_id) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '7 days') AS current_7d_users,
+    COUNT(DISTINCT user_id) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '14 days' AND date_time_utc < NOW() - INTERVAL '7 days') AS prior_7d_users
+FROM llm_cost_base
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_llm_cost_weekly_trend(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Per-real-user weekly LLM cost distribution (avg / median / p25 / p75), bucketed
+    by local calendar week (Mon-Sun). Only fully completed weeks are included so the
+    trend isn't skewed by a partial in-progress week.
+    """
+    base_cte = get_llm_cost_base_cte(exclude_internal)
+    query = f"""
+{base_cte},
+weekly_user_cost AS (
+    SELECT
+        user_id,
+        date_trunc('week', date_time_local)::date AS week_start,
+        SUM(usd_cost) AS weekly_usd
+    FROM llm_cost_base
+    GROUP BY user_id, date_trunc('week', date_time_local)::date
 )
 SELECT
-    (SELECT COUNT(DISTINCT waid) FROM dotz_users_with_messages) AS all_users_count,
-    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users) AS onboarded_users_count,
-    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users WHERE is_active = true) AS alive_count,
-    (SELECT COUNT(DISTINCT waid) FROM dotz_onboarded_users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_7d_count,
-    COALESCE((SELECT COUNT(*) FROM churn_status WHERE NOT came_back), 0) AS churned_7d_count,
-    COALESCE((SELECT COUNT(*) FROM churn_status WHERE came_back), 0) AS churned_7d_came_back
+    week_start,
+    COUNT(DISTINCT user_id) AS users,
+    ROUND(AVG(weekly_usd)::numeric, 4) AS avg_usd,
+    ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY weekly_usd))::numeric, 4) AS median_usd,
+    ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY weekly_usd))::numeric, 4) AS p25_usd,
+    ROUND((PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY weekly_usd))::numeric, 4) AS p75_usd,
+    ROUND(SUM(weekly_usd)::numeric, 2) AS total_usd
+FROM weekly_user_cost
+WHERE week_start < date_trunc('week', NOW() AT TIME ZONE 'America/Sao_Paulo')::date
+GROUP BY week_start
+ORDER BY week_start
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
+def get_llm_cost_by_life_day(exclude_internal: bool = True) -> pd.DataFrame:
+    """Per-real-user LLM cost by day of user life (day 1 = signup day, local tz)."""
+    base_cte = get_llm_cost_base_cte(exclude_internal)
+    query = f"""
+{base_cte},
+per_user_day AS (
+    SELECT user_id, user_life_day, SUM(usd_cost) AS daily_usd
+    FROM llm_cost_base
+    WHERE user_life_day >= 1
+    GROUP BY user_id, user_life_day
+)
+SELECT
+    user_life_day,
+    COUNT(DISTINCT user_id) AS users_active,
+    ROUND(AVG(daily_usd)::numeric, 4) AS avg_usd,
+    ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY daily_usd))::numeric, 4) AS median_usd,
+    ROUND((PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY daily_usd))::numeric, 4) AS p25_usd,
+    ROUND((PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY daily_usd))::numeric, 4) AS p75_usd,
+    ROUND(SUM(daily_usd)::numeric, 2) AS total_usd
+FROM per_user_day
+GROUP BY user_life_day
+ORDER BY user_life_day
 """
     return run_query(query)
 
@@ -3095,6 +3145,43 @@ def get_user_deep_dive_summary(user_id: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120)
+def get_user_llm_cost_metrics(user_id: int) -> pd.DataFrame:
+    """Per-user LLM cost from turn_audit rows (lifetime, last 7d, avg/day)."""
+    return run_query(f"""
+        WITH user_info AS (
+            SELECT id, timezone, created_at
+            FROM users
+            WHERE id = {user_id}
+        ),
+        llm_turns AS (
+            SELECT
+                (ta.message::jsonb ->> 'usd')::numeric AS usd_cost,
+                ta.sent_at AS date_time_utc
+            FROM messages ta
+            WHERE ta.user_id = {user_id}
+              AND ta.type = 'turn_audit'
+              AND ta.message IS NOT NULL
+              AND ta.message LIKE '{{%'
+        )
+        SELECT
+            COALESCE(SUM(lt.usd_cost), 0) AS lifetime_usd,
+            COALESCE(
+                SUM(lt.usd_cost) FILTER (WHERE lt.date_time_utc >= NOW() - INTERVAL '7 days'),
+                0
+            ) AS last_7d_usd,
+            GREATEST(
+                ((CURRENT_TIMESTAMP AT TIME ZONE COALESCE(ui.timezone, 'America/Sao_Paulo'))::date
+                    - (ui.created_at AT TIME ZONE COALESCE(ui.timezone, 'America/Sao_Paulo'))::date
+                    + 1),
+                1
+            ) AS tenure_days
+        FROM user_info ui
+        LEFT JOIN llm_turns lt ON true
+        GROUP BY ui.timezone, ui.created_at
+    """)
+
+
+@st.cache_data(ttl=120)
 def get_user_activity_plan(user_id: int) -> pd.DataFrame:
     """Fetch current activity plan rows for a user."""
     return run_query(f"""
@@ -3622,7 +3709,7 @@ selected_section = st.radio(
     "Dashboard section",
     [
         "📊 Quick Insights",
-        "🎯 Dotz",
+        "💰 Cost",
         "🔍 User Deep Dive",
         "📈 User Retention",
         "🔔 Alerts",
@@ -4598,475 +4685,218 @@ if selected_section == "📊 Quick Insights":
 
 
 
-# Tab 1b: Dotz
-if selected_section == "🎯 Dotz":
-    # Dotz tab should include all Dotz users (including internal test accounts).
-    exclude_internal = False
+# Tab 1b: Cost
+if selected_section == "💰 Cost":
+    # Cost analysis always excludes internal users so spend reflects real customers.
+    exclude_internal = True
     st.markdown("---")
+    st.caption(
+        "Stack B LLM turn-level cost, sourced from `messages.type = 'turn_audit'`. "
+        "Per-user stats (avg / median / p25 / p75) only count **real users** — "
+        "Stack B users who have sent at least one message themselves — so users "
+        "who never messaged don't distort the denominator."
+    )
 
+    # ── 0. Headline: current 7d vs prior 7d ──────────────────────────────
     try:
-        headline_df = get_dotz_headline_metrics(exclude_internal)
-        headline = headline_df.iloc[0] if not headline_df.empty else {}
-        all_users_count = int(headline.get("all_users_count", 0))
-        onboarded_users_count = int(headline.get("onboarded_users_count", 0))
-        alive_count = int(headline.get("alive_count", 0))
-        new_7d_count = int(headline.get("new_7d_count", 0))
-        churned_7d_count = int(headline.get("churned_7d_count", 0))
-        churned_7d_came_back = int(headline.get("churned_7d_came_back", 0))
-    except Exception:
-        all_users_count = onboarded_users_count = alive_count = new_7d_count = churned_7d_count = churned_7d_came_back = 0
+        cost_headline_df = get_llm_cost_headline_metrics(exclude_internal)
+        cost_headline = cost_headline_df.iloc[0] if not cost_headline_df.empty else {}
+        current_7d_total = float(cost_headline.get("current_7d_total", 0) or 0)
+        prior_7d_total = float(cost_headline.get("prior_7d_total", 0) or 0)
+        current_7d_users = int(cost_headline.get("current_7d_users", 0) or 0)
+        prior_7d_users = int(cost_headline.get("prior_7d_users", 0) or 0)
+    except Exception as e:
+        st.warning(f"Could not load headline cost metrics: {e}")
+        current_7d_total = prior_7d_total = 0.0
+        current_7d_users = prior_7d_users = 0
 
-    alive_pct = round(100 * alive_count / onboarded_users_count, 1) if onboarded_users_count else 0
-    new_7d_pct = round(100 * new_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
-    churned_7d_pct = round(100 * churned_7d_count / onboarded_users_count, 1) if onboarded_users_count else 0
+    current_7d_avg = (current_7d_total / current_7d_users) if current_7d_users else 0.0
+    prior_7d_avg = (prior_7d_total / prior_7d_users) if prior_7d_users else 0.0
+    total_delta_pct = (
+        round(100 * (current_7d_total - prior_7d_total) / prior_7d_total, 1)
+        if prior_7d_total else None
+    )
+    avg_delta_pct = (
+        round(100 * (current_7d_avg - prior_7d_avg) / prior_7d_avg, 1)
+        if prior_7d_avg else None
+    )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("All users", all_users_count if all_users_count else "—")
-    col1.caption("Dotz users who ever messaged")
-    col2.metric("Onboarded users", onboarded_users_count if onboarded_users_count else "—")
-    col2.caption("Dotz users who have a plan")
-    col3.metric("Alive users", alive_count if alive_count is not None else "—")
-    col3.caption(f"↳ {alive_pct}% of onboarded users")
-    col4.metric("New users (last 7d)", new_7d_count if new_7d_count is not None else "—")
-    col4.caption(f"↳ {new_7d_pct}% of onboarded users")
-    col5.metric("Churned users (last 7d)", churned_7d_count if churned_7d_count is not None else "—")
-    col5.caption(f"↳ {churned_7d_pct}% of onboarded users · {churned_7d_came_back} came back")
+    cost_col1, cost_col2, cost_col3 = st.columns(3)
+    cost_col1.metric("Total LLM cost (last 7d)", f"${current_7d_total:,.2f}")
+    if total_delta_pct is None:
+        cost_col1.caption(f"Prior 7d: ${prior_7d_total:,.2f} (no comparable data)")
+    else:
+        arrow = "🔺" if total_delta_pct >= 0 else "🔻"
+        cost_col1.caption(f"{arrow} {abs(total_delta_pct)}% vs prior 7d (${prior_7d_total:,.2f})")
+
+    cost_col2.metric("Avg cost / real user (last 7d)", f"${current_7d_avg:,.3f}")
+    if avg_delta_pct is None:
+        cost_col2.caption(f"Prior 7d: ${prior_7d_avg:,.3f} (no comparable data)")
+    else:
+        arrow = "🔺" if avg_delta_pct >= 0 else "🔻"
+        cost_col2.caption(f"{arrow} {abs(avg_delta_pct)}% vs prior 7d (${prior_7d_avg:,.3f})")
+
+    cost_col3.metric("Real users with cost (last 7d)", current_7d_users)
+    cost_col3.caption(f"vs {prior_7d_users} in the prior 7d")
 
     st.markdown("---")
-    st.markdown("### 💬 Recent Messages")
 
-    if GoogleTranslator is None:
-        st.caption("ℹ️ Translation unavailable - install `deep-translator` to enable")
-    dotz_translate_recent_messages = st.checkbox(
-        "Translate recent messages to English",
-        value=False,
-        key="dotz_recent_messages_translate",
-        help="Disabled by default because translating every row can slow this tab.",
+    # ── 1. Weekly per-user cost trend (median / avg / p25 / p75) ───────────
+    st.markdown("#### 📦 Weekly LLM cost per real user — trend")
+    st.caption(
+        "One box per completed local calendar week (Mon–Sun). Box spans p25–p75, "
+        "white tick = median, orange line = average."
     )
-    dotz_wrap_recent_messages = st.checkbox(
-        "Wrap recent messages for screenshots",
-        value=False,
-        key="dotz_recent_messages_wrap",
-        help="Shows the same table with wrapped message text so it fits in screenshots.",
-    )
+    try:
+        weekly_cost_df = get_llm_cost_weekly_trend(exclude_internal)
+    except Exception as e:
+        st.warning(f"Could not load weekly cost trend: {e}")
+        weekly_cost_df = pd.DataFrame()
 
-    dotz_time_range = st.selectbox(
-        "Filter by time range:",
-        ["Last 20 messages", "Last 1 hour", "Last 24 hours"],
-        key="dotz_recent_messages_range",
-    )
+    if not weekly_cost_df.empty:
+        weekly_cost_df = weekly_cost_df.copy()
+        weekly_cost_df["week_start"] = pd.to_datetime(weekly_cost_df["week_start"])
+        for _col in ["avg_usd", "median_usd", "p25_usd", "p75_usd", "total_usd"]:
+            weekly_cost_df[_col] = pd.to_numeric(weekly_cost_df[_col], errors="coerce")
+        weekly_cost_df["week_label"] = weekly_cost_df["week_start"].dt.strftime("%d %b")
 
-    internal_filter_join = get_internal_users_filter_join_sql(exclude_internal, "u")
+        try:
+            import altair as alt
 
-    dotz_time_condition = ""
-    dotz_limit_clause = ""
-    if dotz_time_range == "Last 20 messages":
-        dotz_limit_clause = "LIMIT 20"
-    elif dotz_time_range == "Last 1 hour":
-        dotz_time_condition = "AND m.sent_at >= NOW() - INTERVAL '1 hour'"
-    else:
-        dotz_time_condition = "AND m.sent_at >= NOW() - INTERVAL '24 hours'"
-
-    dotz_recent_query = f"""
-        WITH dotz_messages AS (
-            SELECT DISTINCT ON (m.id)
-                m.id AS msg_id,
-                m.sent_at AS timestamp,
-                m.type AS msg_type,
-                u.id AS user_id,
-                u.full_name AS user_name,
-                u.waid AS user_waid,
-                u.timezone AS user_timezone,
-                m.sender,
-                m.message AS raw_message,
-                m.status
-            FROM messages m
-            JOIN users u ON (m.user_id = u.id OR m.waid = u.waid)
-            WHERE m.sent_at IS NOT NULL
-              {dotz_time_condition}
-              {get_user_visible_message_filter_sql("m")}
-              {internal_filter_join if exclude_internal and internal_filter_join else ""}
-              AND COALESCE(u.tags, '[]'::jsonb) ? 'dotz'
-            ORDER BY m.id, u.created_at DESC, m.sent_at DESC
-        )
-        SELECT *
-        FROM dotz_messages
-        ORDER BY timestamp DESC
-        {dotz_limit_clause}
-    """
-
-    dotz_recent_messages = run_query(dotz_recent_query)
-
-    if not dotz_recent_messages.empty:
-        st.caption(f"Showing {len(dotz_recent_messages)} message(s)")
-        dotz_display = dotz_recent_messages.copy()
-
-        # Same timestamp conversion pattern as Quick Insights / Deep Dive.
-        def _dotz_parse_timezone(tz_str):
-            if not tz_str or pd.isna(tz_str):
-                return None
-            tz_str = str(tz_str).strip()
-            try:
-                return pytz.timezone(tz_str)
-            except Exception:
-                pass
-            match = re.search(r'([+-]?)(\d{1,2})(?::(\d{2}))?', tz_str)
-            if match:
-                sign = -1 if match.group(1) == '-' else 1
-                if 'UTC-' in tz_str or 'GMT-' in tz_str or tz_str.startswith('-'):
-                    sign = -1
-                elif 'UTC+' in tz_str or 'GMT+' in tz_str or tz_str.startswith('+'):
-                    sign = 1
-                hours = int(match.group(2)) * sign
-                minutes = int(match.group(3) or 0)
-                return timezone(timedelta(hours=hours, minutes=minutes))
-            return None
-
-        def _dotz_format_timestamp_local(row):
-            ts = row["timestamp"]
-            tz_str = row.get("user_timezone")
-            if pd.isna(ts):
-                return ""
-            try:
-                if isinstance(ts, str):
-                    ts = pd.to_datetime(ts)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=pytz.UTC)
-                user_tz = _dotz_parse_timezone(tz_str)
-                if user_tz:
-                    ts = ts.astimezone(user_tz)
-                    return ts.strftime("%b %d, %H:%M")
-                return ts.strftime("%b %d, %H:%M") + " UTC"
-            except Exception:
-                return str(ts)[:16]
-
-        def _dotz_extract_message_text(raw_msg):
-            if pd.isna(raw_msg) or raw_msg is None:
-                return ""
-            msg_str = str(raw_msg).strip()
-
-            def parse_json(s):
-                try:
-                    data = json.loads(s)
-                    if isinstance(data, str):
-                        try:
-                            return json.loads(data)
-                        except Exception:
-                            return data
-                    return data
-                except Exception:
-                    return None
-
-            def find_text(obj, depth=0):
-                if depth > 10 or obj is None:
-                    return None
-                if isinstance(obj, str) and len(obj) > 2:
-                    return obj
-                if isinstance(obj, dict):
-                    for key in ["text", "body", "title", "message", "content", "caption", "label", "description", "value"]:
-                        if key in obj:
-                            val = obj[key]
-                            if isinstance(val, str) and len(val) > 2:
-                                return val
-                            found = find_text(val, depth + 1)
-                            if found:
-                                return found
-                    if "payload" in obj:
-                        payload = obj["payload"]
-                        if isinstance(payload, str):
-                            pj = parse_json(payload)
-                            if isinstance(pj, (dict, list)):
-                                found = find_text(pj, depth + 1)
-                                if found:
-                                    return found
-                            elif len(payload) > 2:
-                                return payload
-                        else:
-                            found = find_text(payload, depth + 1)
-                            if found:
-                                return found
-                    for v in obj.values():
-                        found = find_text(v, depth + 1)
-                        if found:
-                            return found
-                elif isinstance(obj, list):
-                    for item in obj:
-                        found = find_text(item, depth + 1)
-                        if found:
-                            return found
-                return None
-
-            data = parse_json(msg_str)
-
-            if isinstance(data, dict):
-                for key in ["flows", "quickReply", "postback", "interactive"]:
-                    if key in data:
-                        found = find_text(data[key])
-                        if found:
-                            return found
-                if "template" in data:
-                    tmpl = data["template"]
-                    template_texts = []
-                    if isinstance(tmpl, dict):
-                        components = tmpl.get("components")
-                        if isinstance(components, list):
-                            for comp in components:
-                                if isinstance(comp, dict):
-                                    params = comp.get("parameters")
-                                    if isinstance(params, list):
-                                        for p in params:
-                                            if isinstance(p, dict) and p.get("type") == "text":
-                                                txt = p.get("text")
-                                                if isinstance(txt, str) and txt.strip():
-                                                    template_texts.append(txt.strip())
-                    if template_texts:
-                        main_body = max(template_texts, key=len)
-                        return re.sub(r"\s+", " ", main_body).strip()
-                for key in ["interactive", "postback", "template"]:
-                    if key in data:
-                        found = find_text(data[key])
-                        if found:
-                            return found
-
-            if data is not None:
-                found = find_text(data)
-                if found:
-                    return found
-
-            if isinstance(data, str) and len(data) > 2:
-                return data
-
-            if msg_str.startswith("{") or msg_str.startswith("["):
-                return msg_str
-            return msg_str
-
-        if "recent_msg_translations" not in st.session_state:
-            st.session_state.recent_msg_translations = {}
-
-        def _dotz_translate_to_english(text: str) -> str:
-            if not text or text.strip() == "":
-                return ""
-            if GoogleTranslator is None:
-                return "[Translation unavailable - deep_translator not installed]"
-            cache = st.session_state.recent_msg_translations
-            if text in cache:
-                return cache[text]
-            try:
-                text_to_translate = text[:5000] if len(text) > 5000 else text
-                translated = GoogleTranslator(source="auto", target="en").translate(text_to_translate)
-                cache[text] = translated
-                return translated
-            except Exception:
-                cache[text] = text
-                return text
-
-        def _dotz_is_audio_message(msg_type, raw_msg):
-            if pd.isna(msg_type):
-                msg_type = ""
-            t = str(msg_type).strip().lower()
-            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
-            return (
-                t == "audio"
-                or "audio/" in t
-                or "audio/ogg" in raw_str
-                or ("opus" in raw_str and "audio" in raw_str.lower())
+            _box_layer = (
+                alt.Chart(weekly_cost_df)
+                .mark_bar(size=26, color="#00d4aa", opacity=0.35)
+                .encode(
+                    x=alt.X("week_start:T", title="Week starting"),
+                    y=alt.Y("p25_usd:Q", title="LLM cost per real user ($)"),
+                    y2=alt.Y2("p75_usd:Q"),
+                    tooltip=[
+                        alt.Tooltip("week_label:N", title="Week"),
+                        alt.Tooltip("users:Q", title="Real users"),
+                        alt.Tooltip("p25_usd:Q", title="p25", format="$.3f"),
+                        alt.Tooltip("median_usd:Q", title="Median", format="$.3f"),
+                        alt.Tooltip("avg_usd:Q", title="Average", format="$.3f"),
+                        alt.Tooltip("p75_usd:Q", title="p75", format="$.3f"),
+                    ],
+                )
             )
+            _median_layer = (
+                alt.Chart(weekly_cost_df)
+                .mark_tick(color="#ffffff", thickness=2, size=26)
+                .encode(x="week_start:T", y="median_usd:Q")
+            )
+            _avg_layer = (
+                alt.Chart(weekly_cost_df)
+                .mark_line(point=True, color="#ff9f40", strokeWidth=2)
+                .encode(x="week_start:T", y="avg_usd:Q")
+            )
+            st.altair_chart(
+                (_box_layer + _median_layer + _avg_layer).properties(height=320),
+                use_container_width=True,
+            )
+            st.caption("🟩 Box = p25–p75 · ⬜ White tick = median · 🟧 Orange line = average")
+        except Exception as _chart_err:
+            st.warning(f"Could not render weekly cost chart: {_chart_err}")
 
-        def _dotz_is_sticker_message(msg_type, raw_msg):
-            if pd.isna(msg_type):
-                msg_type = ""
-            t = str(msg_type).strip().lower()
-            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
-            if t == "sticker":
-                return True
-            if '"sticker"' in raw_str and "image/webp" in raw_str:
-                return True
-            return False
-
-        def _dotz_is_image_message(msg_type, raw_msg):
-            if pd.isna(msg_type):
-                msg_type = ""
-            t = str(msg_type).strip().lower()
-            raw_str = "" if pd.isna(raw_msg) else str(raw_msg)
-            if _dotz_is_sticker_message(msg_type, raw_msg):
-                return False
-            if t in ("image", "photo"):
-                return True
-            if "image/" in t or ('"image"' in raw_str and "image/jpeg" in raw_str):
-                return True
-            return False
-
-        skip_idx = set()
-        transcript_for_audio = {}
-        for i in range(len(dotz_recent_messages)):
-            row = dotz_recent_messages.iloc[i]
-            if not _dotz_is_audio_message(row.get("msg_type"), row.get("raw_message")):
-                continue
-            try:
-                ts_cur = pd.to_datetime(row["timestamp"])
-            except Exception:
-                continue
-            for candidate_idx in [i - 1, i + 1]:
-                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
-                    continue
-                if candidate_idx in skip_idx:
-                    continue
-                other = dotz_recent_messages.iloc[candidate_idx]
-                if other["sender"] != row["sender"] or _dotz_is_audio_message(other.get("msg_type"), other.get("raw_message")):
-                    continue
-                try:
-                    ts_other = pd.to_datetime(other["timestamp"])
-                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
-                        transcript_for_audio[i] = candidate_idx
-                        skip_idx.add(candidate_idx)
-                        break
-                except Exception:
-                    pass
-
-        interpretation_for_image = {}
-        for i in range(len(dotz_recent_messages)):
-            row = dotz_recent_messages.iloc[i]
-            if not _dotz_is_image_message(row.get("msg_type"), row.get("raw_message")):
-                continue
-            try:
-                ts_cur = pd.to_datetime(row["timestamp"])
-            except Exception:
-                continue
-            for candidate_idx in [i - 1, i + 1]:
-                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
-                    continue
-                if candidate_idx in skip_idx:
-                    continue
-                other = dotz_recent_messages.iloc[candidate_idx]
-                if other["sender"] != row["sender"] or _dotz_is_image_message(other.get("msg_type"), other.get("raw_message")):
-                    continue
-                try:
-                    ts_other = pd.to_datetime(other["timestamp"])
-                    if abs((ts_cur - ts_other).total_seconds()) <= 120:
-                        interpretation_for_image[i] = candidate_idx
-                        skip_idx.add(candidate_idx)
-                        break
-                except Exception:
-                    pass
-
-        description_for_sticker = {}
-
-        def _dotz_is_text_like_for_sticker(msg_type, raw_msg):
-            if pd.isna(msg_type):
-                msg_type = ""
-            t = str(msg_type).strip().lower()
-            raw = "" if pd.isna(raw_msg) else str(raw_msg)
-            if _dotz_is_sticker_message(msg_type, raw_msg) or _dotz_is_audio_message(msg_type, raw_msg) or _dotz_is_image_message(msg_type, raw_msg):
-                return False
-            if "notification" in raw.lower() or '"template"' in raw.lower():
-                return False
-            return t in ("text", "interactive", "quickreply", "postback", "flows", "") or "text" in raw.lower()
-
-        for i in range(len(dotz_recent_messages)):
-            row = dotz_recent_messages.iloc[i]
-            if not _dotz_is_sticker_message(row.get("msg_type"), row.get("raw_message")):
-                continue
-            try:
-                ts_cur = pd.to_datetime(row["timestamp"])
-            except Exception:
-                continue
-            for candidate_idx in [i - 1]:
-                if candidate_idx < 0 or candidate_idx >= len(dotz_recent_messages):
-                    continue
-                if candidate_idx in skip_idx:
-                    continue
-                other = dotz_recent_messages.iloc[candidate_idx]
-                if other["sender"] != row["sender"]:
-                    continue
-                if not _dotz_is_text_like_for_sticker(other.get("msg_type"), other.get("raw_message")):
-                    continue
-                try:
-                    ts_other = pd.to_datetime(other["timestamp"])
-                    if 0 <= (ts_cur - ts_other).total_seconds() <= 30:
-                        description_for_sticker[i] = candidate_idx
-                        skip_idx.add(candidate_idx)
-                        break
-                except Exception:
-                    pass
-
-        def _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_tmpl):
-            if is_tmpl:
-                return "template"
-            if is_audio:
-                return "🎧"
-            if is_sticker:
-                return "sticker"
-            if is_image:
-                return "📷"
-            t = msg_type_val if msg_type_val is not None and pd.notna(msg_type_val) else ""
-            return str(t).strip() or "—"
-
-        def _dotz_get_display_text(idx):
-            if idx in skip_idx:
-                return ""
-            row = dotz_recent_messages.iloc[idx]
-            raw = row.get("raw_message")
-            if _dotz_is_audio_message(row.get("msg_type"), raw):
-                if idx in transcript_for_audio:
-                    trans_idx = transcript_for_audio[idx]
-                    prev = dotz_recent_messages.iloc[trans_idx]
-                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Audio]"
-                return "[Audio]"
-            if _dotz_is_sticker_message(row.get("msg_type"), raw):
-                if idx in description_for_sticker:
-                    desc_idx = description_for_sticker[idx]
-                    prev = dotz_recent_messages.iloc[desc_idx]
-                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Sticker]"
-                return "[Sticker]"
-            if _dotz_is_image_message(row.get("msg_type"), raw):
-                if idx in interpretation_for_image:
-                    interp_idx = interpretation_for_image[idx]
-                    prev = dotz_recent_messages.iloc[interp_idx]
-                    return _dotz_extract_message_text(prev.get("raw_message")) or "[Image]"
-                return "[Image]"
-            return _dotz_extract_message_text(raw)
-
-        rows_display = []
-        for i in range(len(dotz_recent_messages)):
-            if i in skip_idx:
-                continue
-            row = dotz_recent_messages.iloc[i]
-            msg_type_val = row.get("msg_type")
-            raw_msg = row.get("raw_message")
-            is_audio = _dotz_is_audio_message(msg_type_val, raw_msg)
-            is_sticker = _dotz_is_sticker_message(msg_type_val, raw_msg)
-            is_image = _dotz_is_image_message(msg_type_val, raw_msg)
-            text = _dotz_get_display_text(i)
-            rows_display.append({
-                "Time": _dotz_format_timestamp_local(row),
-                "User": format_display_name(row.get("user_name"), row.get("user_waid"), user_id=row.get("user_id")),
-                "From": "👤 User" if row["sender"] == "user" else "🤖 Bot",
-                "Status": str(row.get("status")).lower() if pd.notna(row.get("status")) else "—",
-                "Type": _dotz_get_type_label(msg_type_val, is_audio, is_image, is_sticker, is_template(raw_msg)),
-                "Message": text,
-                "Message (EN)": _dotz_translate_to_english(text) if dotz_translate_recent_messages else "",
-            })
-
-        dotz_display = pd.DataFrame(rows_display)
-        if dotz_wrap_recent_messages:
-            render_wrapped_messages_table(dotz_display)
-        else:
+        with st.expander("View weekly cost data"):
             st.dataframe(
-                dotz_display[["Time", "User", "From", "Status", "Type", "Message", "Message (EN)"]],
+                weekly_cost_df[
+                    ["week_label", "users", "avg_usd", "median_usd", "p25_usd", "p75_usd", "total_usd"]
+                ].rename(columns={
+                    "week_label": "Week",
+                    "users": "Real users",
+                    "avg_usd": "Avg $",
+                    "median_usd": "Median $",
+                    "p25_usd": "p25 $",
+                    "p75_usd": "p75 $",
+                    "total_usd": "Total $",
+                }),
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Time": st.column_config.TextColumn(width="small"),
-                    "User": st.column_config.TextColumn(width="medium"),
-                    "From": st.column_config.TextColumn(width="small"),
-                    "Status": st.column_config.TextColumn(width="small"),
-                    "Type": st.column_config.TextColumn(width="small"),
-                    "Message": st.column_config.TextColumn(width="large"),
-                    "Message (EN)": st.column_config.TextColumn(width="large"),
-                },
             )
     else:
-        st.info("No messages found")
+        st.info("Not enough data yet for a weekly trend (need at least one fully completed week).")
+
+    st.markdown("---")
+
+    # ── 2. Cost per user life day ──────────────────────────────
+    st.markdown("#### 📅 LLM cost per real user by day of user life")
+    st.caption(
+        "Day 1 = signup day (local time). Life days with fewer than 5 active real "
+        "users are hidden from the chart to avoid noisy long-tail days."
+    )
+    try:
+        life_day_cost_df = get_llm_cost_by_life_day(exclude_internal)
+    except Exception as e:
+        st.warning(f"Could not load cost-by-life-day data: {e}")
+        life_day_cost_df = pd.DataFrame()
+
+    if not life_day_cost_df.empty:
+        life_day_cost_df = life_day_cost_df.copy()
+        for _col in ["users_active", "avg_usd", "median_usd", "p25_usd", "p75_usd", "total_usd"]:
+            life_day_cost_df[_col] = pd.to_numeric(life_day_cost_df[_col], errors="coerce")
+        life_day_chart_df = life_day_cost_df[life_day_cost_df["users_active"] >= 5]
+
+        if not life_day_chart_df.empty:
+            try:
+                import altair as alt
+
+                _band_layer = (
+                    alt.Chart(life_day_chart_df)
+                    .mark_area(color="#00d4aa", opacity=0.15)
+                    .encode(
+                        x=alt.X("user_life_day:Q", title="Day of user life"),
+                        y=alt.Y("p25_usd:Q", title="LLM cost per real user ($)"),
+                        y2=alt.Y2("p75_usd:Q"),
+                    )
+                )
+                _median_line = (
+                    alt.Chart(life_day_chart_df)
+                    .mark_line(color="#ffffff", strokeWidth=2)
+                    .encode(x="user_life_day:Q", y="median_usd:Q")
+                )
+                _avg_line = (
+                    alt.Chart(life_day_chart_df)
+                    .mark_line(color="#ff9f40", strokeWidth=2, strokeDash=[4, 3])
+                    .encode(
+                        x="user_life_day:Q",
+                        y="avg_usd:Q",
+                        tooltip=[
+                            alt.Tooltip("user_life_day:Q", title="Life day"),
+                            alt.Tooltip("users_active:Q", title="Real users"),
+                            alt.Tooltip("p25_usd:Q", title="p25", format="$.3f"),
+                            alt.Tooltip("median_usd:Q", title="Median", format="$.3f"),
+                            alt.Tooltip("avg_usd:Q", title="Average", format="$.3f"),
+                            alt.Tooltip("p75_usd:Q", title="p75", format="$.3f"),
+                        ],
+                    )
+                )
+                st.altair_chart(
+                    (_band_layer + _median_line + _avg_line).properties(height=320),
+                    use_container_width=True,
+                )
+                st.caption("🟩 Shaded band = p25–p75 · ⬜ White line = median · 🟧 Dashed orange line = average")
+            except Exception as _chart_err:
+                st.warning(f"Could not render life-day cost chart: {_chart_err}")
+        else:
+            st.info("Not enough real users per life day yet (need ≥5 active real users on a given day).")
+
+        with st.expander("View cost-by-life-day data"):
+            st.dataframe(
+                life_day_cost_df.rename(columns={
+                    "user_life_day": "Life day",
+                    "users_active": "Real users",
+                    "avg_usd": "Avg $",
+                    "median_usd": "Median $",
+                    "p25_usd": "p25 $",
+                    "p75_usd": "p75 $",
+                    "total_usd": "Total $",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("No life-day cost data found.")
 
 
 # Tab 2: User Deep Dive
@@ -5176,12 +5006,6 @@ if selected_section == "🔍 User Deep Dive":
                 return True
         outside_24h_flag = is_outside_24h(last_user_message_at)
 
-        user_recovery_count = int(summary.get('recovery_count', 0) or 0)
-        last_recovery_name = summary.get('last_recovery_template_name') if pd.notna(summary.get('last_recovery_template_name')) else "—"
-        last_recovery_step = summary.get('last_recovery_ladder_step') if pd.notna(summary.get('last_recovery_ladder_step')) else None
-        last_recovery_sent_at = summary.get('last_recovery_sent_at')
-        last_recovery_time = format_ts_local(last_recovery_sent_at) if pd.notna(last_recovery_sent_at) else "—"
-
         # Recovery ladder position (PDF milestones + last send since AFK)
         days_afk = int(summary.get('days_afk', 0) or 0) if pd.notna(summary.get('days_afk')) else 0
         is_afk = outside_24h_flag and days_afk >= 1
@@ -5197,14 +5021,16 @@ if selected_section == "🔍 User Deep Dive":
         last_rung_sent_at = summary.get('last_rung_sent_at')
         recovery_cohort_label = "≤3 active days" if active_days_count <= 3 else ">3 active days"
 
-        conv24 = bool(summary.get('conv24')) if pd.notna(summary.get('conv24')) else False
-        conv72 = bool(summary.get('conv72')) if pd.notna(summary.get('conv72')) else False
-        hrs_reply = summary.get('hours_to_reply')
-        hrs_reply_fmt = f"{hrs_reply:.1f} h" if hrs_reply is not None and pd.notna(hrs_reply) else "—"
-
-        onboarding_completed = bool(summary.get('onboarding_completed')) if pd.notna(summary.get('onboarding_completed')) else False
-        slogan_set = bool(summary.get('slogan_set')) if pd.notna(summary.get('slogan_set')) else False
-        first_activity_completed = bool(summary.get('first_activity_completed')) if pd.notna(summary.get('first_activity_completed')) else False
+        try:
+            llm_cost_df = get_user_llm_cost_metrics(user_id)
+            llm_cost = llm_cost_df.iloc[0] if not llm_cost_df.empty else {}
+            llm_lifetime_usd = float(llm_cost.get("lifetime_usd", 0) or 0)
+            llm_last_7d_usd = float(llm_cost.get("last_7d_usd", 0) or 0)
+            llm_tenure_days = int(llm_cost.get("tenure_days", 1) or 1)
+            llm_avg_per_day = llm_lifetime_usd / llm_tenure_days if llm_tenure_days else 0.0
+        except Exception:
+            llm_lifetime_usd = llm_last_7d_usd = llm_avg_per_day = 0.0
+            llm_tenure_days = 1
 
         # Activity plan (schedule) from user_activities
         plan_df = get_user_activity_plan(user_id)
@@ -5267,13 +5093,11 @@ if selected_section == "🔍 User Deep Dive":
             st.info(f"**Slogan / Mantra:** {user_slogan if user_slogan and pd.notna(user_slogan) else '—'}")
 
         st.markdown("#### 🪜 Recovery Ladder Position")
-        afk_col1, afk_col2, afk_col3 = st.columns(3)
+        afk_col1, afk_col2 = st.columns(2)
         with afk_col1:
-            st.metric("Days AFK", days_afk if is_afk else 0, "No user msg in 24h+" if is_afk else "Active")
-        with afk_col2:
             next_label = _format_milestone_step(next_ladder_step)
             st.metric("Next Ladder Step", next_label, ladder_position)
-        with afk_col3:
+        with afk_col2:
             if pdf_step:
                 st.metric("Today's PDF Step", _format_milestone_step(pdf_step), recovery_cohort_label)
             else:
@@ -5296,20 +5120,6 @@ if selected_section == "🔍 User Deep Dive":
         else:
             st.markdown(f"**Recovery ladder:** — (no recovery sends) · {recovery_cohort_label}")
 
-        # Funnel metrics: onboarding completed, slogan set, first activity completed
-        st.markdown("#### 🎯 User Journey Funnel")
-        funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
-        
-        with funnel_col1:
-            status_icon = "✅" if onboarding_completed else "❌"
-            st.metric("Onboarding Completed", status_icon, "Step 1")
-        with funnel_col2:
-            status_icon = "✅" if slogan_set else "❌"
-            st.metric("Slogan Set", status_icon, "Step 2")
-        with funnel_col3:
-            status_icon = "✅" if first_activity_completed else "❌"
-            st.metric("First Activity Completed", status_icon, "Step 3")
-        
         # Most active times analysis (in user's local timezone)
         st.markdown("#### 📊 Most Active Times")
         
@@ -5379,38 +5189,16 @@ if selected_section == "🔍 User Deep Dive":
         st.markdown("---")
         
         # Metrics row (active days + goal from users table per db-dictionary)
-        m1, m1_goal, m2, m3, m4, m5, m6, m7, m8 = st.columns(9)
+        m1, m1_goal, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
         m1.metric("📅 Active Days", active_days_count)
         m1_goal.metric("🎯 Active Days Goal", active_days_goal_str)
         m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
         m3.metric("⏭️ Next Activity", next_activity_name, next_activity_day)
         m4.metric("⏱️ Last Active", last_active)
         m5.metric("💬 Messages Sent (24h)", count_24h, f"3d: {count_3d} • 7d: {count_7d}")
-        m6.metric("Days AFK", days_afk if is_afk else 0, "Active" if not is_afk else "24h+ silent")
-        m7.metric("Recovery Sends", user_recovery_count, f"Last: {last_recovery_time}")
-        m8.metric("Recovery Conversion", "✓ 24h" if conv24 else ("✓ 72h" if conv72 else "—"), hrs_reply_fmt)
-
-        # Recovery response by type (windowed attribution): Fun image vs Recovery message
-        st.markdown("#### 🪜 Recovery Response by Type")
-        try:
-            resp_df = get_user_recovery_response_by_type(user_id)
-        except Exception as e:
-            resp_df = pd.DataFrame()
-            st.caption(f"Could not load recovery response breakdown: {e}")
-        if resp_df is None or resp_df.empty:
-            st.caption("No recovery-ladder sends yet for this user.")
-        else:
-            resp_map = {r["step_type"]: r for _, r in resp_df.iterrows()}
-            rc1, rc2 = st.columns(2)
-            for col, key in ((rc1, "Recovery message"), (rc2, "Fun image")):
-                if key in resp_map:
-                    sends = int(resp_map[key]["sends"])
-                    responded = int(resp_map[key]["responded"])
-                    rate = (100.0 * responded / sends) if sends else 0.0
-                    col.metric(key, f"{rate:.0f}%", f"{responded}/{sends} responded")
-                else:
-                    col.metric(key, "—", "0 sends")
-            st.caption("Windowed attribution: a reply counts only if it lands before the user's next ladder rung.")
+        m6.metric("💰 LLM cost (lifetime)", f"${llm_lifetime_usd:,.2f}")
+        m7.metric("💰 LLM cost (7d)", f"${llm_last_7d_usd:,.2f}")
+        m8.metric("💰 LLM avg / day", f"${llm_avg_per_day:,.3f}", f"{llm_tenure_days}d tenure")
 
         # Activity plan weekly calendar
         st.markdown("#### 📅 Activity Plan (weekly)")
