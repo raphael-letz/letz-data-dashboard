@@ -5189,7 +5189,7 @@ if selected_section == "🔍 User Deep Dive":
         st.markdown("---")
         
         # Metrics row (active days + goal from users table per db-dictionary)
-        m1, m1_goal, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+        m1, m1_goal, m2, m3, m4, m5, m6, m7, m8 = st.columns(9)
         m1.metric("📅 Active Days", active_days_count)
         m1_goal.metric("🎯 Active Days Goal", active_days_goal_str)
         m2.metric("✅ Last Completed", last_activity_name, last_activity_time)
