@@ -4044,7 +4044,7 @@ if selected_section == "📊 Quick Insights":
             "<table style='width:100%;border-collapse:collapse;margin:8px 0 4px 0;font-size:1.15rem;'>"
             "<thead><tr>"
             "<th style='text-align:left;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Metric</th>"
-            "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Last 7D</th>"
+            "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Current</th>"
             "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Previous 7D</th>"
             "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Δ</th>"
             "</tr></thead>"
