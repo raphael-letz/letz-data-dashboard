@@ -868,6 +868,215 @@ ORDER BY row_type, activity_date
     return run_query(query)
 
 
+@st.cache_data(ttl=300)
+def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Investor-facing engagement comparison for Quick Insights.
+
+    Rows: DAU, avg rolling 30-day MAU, DAU/MAU, 7D/14D/30D retention.
+    Columns: last 7 completed local days vs previous 7 completed local days
+    (America/Sao_Paulo; today excluded for DAU/MAU).
+
+    Retention (first-activity definition): among onboarded external users who
+    completed a first activity and have matured into the window.
+    - 7D: second activity within 7 days of first
+    - 14D / 30D: any subsequent activity after day 14 / 30 from first
+    """
+    internal_waids = load_internal_users() if exclude_internal else []
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+params AS (
+  SELECT
+    CURRENT_TIMESTAMP AS as_of_ts,
+    (CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date AS as_of_local_date
+),
+report_days AS (
+  SELECT 'Last 7D' AS period,
+         generate_series(p.as_of_local_date - 7, p.as_of_local_date - 1, INTERVAL '1 day')::date AS local_date
+  FROM params p
+  UNION ALL
+  SELECT 'Previous 7D',
+         generate_series(p.as_of_local_date - 14, p.as_of_local_date - 8, INTERVAL '1 day')::date
+  FROM params p
+),
+retention_snapshots AS (
+  SELECT 'Current' AS period, as_of_ts AS snapshot_ts FROM params
+  UNION ALL
+  SELECT 'Previous 7D', as_of_ts - INTERVAL '7 days' FROM params
+),
+onboarded AS (
+  SELECT u.id, MIN(acf.updated_at) AS onboarded_at
+  FROM users u
+  JOIN ai_companion_flows acf
+    ON acf.user_id = u.id
+   AND acf.type = 'onboarding'
+   AND acf.is_complete = 'true'
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY u.id
+),
+activities AS (
+  SELECT uah.user_id, uah.completed_at,
+         (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM user_activities_history uah
+  JOIN onboarded o ON o.id = uah.user_id
+  WHERE uah.completed_at >= o.onboarded_at
+),
+daily_dau AS (
+  SELECT d.period, d.local_date, COUNT(DISTINCT a.user_id) AS dau
+  FROM report_days d
+  LEFT JOIN activities a ON a.local_date = d.local_date
+  GROUP BY d.period, d.local_date
+),
+daily_mau AS (
+  SELECT d.period, d.local_date, COUNT(DISTINCT a.user_id) AS mau
+  FROM report_days d
+  LEFT JOIN activities a
+    ON a.local_date BETWEEN d.local_date - 29 AND d.local_date
+  GROUP BY d.period, d.local_date
+),
+activity_summary AS (
+  SELECT
+    dd.period,
+    ROUND(AVG(dd.dau), 1) AS avg_dau,
+    ROUND(AVG(dm.mau), 1) AS avg_mau,
+    ROUND(100.0 * AVG(dd.dau) / NULLIF(AVG(dm.mau), 0), 1) AS dau_mau_pct
+  FROM daily_dau dd
+  JOIN daily_mau dm
+    ON dm.period = dd.period
+   AND dm.local_date = dd.local_date
+  GROUP BY dd.period
+),
+first_activity AS (
+  SELECT s.period, s.snapshot_ts, o.id, MIN(a.completed_at) AS first_completed_at
+  FROM retention_snapshots s
+  JOIN onboarded o ON o.onboarded_at <= s.snapshot_ts
+  JOIN activities a
+    ON a.user_id = o.id
+   AND a.completed_at <= s.snapshot_ts
+  GROUP BY s.period, s.snapshot_ts, o.id
+),
+repeat_retention AS (
+  SELECT
+    f.period,
+    f.snapshot_ts,
+    f.id,
+    f.first_completed_at,
+    MAX((a.completed_at <= f.first_completed_at + INTERVAL '7 days')::int) = 1 AS repeat_within_7d,
+    MAX((a.completed_at > f.first_completed_at + INTERVAL '14 days')::int) = 1 AS repeat_after_14d,
+    MAX((a.completed_at > f.first_completed_at + INTERVAL '30 days')::int) = 1 AS repeat_after_30d
+  FROM first_activity f
+  LEFT JOIN activities a
+    ON a.user_id = f.id
+   AND a.completed_at > f.first_completed_at
+   AND a.completed_at <= f.snapshot_ts
+  GROUP BY f.period, f.snapshot_ts, f.id, f.first_completed_at
+),
+retention_summary AS (
+  SELECT
+    period,
+    1 AS sort_order,
+    '7D retention' AS metric,
+    COUNT(*) FILTER (WHERE repeat_within_7d) AS numerator,
+    COUNT(*) AS denominator,
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_within_7d) / NULLIF(COUNT(*), 0),
+      1
+    ) AS rate
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '7 days'
+  GROUP BY period
+  UNION ALL
+  SELECT
+    period,
+    2,
+    '14D retention',
+    COUNT(*) FILTER (WHERE repeat_after_14d),
+    COUNT(*),
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_after_14d) / NULLIF(COUNT(*), 0),
+      1
+    )
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '14 days'
+  GROUP BY period
+  UNION ALL
+  SELECT
+    period,
+    3,
+    '30D retention',
+    COUNT(*) FILTER (WHERE repeat_after_30d),
+    COUNT(*),
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_after_30d) / NULLIF(COUNT(*), 0),
+      1
+    )
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '30 days'
+  GROUP BY period
+),
+metric_rows AS (
+  SELECT
+    1 AS sort_order,
+    'DAU (avg. daily active users)' AS metric,
+    'count' AS value_type,
+    MAX(avg_dau) FILTER (WHERE period = 'Last 7D') AS current_value,
+    MAX(avg_dau) FILTER (WHERE period = 'Previous 7D') AS previous_value,
+    NULL::numeric AS current_numerator,
+    NULL::numeric AS current_denominator,
+    NULL::numeric AS previous_numerator,
+    NULL::numeric AS previous_denominator
+  FROM activity_summary
+  UNION ALL
+  SELECT
+    2,
+    'MAU (avg. rolling 30-day MAU)',
+    'count',
+    MAX(avg_mau) FILTER (WHERE period = 'Last 7D'),
+    MAX(avg_mau) FILTER (WHERE period = 'Previous 7D'),
+    NULL, NULL, NULL, NULL
+  FROM activity_summary
+  UNION ALL
+  SELECT
+    3,
+    'DAU / MAU',
+    'pct',
+    MAX(dau_mau_pct) FILTER (WHERE period = 'Last 7D'),
+    MAX(dau_mau_pct) FILTER (WHERE period = 'Previous 7D'),
+    NULL, NULL, NULL, NULL
+  FROM activity_summary
+  UNION ALL
+  SELECT
+    3 + sort_order,
+    metric,
+    'retention',
+    MAX(rate) FILTER (WHERE period = 'Current'),
+    MAX(rate) FILTER (WHERE period = 'Previous 7D'),
+    MAX(numerator) FILTER (WHERE period = 'Current'),
+    MAX(denominator) FILTER (WHERE period = 'Current'),
+    MAX(numerator) FILTER (WHERE period = 'Previous 7D'),
+    MAX(denominator) FILTER (WHERE period = 'Previous 7D')
+  FROM retention_summary
+  GROUP BY metric, sort_order
+)
+SELECT
+  sort_order,
+  metric,
+  value_type,
+  current_value,
+  previous_value,
+  current_numerator,
+  current_denominator,
+  previous_numerator,
+  previous_denominator
+FROM metric_rows
+ORDER BY sort_order
+"""
+    return run_query(query)
+
+
 def get_llm_cost_base_cte(exclude_internal: bool = True) -> str:
     """
     Base CTE for Stack B LLM turn-level cost analysis (messages.type = 'turn_audit').
@@ -3770,7 +3979,7 @@ if selected_section == "📊 Quick Insights":
     at_risk_5d_pct = round(100 * at_risk_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
     active_users_5d_pct = round(100 * active_users_5d_count / onboarded_users_count, 1) if onboarded_users_count else 0
 
-    # ── DAU / MAU data loading ────────────────────────────────────────────────
+    # ── DAU / MAU data loading (charts) ───────────────────────────────────────
     try:
         _dau_df = get_dau_metrics(exclude_internal)
         _dau_daily = _dau_df[_dau_df["row_type"] == "daily"].copy() if not _dau_df.empty else pd.DataFrame()
@@ -3779,35 +3988,81 @@ if selected_section == "📊 Quick Insights":
         _dau_daily["dau"] = pd.to_numeric(_dau_daily["dau"], errors="coerce").fillna(0)
         _dau_daily["mau"] = pd.to_numeric(_dau_daily["mau"], errors="coerce").fillna(0)
         _dau_daily = _dau_daily.sort_values("activity_date")
-        dau_7d = float(_dau_daily.tail(7)["dau"].mean()) if len(_dau_daily) >= 7 else 0.0
-        dau_prev_7d = float(_dau_daily.head(7)["dau"].mean()) if len(_dau_daily) >= 14 else 0.0
-        _mau_current_row = _dau_daily.iloc[-1] if not _dau_daily.empty else None
-        _mau_prev_row = _dau_daily.iloc[6] if len(_dau_daily) >= 14 else None
-        mau_current = float(_mau_current_row["mau"]) if _mau_current_row is not None and pd.notna(_mau_current_row.get("mau")) else 0.0
-        mau_prev = float(_mau_prev_row["mau"]) if _mau_prev_row is not None and pd.notna(_mau_prev_row.get("mau")) else 0.0
-        dau_mau = round(dau_7d / mau_current, 3) if mau_current else 0.0
-        dau_mau_prev = round(dau_prev_7d / mau_prev, 3) if mau_prev else 0.0
     except Exception as _dau_err:
-        _dau_weekly = _dau_ratio_daily = pd.DataFrame()
-        dau_7d = dau_prev_7d = mau_current = mau_prev = dau_mau = dau_mau_prev = 0.0
+        _dau_daily = _dau_weekly = _dau_ratio_daily = pd.DataFrame()
         st.warning(f"Could not load DAU metrics: {_dau_err}")
 
-    # ── 1. DAU + DAU/MAU metrics ─────────────────────────────────────────────
-    _dau_delta = round(dau_7d - dau_prev_7d, 1)
-    _dau_mau_delta = round(dau_mau - dau_mau_prev, 3)
-    _mc1, _mc2, _ = st.columns([1, 1, 2])
-    _mc1.metric(
-        "DAU — avg last 7d",
-        f"{dau_7d:.1f}",
-        delta=f"{_dau_delta:+.1f} vs prev 7d",
-        help="Avg daily distinct users who completed ≥1 activity, over the last 7 days vs the prior 7 days.",
+    # ── 1. Engagement comparison table ───────────────────────────────────────
+    def _fmt_engagement_cell(row, prefix: str) -> str:
+        value = row.get(f"{prefix}_value")
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        value_type = row.get("value_type")
+        if value_type == "retention":
+            num = row.get(f"{prefix}_numerator")
+            den = row.get(f"{prefix}_denominator")
+            if num is not None and den is not None and not pd.isna(num) and not pd.isna(den):
+                return f"{float(value):.1f}% ({int(num)} / {int(den)})"
+            return f"{float(value):.1f}%"
+        if value_type == "pct":
+            return f"{float(value):.1f}%"
+        return f"{float(value):.1f}"
+
+    def _engagement_delta_html(curr, prev) -> str:
+        if curr is None or prev is None or pd.isna(curr) or pd.isna(prev):
+            return '<span style="color:#888;">—</span>'
+        diff = float(curr) - float(prev)
+        if abs(diff) < 1e-9:
+            return '<span style="color:#888;">0.0</span>'
+        # Higher is better for all rows in this table
+        color = "#00d4aa" if diff > 0 else "#ff6b6b"
+        arrow = "▲" if diff > 0 else "▼"
+        return f'<span style="color:{color};font-weight:600;">{arrow} {diff:+.1f}</span>'
+
+    try:
+        _eng_df = get_quick_insights_engagement_table(exclude_internal)
+    except Exception as _eng_err:
+        _eng_df = pd.DataFrame()
+        st.warning(f"Could not load engagement comparison: {_eng_err}")
+
+    st.markdown("#### Engagement — last 7d vs previous 7d")
+    st.caption(
+        "DAU/MAU use completed local days ending yesterday (America/Sao_Paulo). "
+        "Retention uses the first-activity definition among onboarded external users."
     )
-    _mc2.metric(
-        "DAU/MAU",
-        f"{dau_mau:.1%}",
-        delta=f"{_dau_mau_delta:+.1%} vs prev",
-        help="DAU (avg last 7d) ÷ rolling 30-day MAU ending yesterday. Prev compares avg DAU days 8–14 ÷ rolling 30-day MAU at the end of that prior 7-day period.",
-    )
+    if not _eng_df.empty:
+        _eng_rows_html = []
+        for _, _row in _eng_df.iterrows():
+            _curr = _fmt_engagement_cell(_row, "current")
+            _prev = _fmt_engagement_cell(_row, "previous")
+            _delta = _engagement_delta_html(_row.get("current_value"), _row.get("previous_value"))
+            _eng_rows_html.append(
+                "<tr>"
+                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;'>{_row['metric']}</td>"
+                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_curr}</td>"
+                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_prev}</td>"
+                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_delta}</td>"
+                "</tr>"
+            )
+        st.markdown(
+            "<table style='width:100%;border-collapse:collapse;margin:8px 0 4px 0;'>"
+            "<thead><tr>"
+            "<th style='text-align:left;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Metric</th>"
+            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Last 7D</th>"
+            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Previous 7D</th>"
+            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Δ</th>"
+            "</tr></thead>"
+            f"<tbody>{''.join(_eng_rows_html)}</tbody>"
+            "</table>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "* Retention definition: among users who completed a first activity with Letz and had enough "
+            "time to mature into the relevant window. 7D counts a second activity within 7 days of the first; "
+            "14D and 30D count any subsequent activity after day 14 or 30, respectively. External users only."
+        )
+    else:
+        st.info("No engagement comparison data available yet.")
 
     st.markdown("---")
 
@@ -3865,7 +4120,10 @@ if selected_section == "📊 Quick Insights":
         st.info("Need at least 14 days of activity data for DAU comparison.")
 
     st.markdown("#### DAU/MAU — rolling 30d trend")
-    st.caption("Daily DAU divided by that day's rolling 30-day MAU. The bold line is a 7-day moving average to reduce weekday noise.")
+    st.caption(
+        "Daily DAU ÷ that day's rolling 30-day MAU. The bold line is a 7-day moving average. "
+        "The engagement table above uses avg DAU ÷ avg rolling MAU over each 7-day window."
+    )
     if not _dau_ratio_daily.empty:
         try:
             import altair as alt
