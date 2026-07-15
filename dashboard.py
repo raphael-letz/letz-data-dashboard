@@ -4025,11 +4025,7 @@ if selected_section == "📊 Quick Insights":
         _eng_df = pd.DataFrame()
         st.warning(f"Could not load engagement comparison: {_eng_err}")
 
-    st.markdown("#### Engagement — last 7d vs previous 7d")
-    st.caption(
-        "DAU/MAU use completed local days ending yesterday (America/Sao_Paulo). "
-        "Retention uses the first-activity definition among onboarded external users."
-    )
+    st.markdown("#### KPI")
     if not _eng_df.empty:
         _eng_rows_html = []
         for _, _row in _eng_df.iterrows():
@@ -4038,19 +4034,19 @@ if selected_section == "📊 Quick Insights":
             _delta = _engagement_delta_html(_row.get("current_value"), _row.get("previous_value"))
             _eng_rows_html.append(
                 "<tr>"
-                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;'>{_row['metric']}</td>"
-                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_curr}</td>"
-                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_prev}</td>"
-                f"<td style='padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:right;'>{_delta}</td>"
+                f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;font-size:1.15rem;'>{_row['metric']}</td>"
+                f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_curr}</td>"
+                f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_prev}</td>"
+                f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_delta}</td>"
                 "</tr>"
             )
         st.markdown(
-            "<table style='width:100%;border-collapse:collapse;margin:8px 0 4px 0;'>"
+            "<table style='width:100%;border-collapse:collapse;margin:8px 0 4px 0;font-size:1.15rem;'>"
             "<thead><tr>"
-            "<th style='text-align:left;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Metric</th>"
-            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Last 7D</th>"
-            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Previous 7D</th>"
-            "<th style='text-align:right;padding:10px 12px;border-bottom:1px solid #444;color:#aaa;font-weight:500;'>Δ</th>"
+            "<th style='text-align:left;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Metric</th>"
+            "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Last 7D</th>"
+            "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Previous 7D</th>"
+            "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Δ</th>"
             "</tr></thead>"
             f"<tbody>{''.join(_eng_rows_html)}</tbody>"
             "</table>",
