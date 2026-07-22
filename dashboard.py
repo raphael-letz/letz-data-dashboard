@@ -4079,7 +4079,7 @@ if selected_section == "📊 Quick Insights":
 
     # ── 3. DAU daily comparison + DAU/MAU trend ──────────────────────────────
     st.markdown("#### 📈 DAU — last 7d vs previous 7d")
-    st.caption("Distinct external users completing ≥1 activity per local day. Lines align day 1–7 in each 7-day period.")
+    st.caption("Distinct external users completing ≥1 activity per local day. Aligned by weekday across the two 7-day periods.")
     if len(_dau_daily) >= 14:
         try:
             import altair as alt
@@ -4089,26 +4089,47 @@ if selected_section == "📊 Quick Insights":
             _dau_compare["period"] = ["Previous 7d"] * 7 + ["Last 7d"] * 7
             _dau_compare["day_in_period"] = (_dau_compare.index % 7) + 1
             _dau_compare["date_label"] = _dau_compare["activity_dt"].dt.strftime("%d %b")
-
-            _dau_chart = (
-                alt.Chart(_dau_compare)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("day_in_period:O", title="Day in 7-day period"),
-                    y=alt.Y("dau:Q", title="DAU", scale=alt.Scale(zero=True)),
-                    color=alt.Color(
-                        "period:N",
-                        title="Period",
-                        scale=alt.Scale(domain=["Last 7d", "Previous 7d"], range=["#00d4aa", "#7aa2ff"]),
-                    ),
-                    tooltip=[
-                        alt.Tooltip("period:N", title="Period"),
-                        alt.Tooltip("date_label:N", title="Date"),
-                        alt.Tooltip("dau:Q", title="DAU", format=".0f"),
-                    ],
-                )
-                .properties(height=280)
+            # Weekday label (Mon, Tue, ...). Both periods are exactly 7 days apart,
+            # so each day_in_period maps to the same weekday in both periods.
+            _dau_compare["weekday"] = _dau_compare["activity_dt"].dt.strftime("%a")
+            _weekday_order = (
+                _dau_compare.sort_values("day_in_period")
+                .drop_duplicates("day_in_period")["weekday"]
+                .tolist()
             )
+
+            # Dynamic y-axis: pad around the actual data range so day-to-day and
+            # period-to-period differences are visually perceptible (not zero-based).
+            _y_min = float(_dau_compare["dau"].min())
+            _y_max = float(_dau_compare["dau"].max())
+            _y_pad = max((_y_max - _y_min) * 0.15, 1.0)
+            _y_domain = [max(_y_min - _y_pad, 0), _y_max + _y_pad]
+
+            _color_scale = alt.Scale(
+                domain=["Last 7d", "Previous 7d"], range=["#00d4aa", "#7aa2ff"]
+            )
+            _base = alt.Chart(_dau_compare).encode(
+                x=alt.X("weekday:N", title="Weekday", sort=_weekday_order),
+                y=alt.Y(
+                    "dau:Q",
+                    title="DAU",
+                    scale=alt.Scale(domain=_y_domain, zero=False, nice=False),
+                ),
+                color=alt.Color("period:N", title="Period", scale=_color_scale),
+            )
+            _lines = _base.mark_line(point=True, strokeWidth=3)
+            # Absolute DAU value labels on each point.
+            _labels = _base.mark_text(
+                dy=-12, fontSize=12, fontWeight="bold"
+            ).encode(
+                text=alt.Text("dau:Q", format=".0f"),
+                tooltip=[
+                    alt.Tooltip("period:N", title="Period"),
+                    alt.Tooltip("date_label:N", title="Date"),
+                    alt.Tooltip("dau:Q", title="DAU", format=".0f"),
+                ],
+            )
+            _dau_chart = (_lines + _labels).properties(height=320)
             st.altair_chart(_dau_chart, use_container_width=True)
         except Exception as _dau_chart_err:
             st.warning(f"Could not render DAU chart: {_dau_chart_err}")
