@@ -1257,15 +1257,17 @@ def _load_llm_cost_forecast_cache() -> dict:
         return {}
 
 
-def _save_llm_cost_forecast_cache(months: dict, source: str) -> None:
+def _save_llm_cost_forecast_cache(budgets: dict, source: str) -> None:
     payload = {
         "spreadsheet_id": LLM_COST_FORECAST_SHEET_ID,
         "gid": LLM_COST_FORECAST_GID,
         "sheet_name": "Forecast",
-        "row_label": "LLM (Openrouter)",
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
-        "months": months,
+        # Back-compat: months = run-rate budget (LLM Openrouter row)
+        "months": budgets.get("run_rate") or {},
+        "cost_per_mau": budgets.get("cost_per_mau") or {},
+        "run_rate": budgets.get("run_rate") or {},
     }
     try:
         os.makedirs(os.path.dirname(LLM_COST_FORECAST_CACHE_PATH), exist_ok=True)
@@ -1276,8 +1278,34 @@ def _save_llm_cost_forecast_cache(months: dict, source: str) -> None:
         pass
 
 
-def _months_from_forecast_csv(csv_text: str) -> dict:
-    """Parse Forecast sheet CSV; row labeled LLM (Openrouter) → month amounts."""
+_FORECAST_MONTH_NAMES = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+}
+
+
+def _forecast_month_cols(header: list) -> dict:
+    return {
+        name: idx for idx, name in enumerate(header)
+        if name in _FORECAST_MONTH_NAMES
+    }
+
+
+def _months_from_labeled_row(row: list, month_cols: dict) -> dict:
+    months = {}
+    for month_name, idx in month_cols.items():
+        months[month_name] = _parse_forecast_usd(row[idx] if idx < len(row) else None)
+    return months
+
+
+def _budgets_from_forecast_csv(csv_text: str) -> dict:
+    """
+    Parse Forecast sheet CSV into budget series by month.
+
+    Returns dict with:
+      cost_per_mau — row labeled "LLM cost/MAU" (sheet row 5)
+      run_rate     — row labeled "LLM (Openrouter)" (sheet row 12)
+    """
     rows = list(csv.reader(io.StringIO(csv_text)))
     if not rows:
         return {}
@@ -1285,13 +1313,7 @@ def _months_from_forecast_csv(csv_text: str) -> dict:
     header_idx = None
     for i, row in enumerate(rows[:8]):
         cells = [c.strip() for c in row]
-        month_hits = sum(
-            1 for c in cells
-            if c in {
-                "January", "February", "March", "April", "May", "June",
-                "July", "August", "September", "October", "November", "December",
-            }
-        )
+        month_hits = sum(1 for c in cells if c in _FORECAST_MONTH_NAMES)
         if month_hits >= 3:
             header_idx = i
             break
@@ -1299,37 +1321,27 @@ def _months_from_forecast_csv(csv_text: str) -> dict:
         return {}
 
     header = [c.strip() for c in rows[header_idx]]
-    month_cols = {
-        name: idx for idx, name in enumerate(header)
-        if name in {
-            "January", "February", "March", "April", "May", "June",
-            "July", "August", "September", "October", "November", "December",
-        }
-    }
+    month_cols = _forecast_month_cols(header)
     if not month_cols:
         return {}
 
+    budgets = {"cost_per_mau": {}, "run_rate": {}}
     for row in rows[header_idx + 1:]:
         label_cells = [c.strip().lower() for c in row[:3]]
-        if not any("llm" in c and "openrouter" in c for c in label_cells):
-            # Also accept shorter "LLM (Openrouter)" variants / "LLM" cost row
-            if not any(c == "llm (openrouter)" or c.startswith("llm (open") for c in label_cells):
-                continue
-        months = {}
-        for month_name, idx in month_cols.items():
-            months[month_name] = _parse_forecast_usd(row[idx] if idx < len(row) else None)
-        return months
-    return {}
+        label = " ".join(c for c in label_cells if c)
+        if "llm cost/mau" in label or label.strip() == "llm cost/mau":
+            budgets["cost_per_mau"] = _months_from_labeled_row(row, month_cols)
+        elif "llm" in label and "openrouter" in label:
+            budgets["run_rate"] = _months_from_labeled_row(row, month_cols)
+    return budgets
 
 
 @st.cache_data(ttl=300)
-def get_llm_cost_forecast_months() -> tuple[dict, str]:
+def get_llm_cost_budget_series() -> tuple[dict, str]:
     """
-    Live-pull LLM (Openrouter) monthly forecast from the Cost Report Forecast tab.
+    Live-pull LLM budgets from the Cost Report Forecast tab.
 
-    Tries the Google Sheets CSV export (works when the sheet is link-readable),
-    then falls back to the local .context cache last synced from that sheet.
-    Returns (months_dict, source_label).
+    Returns ({"cost_per_mau": {month: val}, "run_rate": {month: val}}, source_label).
     """
     export_url = (
         f"https://docs.google.com/spreadsheets/d/{LLM_COST_FORECAST_SHEET_ID}"
@@ -1342,30 +1354,40 @@ def get_llm_cost_forecast_months() -> tuple[dict, str]:
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
             raw = resp.read()
-        # Reject HTML login/interstitial pages
         if raw[:1] == b"<" or b"<html" in raw[:200].lower():
             raise ValueError("Sheet export returned HTML (not publicly readable)")
         text = raw.decode("utf-8-sig", errors="replace")
-        months = _months_from_forecast_csv(text)
-        if months:
-            _save_llm_cost_forecast_cache(months, "Google Sheet CSV export (live)")
-            return months, "Google Sheet (live)"
+        budgets = _budgets_from_forecast_csv(text)
+        if budgets.get("cost_per_mau") or budgets.get("run_rate"):
+            _save_llm_cost_forecast_cache(budgets, "Google Sheet CSV export (live)")
+            return budgets, "Google Sheet (live)"
     except Exception:
         pass
 
     cache = _load_llm_cost_forecast_cache()
-    months = cache.get("months") or {}
+    budgets = {
+        "cost_per_mau": cache.get("cost_per_mau") or {},
+        "run_rate": cache.get("run_rate") or cache.get("months") or {},
+    }
     synced_at = cache.get("synced_at")
     source = "cached forecast"
     if synced_at:
         source = f"cached forecast (synced {str(synced_at)[:10]})"
-    return months, source
+    return budgets, source
+
+
+def get_llm_cost_budgets_for_month(month_name: str) -> tuple[float | None, float | None, str]:
+    """Return (cost_per_mau_budget, run_rate_budget, source_label) for a month."""
+    budgets, source = get_llm_cost_budget_series()
+    cost_per_mau = _parse_forecast_usd((budgets.get("cost_per_mau") or {}).get(month_name))
+    run_rate = _parse_forecast_usd((budgets.get("run_rate") or {}).get(month_name))
+    return cost_per_mau, run_rate, source
 
 
 def get_llm_cost_forecast_for_month(month_name: str) -> tuple[float | None, str]:
-    """Return (forecast_usd, source_label) for a calendar month name."""
-    months, source = get_llm_cost_forecast_months()
-    return _parse_forecast_usd(months.get(month_name)), source
+    """Return (run_rate budget usd, source_label) for a calendar month name."""
+    _cost_per_mau, run_rate, source = get_llm_cost_budgets_for_month(month_name)
+    return run_rate, source
 
 
 @st.cache_data(ttl=300)
@@ -5197,11 +5219,6 @@ if selected_section == "💰 Cost":
     # Cost analysis always excludes internal users so spend reflects real customers.
     exclude_internal = True
     st.markdown("---")
-    st.caption(
-        "Stack B LLM turn-level cost, sourced from `messages.type = 'turn_audit'`. "
-        "Per-user stats only count **real users** (Stack B users who have sent at "
-        "least one message). MAU matches Quick Insights (avg rolling 30-day activity MAU)."
-    )
 
     # ── 0. KPI table: cost/MAU, run rate, forecast ─────────────────────────
     _sp_today = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
@@ -5243,34 +5260,49 @@ if selected_section == "💰 Cost":
     )
 
     try:
-        forecast_usd, forecast_source = get_llm_cost_forecast_for_month(_month_name)
-    except Exception as e:
-        forecast_usd, forecast_source = None, f"unavailable ({e})"
+        budget_cost_per_mau, budget_run_rate, _budget_source = get_llm_cost_budgets_for_month(
+            _month_name
+        )
+    except Exception:
+        budget_cost_per_mau = budget_run_rate = None
 
     def _fmt_usd(value, precision=2):
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return "—"
         return f"${float(value):,.{precision}f}"
 
-    def _cost_delta_html(curr, prev, higher_is_bad=True, precision=2, neutral_pct=0.02):
-        """Colour indicator for cost metrics (up = worse by default)."""
+    def _budget_color(curr, budget, neutral_pct=0.02) -> str:
+        """Colour Last 7d vs budget: over = red, under = green, near = neutral."""
+        if curr is None or budget is None or pd.isna(curr) or pd.isna(budget):
+            return "#eaeaea"
+        curr_f, budget_f = float(curr), float(budget)
+        if abs(budget_f) < 1e-9:
+            return "#eaeaea"
+        rel = (curr_f - budget_f) / abs(budget_f)
+        if abs(rel) < neutral_pct:
+            return "#eaeaea"
+        return "#ff6b6b" if rel > 0 else "#00d4aa"
+
+    def _trend_arrow(curr, prev, neutral_pct=0.02) -> str:
+        """▲/▼ vs previous 7d (direction only; colour comes from budget)."""
         if curr is None or prev is None or pd.isna(curr) or pd.isna(prev):
-            return '<span style="color:#888;">—</span>'
+            return ""
         curr_f, prev_f = float(curr), float(prev)
-        if abs(prev_f) < 1e-9 and abs(curr_f) < 1e-9:
-            return '<span style="color:#888;">●</span>'
-        diff = curr_f - prev_f
-        rel = abs(diff) / abs(prev_f) if abs(prev_f) >= 1e-9 else (1.0 if abs(diff) > 0 else 0.0)
-        if rel < neutral_pct or abs(diff) < 1e-9:
-            return '<span style="color:#888;">●</span>'
-        if higher_is_bad:
-            color = "#ff6b6b" if diff > 0 else "#00d4aa"
-        else:
-            color = "#00d4aa" if diff > 0 else "#ff6b6b"
-        arrow = "▲" if diff > 0 else "▼"
+        if abs(prev_f) < 1e-9:
+            if abs(curr_f) < 1e-9:
+                return ""
+            return " ▲" if curr_f > 0 else " ▼"
+        rel = (curr_f - prev_f) / abs(prev_f)
+        if abs(rel) < neutral_pct:
+            return ""
+        return " ▲" if rel > 0 else " ▼"
+
+    def _last7d_html(curr, prev, budget, precision=2) -> str:
+        color = _budget_color(curr, budget)
+        arrow = _trend_arrow(curr, prev)
         return (
-            f'<span style="color:{color};font-weight:600;">'
-            f"{arrow} {_fmt_usd(abs(diff), precision)}</span>"
+            f"<span style='color:{color};font-weight:600;'>"
+            f"{_fmt_usd(curr, precision)}{arrow}</span>"
         )
 
     _kpi_rows = [
@@ -5278,22 +5310,14 @@ if selected_section == "💰 Cost":
             "metric": "LLM cost/MAU (last 7d)",
             "current": current_cost_per_mau,
             "previous": prior_cost_per_mau,
-            "delta_html": _cost_delta_html(current_cost_per_mau, prior_cost_per_mau),
+            "budget": budget_cost_per_mau,
             "precision": 2,
         },
         {
             "metric": f"LLM cost — run rate ({_month_name})",
             "current": current_run_rate,
             "previous": prior_run_rate,
-            "delta_html": _cost_delta_html(current_run_rate, prior_run_rate),
-            "precision": 0,
-        },
-        {
-            "metric": f"LLM cost forecast ({_month_name})",
-            "current": forecast_usd,
-            "previous": None,
-            # Indicator: current run rate vs forecast (over = red)
-            "delta_html": _cost_delta_html(current_run_rate, forecast_usd, neutral_pct=0.05),
+            "budget": budget_run_rate,
             "precision": 0,
         },
     ]
@@ -5305,9 +5329,10 @@ if selected_section == "💰 Cost":
         _kpi_rows_html.append(
             "<tr>"
             f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;font-size:1.15rem;'>{_row['metric']}</td>"
-            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_fmt_usd(_row['current'], _prec)}</td>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>"
+            f"{_last7d_html(_row['current'], _row['previous'], _row['budget'], _prec)}</td>"
             f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_fmt_usd(_row['previous'], _prec)}</td>"
-            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_row['delta_html']}</td>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_fmt_usd(_row['budget'], _prec)}</td>"
             "</tr>"
         )
     st.markdown(
@@ -5316,19 +5341,11 @@ if selected_section == "💰 Cost":
         "<th style='text-align:left;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Metric</th>"
         "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Last 7d</th>"
         "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Previous 7d</th>"
-        "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Δ</th>"
+        "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Budget</th>"
         "</tr></thead>"
         f"<tbody>{''.join(_kpi_rows_html)}</tbody>"
         "</table>",
         unsafe_allow_html=True,
-    )
-    st.caption(
-        f"Cost/MAU = (7d LLM cost ÷ 7 × {_days_in_month} days) ÷ avg rolling 30d MAU. "
-        f"Run rate = {_month_name} MTD ÷ elapsed days × {_days_in_month} "
-        f"(through yesterday, America/Sao_Paulo). "
-        f"Forecast from [Cost Report Forecast sheet](https://docs.google.com/spreadsheets/d/{LLM_COST_FORECAST_SHEET_ID}/edit?gid={LLM_COST_FORECAST_GID}#gid={LLM_COST_FORECAST_GID}) "
-        f"row 12 · {forecast_source}. "
-        "Δ for forecast compares current run rate vs forecast (▲ over / ▼ under)."
     )
 
     st.markdown("---")

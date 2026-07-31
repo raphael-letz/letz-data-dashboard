@@ -2,10 +2,25 @@
   "spreadsheet_id": "1ARpMh-V-U2BNPTwBQezCpEKrZaiTyk4_GOMV8JDvJn4",
   "gid": "1487726926",
   "sheet_name": "Forecast",
-  "row_label": "LLM (Openrouter)",
-  "synced_at": "2026-07-31T14:47:22.330026+00:00",
+  "synced_at": "2026-07-31T14:54:34.038079+00:00",
   "source": "Google Sheet CSV export (live)",
   "months": {
+    "July": 2067.0,
+    "August": 5457.0,
+    "September": 10004.0,
+    "October": 15407.0,
+    "November": 21789.0,
+    "December": 25000.0
+  },
+  "cost_per_mau": {
+    "July": 17.0,
+    "August": 18.0,
+    "September": 20.0,
+    "October": 22.0,
+    "November": 24.0,
+    "December": 25.0
+  },
+  "run_rate": {
     "July": 2067.0,
     "August": 5457.0,
     "September": 10004.0,
