@@ -11,6 +11,10 @@ import os
 import json
 import re
 import html
+import calendar
+import csv
+import io
+import urllib.request
 import pytz
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
@@ -1122,18 +1126,246 @@ llm_cost_base AS (
 
 @st.cache_data(ttl=300)
 def get_llm_cost_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
-    """Rolling current-7d vs prior-7d LLM cost totals and distinct real users with cost."""
+    """
+    LLM cost KPI inputs for the Cost tab.
+
+    Returns current/prior 7d totals, avg rolling-30d MAU over those windows
+    (same definition as Quick Insights), and month-to-date cost through yesterday
+    (America/Sao_Paulo) for the current-month run rate.
+    """
     base_cte = get_llm_cost_base_cte(exclude_internal)
+    internal_waids = load_internal_users() if exclude_internal else []
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
     query = f"""
-{base_cte}
+{base_cte},
+internal_waids AS (
+    SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+params AS (
+    SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date AS as_of_local_date
+),
+report_days AS (
+    SELECT 'Last 7D' AS period,
+           generate_series(p.as_of_local_date - 7, p.as_of_local_date - 1, INTERVAL '1 day')::date AS local_date
+    FROM params p
+    UNION ALL
+    SELECT 'Previous 7D',
+           generate_series(p.as_of_local_date - 14, p.as_of_local_date - 8, INTERVAL '1 day')::date
+    FROM params p
+),
+onboarded AS (
+    SELECT u.id, MIN(acf.updated_at) AS onboarded_at
+    FROM users u
+    JOIN ai_companion_flows acf
+      ON acf.user_id = u.id
+     AND acf.type = 'onboarding'
+     AND acf.is_complete = 'true'
+    WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+    GROUP BY u.id
+),
+activities AS (
+    SELECT uah.user_id,
+           (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+    FROM user_activities_history uah
+    JOIN onboarded o ON o.id = uah.user_id
+    WHERE uah.completed_at >= o.onboarded_at
+),
+daily_mau AS (
+    SELECT d.period, d.local_date, COUNT(DISTINCT a.user_id) AS mau
+    FROM report_days d
+    LEFT JOIN activities a
+      ON a.local_date BETWEEN d.local_date - 29 AND d.local_date
+    GROUP BY d.period, d.local_date
+),
+mau_summary AS (
+    SELECT
+        ROUND(AVG(mau) FILTER (WHERE period = 'Last 7D'), 1) AS current_7d_mau,
+        ROUND(AVG(mau) FILTER (WHERE period = 'Previous 7D'), 1) AS prior_7d_mau
+    FROM daily_mau
+),
+cost_summary AS (
+    SELECT
+        COALESCE(SUM(usd_cost) FILTER (
+            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  BETWEEN (SELECT as_of_local_date - 7 FROM params)
+                      AND (SELECT as_of_local_date - 1 FROM params)
+        ), 0) AS current_7d_total,
+        COALESCE(SUM(usd_cost) FILTER (
+            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  BETWEEN (SELECT as_of_local_date - 14 FROM params)
+                      AND (SELECT as_of_local_date - 8 FROM params)
+        ), 0) AS prior_7d_total,
+        COALESCE(SUM(usd_cost) FILTER (
+            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  >= date_trunc('month', (SELECT as_of_local_date FROM params))::date
+              AND (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  < (SELECT as_of_local_date FROM params)
+        ), 0) AS mtd_total,
+        COALESCE(SUM(usd_cost) FILTER (
+            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  >= date_trunc('month', (SELECT as_of_local_date FROM params) - INTERVAL '7 days')::date
+              AND (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
+                  < (SELECT as_of_local_date - 7 FROM params)
+        ), 0) AS mtd_total_prev_7d,
+        (SELECT as_of_local_date FROM params) AS as_of_local_date
+    FROM llm_cost_base
+)
 SELECT
-    COALESCE(SUM(usd_cost) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '7 days'), 0) AS current_7d_total,
-    COALESCE(SUM(usd_cost) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '14 days' AND date_time_utc < NOW() - INTERVAL '7 days'), 0) AS prior_7d_total,
-    COUNT(DISTINCT user_id) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '7 days') AS current_7d_users,
-    COUNT(DISTINCT user_id) FILTER (WHERE date_time_utc >= NOW() - INTERVAL '14 days' AND date_time_utc < NOW() - INTERVAL '7 days') AS prior_7d_users
-FROM llm_cost_base
+    c.current_7d_total,
+    c.prior_7d_total,
+    c.mtd_total,
+    c.mtd_total_prev_7d,
+    c.as_of_local_date,
+    m.current_7d_mau,
+    m.prior_7d_mau
+FROM cost_summary c
+CROSS JOIN mau_summary m
 """
     return run_query(query)
+
+
+LLM_COST_FORECAST_SHEET_ID = "1ARpMh-V-U2BNPTwBQezCpEKrZaiTyk4_GOMV8JDvJn4"
+LLM_COST_FORECAST_GID = "1487726926"
+LLM_COST_FORECAST_CACHE_PATH = os.path.join(
+    os.path.dirname(__file__), ".context", "llm-cost-forecast.json"
+)
+
+
+def _parse_forecast_usd(value) -> float | None:
+    """Parse a sheet cell like '2,067' / '$2,067' into a float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "-", "—"}:
+        return None
+    cleaned = re.sub(r"[^\d.\-]", "", text.replace(",", ""))
+    if cleaned in {"", "-", "."}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _load_llm_cost_forecast_cache() -> dict:
+    try:
+        with open(LLM_COST_FORECAST_CACHE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_llm_cost_forecast_cache(months: dict, source: str) -> None:
+    payload = {
+        "spreadsheet_id": LLM_COST_FORECAST_SHEET_ID,
+        "gid": LLM_COST_FORECAST_GID,
+        "sheet_name": "Forecast",
+        "row_label": "LLM (Openrouter)",
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "months": months,
+    }
+    try:
+        os.makedirs(os.path.dirname(LLM_COST_FORECAST_CACHE_PATH), exist_ok=True)
+        with open(LLM_COST_FORECAST_CACHE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _months_from_forecast_csv(csv_text: str) -> dict:
+    """Parse Forecast sheet CSV; row labeled LLM (Openrouter) → month amounts."""
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    if not rows:
+        return {}
+
+    header_idx = None
+    for i, row in enumerate(rows[:8]):
+        cells = [c.strip() for c in row]
+        month_hits = sum(
+            1 for c in cells
+            if c in {
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December",
+            }
+        )
+        if month_hits >= 3:
+            header_idx = i
+            break
+    if header_idx is None:
+        return {}
+
+    header = [c.strip() for c in rows[header_idx]]
+    month_cols = {
+        name: idx for idx, name in enumerate(header)
+        if name in {
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        }
+    }
+    if not month_cols:
+        return {}
+
+    for row in rows[header_idx + 1:]:
+        label_cells = [c.strip().lower() for c in row[:3]]
+        if not any("llm" in c and "openrouter" in c for c in label_cells):
+            # Also accept shorter "LLM (Openrouter)" variants / "LLM" cost row
+            if not any(c == "llm (openrouter)" or c.startswith("llm (open") for c in label_cells):
+                continue
+        months = {}
+        for month_name, idx in month_cols.items():
+            months[month_name] = _parse_forecast_usd(row[idx] if idx < len(row) else None)
+        return months
+    return {}
+
+
+@st.cache_data(ttl=300)
+def get_llm_cost_forecast_months() -> tuple[dict, str]:
+    """
+    Live-pull LLM (Openrouter) monthly forecast from the Cost Report Forecast tab.
+
+    Tries the Google Sheets CSV export (works when the sheet is link-readable),
+    then falls back to the local .context cache last synced from that sheet.
+    Returns (months_dict, source_label).
+    """
+    export_url = (
+        f"https://docs.google.com/spreadsheets/d/{LLM_COST_FORECAST_SHEET_ID}"
+        f"/export?format=csv&gid={LLM_COST_FORECAST_GID}"
+    )
+    try:
+        req = urllib.request.Request(
+            export_url,
+            headers={"User-Agent": "LETZ-Dashboard/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read()
+        # Reject HTML login/interstitial pages
+        if raw[:1] == b"<" or b"<html" in raw[:200].lower():
+            raise ValueError("Sheet export returned HTML (not publicly readable)")
+        text = raw.decode("utf-8-sig", errors="replace")
+        months = _months_from_forecast_csv(text)
+        if months:
+            _save_llm_cost_forecast_cache(months, "Google Sheet CSV export (live)")
+            return months, "Google Sheet (live)"
+    except Exception:
+        pass
+
+    cache = _load_llm_cost_forecast_cache()
+    months = cache.get("months") or {}
+    synced_at = cache.get("synced_at")
+    source = "cached forecast"
+    if synced_at:
+        source = f"cached forecast (synced {str(synced_at)[:10]})"
+    return months, source
+
+
+def get_llm_cost_forecast_for_month(month_name: str) -> tuple[float | None, str]:
+    """Return (forecast_usd, source_label) for a calendar month name."""
+    months, source = get_llm_cost_forecast_months()
+    return _parse_forecast_usd(months.get(month_name)), source
 
 
 @st.cache_data(ttl=300)
@@ -4967,57 +5199,142 @@ if selected_section == "💰 Cost":
     st.markdown("---")
     st.caption(
         "Stack B LLM turn-level cost, sourced from `messages.type = 'turn_audit'`. "
-        "Per-user stats (avg / median / p25 / p75) only count **real users** — "
-        "Stack B users who have sent at least one message themselves — so users "
-        "who never messaged don't distort the denominator."
+        "Per-user stats only count **real users** (Stack B users who have sent at "
+        "least one message). MAU matches Quick Insights (avg rolling 30-day activity MAU)."
     )
 
-    # ── 0. Headline: current 7d vs prior 7d ──────────────────────────────
+    # ── 0. KPI table: cost/MAU, run rate, forecast ─────────────────────────
+    _sp_today = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
+    _month_name = _sp_today.strftime("%B")
+    _days_in_month = calendar.monthrange(_sp_today.year, _sp_today.month)[1]
+    _mtd_days = max((_sp_today - _sp_today.replace(day=1)).days, 1)  # through yesterday
+    _prev_as_of = _sp_today - timedelta(days=7)
+    _prev_mtd_days = max((_prev_as_of - _prev_as_of.replace(day=1)).days, 1)
+    _prev_days_in_month = calendar.monthrange(_prev_as_of.year, _prev_as_of.month)[1]
+
     try:
         cost_headline_df = get_llm_cost_headline_metrics(exclude_internal)
         cost_headline = cost_headline_df.iloc[0] if not cost_headline_df.empty else {}
         current_7d_total = float(cost_headline.get("current_7d_total", 0) or 0)
         prior_7d_total = float(cost_headline.get("prior_7d_total", 0) or 0)
-        current_7d_users = int(cost_headline.get("current_7d_users", 0) or 0)
-        prior_7d_users = int(cost_headline.get("prior_7d_users", 0) or 0)
+        mtd_total = float(cost_headline.get("mtd_total", 0) or 0)
+        mtd_total_prev_7d = float(cost_headline.get("mtd_total_prev_7d", 0) or 0)
+        current_7d_mau = float(cost_headline.get("current_7d_mau", 0) or 0)
+        prior_7d_mau = float(cost_headline.get("prior_7d_mau", 0) or 0)
     except Exception as e:
         st.warning(f"Could not load headline cost metrics: {e}")
-        current_7d_total = prior_7d_total = 0.0
-        current_7d_users = prior_7d_users = 0
+        current_7d_total = prior_7d_total = mtd_total = mtd_total_prev_7d = 0.0
+        current_7d_mau = prior_7d_mau = 0.0
 
-    current_7d_avg = (current_7d_total / current_7d_users) if current_7d_users else 0.0
-    prior_7d_avg = (prior_7d_total / prior_7d_users) if prior_7d_users else 0.0
-    total_delta_pct = (
-        round(100 * (current_7d_total - prior_7d_total) / prior_7d_total, 1)
-        if prior_7d_total else None
+    # Monthly-equivalent cost/MAU from each 7d window: (7d cost / 7 * days_in_month) / MAU
+    current_cost_per_mau = (
+        (current_7d_total / 7.0 * _days_in_month) / current_7d_mau
+        if current_7d_mau else None
     )
-    avg_delta_pct = (
-        round(100 * (current_7d_avg - prior_7d_avg) / prior_7d_avg, 1)
-        if prior_7d_avg else None
+    prior_cost_per_mau = (
+        (prior_7d_total / 7.0 * _days_in_month) / prior_7d_mau
+        if prior_7d_mau else None
     )
 
-    cost_col1, cost_col2, cost_col3 = st.columns(3)
-    cost_col1.metric("Total LLM cost (last 7d)", f"${current_7d_total:,.2f}")
-    if total_delta_pct is None:
-        cost_col1.caption(f"Prior 7d: ${prior_7d_total:,.2f} (no comparable data)")
-    else:
-        arrow = "🔺" if total_delta_pct >= 0 else "🔻"
-        cost_col1.caption(f"{arrow} {abs(total_delta_pct)}% vs prior 7d (${prior_7d_total:,.2f})")
+    # Month run rate = MTD ÷ elapsed days × days in month (through yesterday)
+    current_run_rate = (mtd_total / _mtd_days) * _days_in_month if _mtd_days else None
+    prior_run_rate = (
+        (mtd_total_prev_7d / _prev_mtd_days) * _prev_days_in_month if _prev_mtd_days else None
+    )
 
-    cost_col2.metric("Avg cost / real user (last 7d)", f"${current_7d_avg:,.3f}")
-    if avg_delta_pct is None:
-        cost_col2.caption(f"Prior 7d: ${prior_7d_avg:,.3f} (no comparable data)")
-    else:
-        arrow = "🔺" if avg_delta_pct >= 0 else "🔻"
-        cost_col2.caption(f"{arrow} {abs(avg_delta_pct)}% vs prior 7d (${prior_7d_avg:,.3f})")
+    try:
+        forecast_usd, forecast_source = get_llm_cost_forecast_for_month(_month_name)
+    except Exception as e:
+        forecast_usd, forecast_source = None, f"unavailable ({e})"
 
-    cost_col3.metric("Real users with cost (last 7d)", current_7d_users)
-    cost_col3.caption(f"vs {prior_7d_users} in the prior 7d")
+    def _fmt_usd(value, precision=2):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"${float(value):,.{precision}f}"
+
+    def _cost_delta_html(curr, prev, higher_is_bad=True, precision=2, neutral_pct=0.02):
+        """Colour indicator for cost metrics (up = worse by default)."""
+        if curr is None or prev is None or pd.isna(curr) or pd.isna(prev):
+            return '<span style="color:#888;">—</span>'
+        curr_f, prev_f = float(curr), float(prev)
+        if abs(prev_f) < 1e-9 and abs(curr_f) < 1e-9:
+            return '<span style="color:#888;">●</span>'
+        diff = curr_f - prev_f
+        rel = abs(diff) / abs(prev_f) if abs(prev_f) >= 1e-9 else (1.0 if abs(diff) > 0 else 0.0)
+        if rel < neutral_pct or abs(diff) < 1e-9:
+            return '<span style="color:#888;">●</span>'
+        if higher_is_bad:
+            color = "#ff6b6b" if diff > 0 else "#00d4aa"
+        else:
+            color = "#00d4aa" if diff > 0 else "#ff6b6b"
+        arrow = "▲" if diff > 0 else "▼"
+        return (
+            f'<span style="color:{color};font-weight:600;">'
+            f"{arrow} {_fmt_usd(abs(diff), precision)}</span>"
+        )
+
+    _kpi_rows = [
+        {
+            "metric": "LLM cost/MAU (last 7d)",
+            "current": current_cost_per_mau,
+            "previous": prior_cost_per_mau,
+            "delta_html": _cost_delta_html(current_cost_per_mau, prior_cost_per_mau),
+            "precision": 2,
+        },
+        {
+            "metric": f"LLM cost — run rate ({_month_name})",
+            "current": current_run_rate,
+            "previous": prior_run_rate,
+            "delta_html": _cost_delta_html(current_run_rate, prior_run_rate),
+            "precision": 0,
+        },
+        {
+            "metric": f"LLM cost forecast ({_month_name})",
+            "current": forecast_usd,
+            "previous": None,
+            # Indicator: current run rate vs forecast (over = red)
+            "delta_html": _cost_delta_html(current_run_rate, forecast_usd, neutral_pct=0.05),
+            "precision": 0,
+        },
+    ]
+
+    st.markdown("#### KPI")
+    _kpi_rows_html = []
+    for _row in _kpi_rows:
+        _prec = _row["precision"]
+        _kpi_rows_html.append(
+            "<tr>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;font-size:1.15rem;'>{_row['metric']}</td>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_fmt_usd(_row['current'], _prec)}</td>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_fmt_usd(_row['previous'], _prec)}</td>"
+            f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;text-align:right;font-size:1.15rem;'>{_row['delta_html']}</td>"
+            "</tr>"
+        )
+    st.markdown(
+        "<table style='width:100%;border-collapse:collapse;margin:8px 0 4px 0;font-size:1.15rem;'>"
+        "<thead><tr>"
+        "<th style='text-align:left;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Metric</th>"
+        "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Last 7d</th>"
+        "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Previous 7d</th>"
+        "<th style='text-align:right;padding:12px 14px;border-bottom:1px solid #444;color:#aaa;font-weight:500;font-size:1.05rem;'>Δ</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(_kpi_rows_html)}</tbody>"
+        "</table>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Cost/MAU = (7d LLM cost ÷ 7 × {_days_in_month} days) ÷ avg rolling 30d MAU. "
+        f"Run rate = {_month_name} MTD ÷ elapsed days × {_days_in_month} "
+        f"(through yesterday, America/Sao_Paulo). "
+        f"Forecast from [Cost Report Forecast sheet](https://docs.google.com/spreadsheets/d/{LLM_COST_FORECAST_SHEET_ID}/edit?gid={LLM_COST_FORECAST_GID}#gid={LLM_COST_FORECAST_GID}) "
+        f"row 12 · {forecast_source}. "
+        "Δ for forecast compares current run rate vs forecast (▲ over / ▼ under)."
+    )
 
     st.markdown("---")
 
     # ── 1. Weekly per-user cost trend (median / avg / p25 / p75) ───────────
-    st.markdown("#### 📦 Weekly LLM cost per real user — trend")
+    st.markdown("#### Weekly LLM cost per real user — trend")
     st.caption(
         "One box per completed local calendar week (Mon–Sun). Box spans p25–p75, "
         "white tick = median, orange line = average."
@@ -5069,33 +5386,16 @@ if selected_section == "💰 Cost":
                 (_box_layer + _median_layer + _avg_layer).properties(height=320),
                 use_container_width=True,
             )
-            st.caption("🟩 Box = p25–p75 · ⬜ White tick = median · 🟧 Orange line = average")
+            st.caption("Box = p25–p75 · White tick = median · Orange line = average")
         except Exception as _chart_err:
             st.warning(f"Could not render weekly cost chart: {_chart_err}")
-
-        with st.expander("View weekly cost data"):
-            st.dataframe(
-                weekly_cost_df[
-                    ["week_label", "users", "avg_usd", "median_usd", "p25_usd", "p75_usd", "total_usd"]
-                ].rename(columns={
-                    "week_label": "Week",
-                    "users": "Real users",
-                    "avg_usd": "Avg $",
-                    "median_usd": "Median $",
-                    "p25_usd": "p25 $",
-                    "p75_usd": "p75 $",
-                    "total_usd": "Total $",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
     else:
         st.info("Not enough data yet for a weekly trend (need at least one fully completed week).")
 
     st.markdown("---")
 
     # ── 2. Cost per user life day ──────────────────────────────
-    st.markdown("#### 📅 LLM cost per real user by day of user life")
+    st.markdown("#### LLM cost per real user by day of user life")
     st.caption(
         "Day 1 = signup day (local time). Life days with fewer than 5 active real "
         "users are hidden from the chart to avoid noisy long-tail days."
@@ -5150,26 +5450,11 @@ if selected_section == "💰 Cost":
                     (_band_layer + _median_line + _avg_line).properties(height=320),
                     use_container_width=True,
                 )
-                st.caption("🟩 Shaded band = p25–p75 · ⬜ White line = median · 🟧 Dashed orange line = average")
+                st.caption("Shaded band = p25–p75 · White line = median · Dashed orange line = average")
             except Exception as _chart_err:
                 st.warning(f"Could not render life-day cost chart: {_chart_err}")
         else:
             st.info("Not enough real users per life day yet (need ≥5 active real users on a given day).")
-
-        with st.expander("View cost-by-life-day data"):
-            st.dataframe(
-                life_day_cost_df.rename(columns={
-                    "user_life_day": "Life day",
-                    "users_active": "Real users",
-                    "avg_usd": "Avg $",
-                    "median_usd": "Median $",
-                    "p25_usd": "p25 $",
-                    "p75_usd": "p75 $",
-                    "total_usd": "Total $",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
     else:
         st.info("No life-day cost data found.")
 
