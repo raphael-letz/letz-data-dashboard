@@ -877,14 +877,18 @@ def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.Dat
     """
     Investor-facing engagement comparison for Quick Insights.
 
-    Rows: DAU, avg rolling 30-day MAU, DAU/MAU, 7D/14D/30D retention.
+    Rows: DEU, DAU, avg rolling 30-day MAU, DAU/MAU, 7D/14D/30D/60D/90D retention.
     Columns: last 7 completed local days vs previous 7 completed local days
-    (America/Sao_Paulo; today excluded for DAU/MAU).
+    (America/Sao_Paulo; today excluded for DEU/DAU/MAU).
+
+    DEU = avg daily engaged users: onboarded external users with ≥1 inbound
+    coach message that day (messages.sender = 'user', excluding internal
+    trace types think/tool_use/tool_result/turn_audit/weekly_digest).
 
     Retention (first-activity definition): among onboarded external users who
     completed a first activity and have matured into the window.
     - 7D: second activity within 7 days of first
-    - 14D / 30D: any subsequent activity after day 14 / 30 from first
+    - 14D / 30D / 60D / 90D: any subsequent activity after day 14 / 30 / 60 / 90 from first
     """
     internal_waids = load_internal_users() if exclude_internal else []
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
@@ -912,14 +916,14 @@ retention_snapshots AS (
   SELECT 'Previous 7D', as_of_ts - INTERVAL '7 days' FROM params
 ),
 onboarded AS (
-  SELECT u.id, MIN(acf.updated_at) AS onboarded_at
+  SELECT u.id, u.waid, MIN(acf.updated_at) AS onboarded_at
   FROM users u
   JOIN ai_companion_flows acf
     ON acf.user_id = u.id
    AND acf.type = 'onboarding'
    AND acf.is_complete = 'true'
   WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
-  GROUP BY u.id
+  GROUP BY u.id, u.waid
 ),
 activities AS (
   SELECT uah.user_id, uah.completed_at,
@@ -927,6 +931,25 @@ activities AS (
   FROM user_activities_history uah
   JOIN onboarded o ON o.id = uah.user_id
   WHERE uah.completed_at >= o.onboarded_at
+),
+user_messages AS (
+  SELECT
+    o.id AS user_id,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM messages m
+  JOIN onboarded o
+    ON (m.user_id = o.id OR (m.user_id IS NULL AND m.waid = o.waid))
+  WHERE m.sender = 'user'
+    AND COALESCE(m.type, '') NOT IN (
+      'think', 'tool_use', 'tool_result', 'turn_audit', 'weekly_digest'
+    )
+    AND m.sent_at >= o.onboarded_at
+),
+daily_deu AS (
+  SELECT d.period, d.local_date, COUNT(DISTINCT um.user_id) AS deu
+  FROM report_days d
+  LEFT JOIN user_messages um ON um.local_date = d.local_date
+  GROUP BY d.period, d.local_date
 ),
 daily_dau AS (
   SELECT d.period, d.local_date, COUNT(DISTINCT a.user_id) AS dau
@@ -944,10 +967,14 @@ daily_mau AS (
 activity_summary AS (
   SELECT
     dd.period,
+    ROUND(AVG(de.deu), 1) AS avg_deu,
     ROUND(AVG(dd.dau), 1) AS avg_dau,
     ROUND(AVG(dm.mau), 1) AS avg_mau,
     ROUND(100.0 * AVG(dd.dau) / NULLIF(AVG(dm.mau), 0), 1) AS dau_mau_pct
   FROM daily_dau dd
+  JOIN daily_deu de
+    ON de.period = dd.period
+   AND de.local_date = dd.local_date
   JOIN daily_mau dm
     ON dm.period = dd.period
    AND dm.local_date = dd.local_date
@@ -970,7 +997,9 @@ repeat_retention AS (
     f.first_completed_at,
     MAX((a.completed_at <= f.first_completed_at + INTERVAL '7 days')::int) = 1 AS repeat_within_7d,
     MAX((a.completed_at > f.first_completed_at + INTERVAL '14 days')::int) = 1 AS repeat_after_14d,
-    MAX((a.completed_at > f.first_completed_at + INTERVAL '30 days')::int) = 1 AS repeat_after_30d
+    MAX((a.completed_at > f.first_completed_at + INTERVAL '30 days')::int) = 1 AS repeat_after_30d,
+    MAX((a.completed_at > f.first_completed_at + INTERVAL '60 days')::int) = 1 AS repeat_after_60d,
+    MAX((a.completed_at > f.first_completed_at + INTERVAL '90 days')::int) = 1 AS repeat_after_90d
   FROM first_activity f
   LEFT JOIN activities a
     ON a.user_id = f.id
@@ -1020,14 +1049,42 @@ retention_summary AS (
   FROM repeat_retention
   WHERE first_completed_at <= snapshot_ts - INTERVAL '30 days'
   GROUP BY period
+  UNION ALL
+  SELECT
+    period,
+    4,
+    '60D retention',
+    COUNT(*) FILTER (WHERE repeat_after_60d),
+    COUNT(*),
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_after_60d) / NULLIF(COUNT(*), 0),
+      1
+    )
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '60 days'
+  GROUP BY period
+  UNION ALL
+  SELECT
+    period,
+    5,
+    '90D retention',
+    COUNT(*) FILTER (WHERE repeat_after_90d),
+    COUNT(*),
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_after_90d) / NULLIF(COUNT(*), 0),
+      1
+    )
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '90 days'
+  GROUP BY period
 ),
 metric_rows AS (
   SELECT
     1 AS sort_order,
-    'DAU (avg. daily active users)' AS metric,
+    'DEU (avg. daily engaged users)' AS metric,
     'count' AS value_type,
-    MAX(avg_dau) FILTER (WHERE period = 'Last 7D') AS current_value,
-    MAX(avg_dau) FILTER (WHERE period = 'Previous 7D') AS previous_value,
+    MAX(avg_deu) FILTER (WHERE period = 'Last 7D') AS current_value,
+    MAX(avg_deu) FILTER (WHERE period = 'Previous 7D') AS previous_value,
     NULL::numeric AS current_numerator,
     NULL::numeric AS current_denominator,
     NULL::numeric AS previous_numerator,
@@ -1036,6 +1093,15 @@ metric_rows AS (
   UNION ALL
   SELECT
     2,
+    'DAU (avg. daily active users)',
+    'count',
+    MAX(avg_dau) FILTER (WHERE period = 'Last 7D'),
+    MAX(avg_dau) FILTER (WHERE period = 'Previous 7D'),
+    NULL, NULL, NULL, NULL
+  FROM activity_summary
+  UNION ALL
+  SELECT
+    3,
     'MAU (avg. rolling 30-day MAU)',
     'count',
     MAX(avg_mau) FILTER (WHERE period = 'Last 7D'),
@@ -1044,7 +1110,7 @@ metric_rows AS (
   FROM activity_summary
   UNION ALL
   SELECT
-    3,
+    4,
     'DAU / MAU',
     'pct',
     MAX(dau_mau_pct) FILTER (WHERE period = 'Last 7D'),
@@ -1053,7 +1119,7 @@ metric_rows AS (
   FROM activity_summary
   UNION ALL
   SELECT
-    3 + sort_order,
+    4 + sort_order,
     metric,
     'retention',
     MAX(rate) FILTER (WHERE period = 'Current'),
@@ -4307,9 +4373,10 @@ if selected_section == "📊 Quick Insights":
             unsafe_allow_html=True,
         )
         st.caption(
-            "* Retention definition: among users who completed a first activity with Letz and had enough "
-            "time to mature into the relevant window. 7D counts a second activity within 7 days of the first; "
-            "14D and 30D count any subsequent activity after day 14 or 30, respectively. External users only."
+            "* DEU = users who sent ≥1 message to the coach that day. "
+            "Retention: among users who completed a first activity and had enough time to mature into the "
+            "window. 7D counts a second activity within 7 days of the first; "
+            "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
         )
     else:
         st.info("No engagement comparison data available yet.")
