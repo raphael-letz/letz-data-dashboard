@@ -877,13 +877,19 @@ def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.Dat
     """
     Investor-facing engagement comparison for Quick Insights.
 
-    Rows: DEU, DAU, avg rolling 30-day MAU, DAU/MAU, 7D/14D/30D/60D/90D retention.
+    Rows: DEU, DAU, avg rolling 30-day MAU, DAU/MAU, LLM cost/MAU,
+    7D/14D/30D/60D/90D retention.
     Columns: last 7 completed local days vs previous 7 completed local days
-    (America/Sao_Paulo; today excluded for DEU/DAU/MAU).
+    (America/Sao_Paulo; today excluded for DEU/DAU/MAU/cost).
 
     DEU = avg daily engaged users: onboarded external users with ≥1 inbound
     coach message that day (messages.sender = 'user', excluding internal
     trace types think/tool_use/tool_result/turn_audit/weekly_digest).
+
+    LLM cost/MAU uses the same avg rolling 30-day MAU as the MAU row.
+    Numerator is messages.type = 'turn_audit' USD for those onboarded users
+    in each 7-day window, annualized to a monthly equivalent:
+    (7d cost / 7 * days in current month) / MAU.
 
     Retention (first-activity definition): among onboarded external users who
     completed a first activity and have matured into the window.
@@ -979,6 +985,45 @@ activity_summary AS (
     ON dm.period = dd.period
    AND dm.local_date = dd.local_date
   GROUP BY dd.period
+),
+llm_costs AS (
+  SELECT
+    o.id AS user_id,
+    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date,
+    (m.message::jsonb ->> 'usd')::numeric AS usd_cost
+  FROM messages m
+  JOIN onboarded o
+    ON (m.user_id = o.id OR (m.user_id IS NULL AND m.waid = o.waid))
+  WHERE m.type = 'turn_audit'
+    AND m.message IS NOT NULL
+    AND m.message LIKE '{{%'
+    AND m.sent_at >= o.onboarded_at
+),
+cost_summary AS (
+  SELECT
+    d.period,
+    COALESCE(SUM(lc.usd_cost), 0) AS period_cost
+  FROM report_days d
+  LEFT JOIN llm_costs lc ON lc.local_date = d.local_date
+  GROUP BY d.period
+),
+cost_per_mau AS (
+  SELECT
+    a.period,
+    CASE
+      WHEN a.avg_mau IS NULL OR a.avg_mau = 0 THEN NULL
+      ELSE ROUND(
+        (c.period_cost / 7.0
+         * EXTRACT(DAY FROM (
+             date_trunc('month', (SELECT as_of_local_date FROM params))
+             + INTERVAL '1 month' - INTERVAL '1 day'
+           ))::numeric
+        ) / a.avg_mau,
+        2
+      )
+    END AS cost_per_mau
+  FROM activity_summary a
+  JOIN cost_summary c ON c.period = a.period
 ),
 first_activity AS (
   SELECT s.period, s.snapshot_ts, o.id, MIN(a.completed_at) AS first_completed_at
@@ -1119,7 +1164,16 @@ metric_rows AS (
   FROM activity_summary
   UNION ALL
   SELECT
-    4 + sort_order,
+    5,
+    'LLM cost/MAU',
+    'usd',
+    MAX(cost_per_mau) FILTER (WHERE period = 'Last 7D'),
+    MAX(cost_per_mau) FILTER (WHERE period = 'Previous 7D'),
+    NULL, NULL, NULL, NULL
+  FROM cost_per_mau
+  UNION ALL
+  SELECT
+    5 + sort_order,
     metric,
     'retention',
     MAX(rate) FILTER (WHERE period = 'Current'),
@@ -4326,17 +4380,23 @@ if selected_section == "📊 Quick Insights":
             return f"{float(value):.1f}%"
         if value_type == "pct":
             return f"{float(value):.1f}%"
+        if value_type == "usd":
+            return f"${float(value):,.2f}"
         return f"{float(value):.1f}"
 
-    def _engagement_delta_html(curr, prev) -> str:
+    def _engagement_delta_html(curr, prev, value_type: str = "count") -> str:
         if curr is None or prev is None or pd.isna(curr) or pd.isna(prev):
             return '<span style="color:#888;">—</span>'
         diff = float(curr) - float(prev)
         if abs(diff) < 1e-9:
-            return '<span style="color:#888;">0.0</span>'
-        # Higher is better for all rows in this table
-        color = "#00d4aa" if diff > 0 else "#ff6b6b"
+            zero_label = "$0.00" if value_type == "usd" else "0.0"
+            return f'<span style="color:#888;">{zero_label}</span>'
+        # Higher is better except LLM cost/MAU
+        improvement = diff < 0 if value_type == "usd" else diff > 0
+        color = "#00d4aa" if improvement else "#ff6b6b"
         arrow = "▲" if diff > 0 else "▼"
+        if value_type == "usd":
+            return f'<span style="color:{color};font-weight:600;">{arrow} {diff:+.2f}</span>'
         return f'<span style="color:{color};font-weight:600;">{arrow} {diff:+.1f}</span>'
 
     try:
@@ -4351,7 +4411,11 @@ if selected_section == "📊 Quick Insights":
         for _, _row in _eng_df.iterrows():
             _curr = _fmt_engagement_cell(_row, "current")
             _prev = _fmt_engagement_cell(_row, "previous")
-            _delta = _engagement_delta_html(_row.get("current_value"), _row.get("previous_value"))
+            _delta = _engagement_delta_html(
+                _row.get("current_value"),
+                _row.get("previous_value"),
+                _row.get("value_type"),
+            )
             _eng_rows_html.append(
                 "<tr>"
                 f"<td style='padding:12px 14px;border-bottom:1px solid #2a2a2a;font-size:1.15rem;'>{_row['metric']}</td>"
@@ -4374,6 +4438,7 @@ if selected_section == "📊 Quick Insights":
         )
         st.caption(
             "* DEU = users who sent ≥1 message to the coach that day. "
+            "LLM cost/MAU = monthly-equivalent LLM spend (messages turn_audit USD) ÷ the MAU row above. "
             "Retention: among users who completed a first activity and had enough time to mature into the "
             "window. 7D counts a second activity within 7 days of the first; "
             "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
