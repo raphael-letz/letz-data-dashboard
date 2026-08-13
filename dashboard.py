@@ -535,6 +535,174 @@ def get_internal_users_filter_join_sql(exclude_internal: bool = True, table_alia
     return f"AND {table_alias}.waid NOT IN ('{internal_waids_str}')"
 
 
+def get_monthly_activity_retention_triangle() -> pd.DataFrame:
+    """Calendar-month retention triangle from activity logs (external users).
+
+    Cohort = month of first logged activity (America/Sao_Paulo).
+    Month 0 is 100% by definition. Later months are the share of the original
+    cohort with ≥1 activity completion in that calendar month. Incomplete
+    current month is excluded (except Month 0 for this month's cohort).
+    Missing return months are filled with 0%.
+    """
+    internal_waids_str = "', '".join(load_internal_users())
+    query = f"""
+WITH activity_days AS (
+  SELECT DISTINCT
+    uah.user_id,
+    (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM user_activities_history uah
+  JOIN users u ON u.id = uah.user_id
+  WHERE u.waid NOT IN ('{internal_waids_str}')
+),
+user_cohort AS (
+  SELECT
+    user_id,
+    date_trunc('month', MIN(local_date))::date AS cohort_month
+  FROM activity_days
+  GROUP BY user_id
+),
+cohort_sizes AS (
+  SELECT cohort_month, COUNT(*)::int AS cohort_size
+  FROM user_cohort
+  GROUP BY cohort_month
+),
+today_local AS (
+  SELECT date_trunc('month', (NOW() AT TIME ZONE 'America/Sao_Paulo')::date)::date AS current_month
+),
+cohort_months AS (
+  SELECT
+    cs.cohort_month,
+    cs.cohort_size,
+    gs.month_offset
+  FROM cohort_sizes cs
+  CROSS JOIN today_local tl
+  CROSS JOIN LATERAL generate_series(
+    0,
+    GREATEST(
+      0,
+      (
+        EXTRACT(YEAR FROM tl.current_month)::int * 12
+        + EXTRACT(MONTH FROM tl.current_month)::int
+      ) - (
+        EXTRACT(YEAR FROM cs.cohort_month)::int * 12
+        + EXTRACT(MONTH FROM cs.cohort_month)::int
+      ) - 1
+    )
+  ) AS gs(month_offset)
+),
+returned AS (
+  SELECT
+    uc.cohort_month,
+    (
+      (EXTRACT(YEAR FROM date_trunc('month', ad.local_date))::int * 12
+        + EXTRACT(MONTH FROM date_trunc('month', ad.local_date))::int)
+      - (EXTRACT(YEAR FROM uc.cohort_month)::int * 12
+        + EXTRACT(MONTH FROM uc.cohort_month)::int)
+    ) AS month_offset,
+    COUNT(DISTINCT ad.user_id)::int AS returned_users
+  FROM activity_days ad
+  JOIN user_cohort uc ON uc.user_id = ad.user_id
+  GROUP BY 1, 2
+)
+SELECT
+  to_char(cm.cohort_month, 'YYYY-MM') AS cohort_month,
+  cm.month_offset,
+  cm.cohort_size,
+  COALESCE(r.returned_users, 0)::int AS returned_users,
+  CASE
+    WHEN cm.month_offset = 0 THEN 100.0
+    ELSE ROUND(100.0 * COALESCE(r.returned_users, 0) / NULLIF(cm.cohort_size, 0), 1)
+  END AS retention_pct
+FROM cohort_months cm
+LEFT JOIN returned r
+  ON r.cohort_month = cm.cohort_month
+ AND r.month_offset = cm.month_offset
+ORDER BY cm.cohort_month, cm.month_offset
+"""
+    return run_query(query)
+
+
+def get_weekly_activity_retention_curves() -> pd.DataFrame:
+    """Weekly age-based retention from activity logs (external users).
+
+    Cohort = ISO week of first logged activity (America/Sao_Paulo).
+    Week N = share of the original cohort with ≥1 activity in days [7N, 7N+6]
+    after first activity. Week 0 is 100% by definition. A week is included
+    only after every user in the cohort has had that week fully elapse.
+    Missing weeks are filled with 0%.
+    """
+    internal_waids_str = "', '".join(load_internal_users())
+    query = f"""
+WITH activity_days AS (
+  SELECT DISTINCT
+    uah.user_id,
+    (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+  FROM user_activities_history uah
+  JOIN users u ON u.id = uah.user_id
+  WHERE u.waid NOT IN ('{internal_waids_str}')
+),
+user_first AS (
+  SELECT user_id, MIN(local_date) AS first_active_date
+  FROM activity_days
+  GROUP BY user_id
+),
+user_cohort AS (
+  SELECT
+    user_id,
+    first_active_date,
+    date_trunc('week', first_active_date)::date AS cohort_week_start
+  FROM user_first
+),
+cohort_meta AS (
+  SELECT
+    cohort_week_start,
+    COUNT(*)::int AS cohort_size,
+    MAX(first_active_date) AS last_joiner
+  FROM user_cohort
+  GROUP BY cohort_week_start
+),
+today_local AS (
+  SELECT (NOW() AT TIME ZONE 'America/Sao_Paulo')::date AS d
+),
+cohort_weeks AS (
+  SELECT
+    cm.cohort_week_start,
+    cm.cohort_size,
+    gs.week_offset
+  FROM cohort_meta cm
+  CROSS JOIN today_local tl
+  CROSS JOIN LATERAL generate_series(
+    0,
+    GREATEST(0, FLOOR((tl.d - cm.last_joiner) / 7.0)::int - 1)
+  ) AS gs(week_offset)
+),
+returned AS (
+  SELECT
+    uc.cohort_week_start,
+    FLOOR((ad.local_date - uc.first_active_date) / 7.0)::int AS week_offset,
+    COUNT(DISTINCT ad.user_id)::int AS returned_users
+  FROM activity_days ad
+  JOIN user_cohort uc ON uc.user_id = ad.user_id
+  GROUP BY 1, 2
+)
+SELECT
+  to_char(cw.cohort_week_start, 'YYYY-MM-DD') AS cohort_week_start,
+  cw.week_offset,
+  cw.cohort_size,
+  COALESCE(r.returned_users, 0)::int AS returned_users,
+  CASE
+    WHEN cw.week_offset = 0 THEN 100.0
+    ELSE ROUND(100.0 * COALESCE(r.returned_users, 0) / NULLIF(cw.cohort_size, 0), 1)
+  END AS retention_pct
+FROM cohort_weeks cw
+LEFT JOIN returned r
+  ON r.cohort_week_start = cw.cohort_week_start
+ AND r.week_offset = cw.week_offset
+ORDER BY cw.cohort_week_start, cw.week_offset
+"""
+    return run_query(query)
+
+
 USER_VISIBLE_MESSAGE_EXCLUDED_TYPES = (
     "think",
     "tool_use",
@@ -6313,1236 +6481,254 @@ if selected_section == "🔍 User Deep Dive":
 
 # Tab 3: User Retention
 if selected_section == "📈 User Retention":
-    # Recovery: weekly reply timeline + active/risk waterfall (top of tab)
     import altair as alt
 
-    _ret_rl_start = (datetime.now() - timedelta(weeks=12)).strftime("%Y-%m-%d")
+    st.markdown("### Cohort retention")
+    st.caption(
+        "Action = logged activity (`user_activities_history`). Cohort = first activity date "
+        "in America/Sao_Paulo. Retention is the share of the original cohort that logs ≥1 "
+        "activity in that period. Period 0 is 100% by definition. Incomplete periods are "
+        "excluded. Internal users are excluded."
+    )
+
     try:
-        _ret_recovery_events = get_recovery_ladder_events(_ret_rl_start)
+        monthly_df = get_monthly_activity_retention_triangle()
+        weekly_df = get_weekly_activity_retention_curves()
     except Exception as e:
-        _ret_recovery_events = pd.DataFrame()
-        st.warning(f"Could not load recovery ladder data for retention tab: {e}")
-
-    if _ret_recovery_events is not None and not _ret_recovery_events.empty:
-        _ret_df = _ret_recovery_events.copy()
-        _ret_df["week_start_sp"] = pd.to_datetime(_ret_df["week_start_sp"], errors="coerce")
-        _ret_df["replied_before_next_template"] = _ret_df["replied_before_next_template"].fillna(False).astype(int)
-        _ret_df = _ret_df[_ret_df["week_start_sp"].notna()].copy()
-        _ret_weekly = (
-            _ret_df.groupby("week_start_sp")
-            .agg(
-                templates_sent=("user_id", "size"),
-                replied_templates=("replied_before_next_template", "sum"),
-            )
-            .reset_index()
-            .sort_values("week_start_sp", ascending=False)
-        )
-        _ret_weekly["reply_rate_pct"] = (
-            100.0 * _ret_weekly["replied_templates"] / _ret_weekly["templates_sent"]
-        ).round(1)
-
-        st.markdown("#### 📈 Weekly Timeline — Reply Rate (% sends)")
-        _timeline_df = _ret_weekly[["week_start_sp", "reply_rate_pct"]].copy().sort_values("week_start_sp")
-        _timeline_df = _timeline_df.rename(
-            columns={"week_start_sp": "Week", "reply_rate_pct": "Reply rate (%)"}
-        )
-        _timeline_df["Week"] = pd.to_datetime(_timeline_df["Week"]).dt.strftime("%Y-%m-%d")
-        _ret_timeline_chart = (
-            alt.Chart(_timeline_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("Week:N", sort=None, title="Week"),
-                y=alt.Y("Reply rate (%)", title="Reply rate (%)"),
-                tooltip=[
-                    alt.Tooltip("Week:N", title="Week"),
-                    alt.Tooltip("Reply rate (%)", title="Reply rate (%)"),
-                ],
-            )
-            .properties(height=300)
-        )
-        st.altair_chart(_ret_timeline_chart, use_container_width=True)
-
-        st.markdown("#### 📋 Weekly Waterfall — Active, Inactive, Risk & De-risk")
-
-        _ret_wf_default_start = (datetime.now() - timedelta(weeks=12)).date()
-        _ret_wf_default_end = datetime.now().date()
-        _ret_use_custom_wf = st.toggle(
-            "Use custom date range for waterfall section",
-            value=False,
-            key="ret_waterfall_custom_dates_toggle",
-            help="When off, uses the last 12 weeks.",
-        )
-        _ret_wf_start = _ret_wf_default_start
-        _ret_wf_end = _ret_wf_default_end
-        if _ret_use_custom_wf:
-            _rw1, _rw2 = st.columns(2)
-            with _rw1:
-                _ret_wf_start = st.date_input(
-                    "Waterfall start date",
-                    value=_ret_wf_default_start,
-                    key="ret_waterfall_start_date",
-                )
-            with _rw2:
-                _ret_wf_end = st.date_input(
-                    "Waterfall end date",
-                    value=_ret_wf_default_end,
-                    key="ret_waterfall_end_date",
-                )
-
-        if _ret_wf_start > _ret_wf_end:
-            st.warning("Waterfall date range is invalid (`start > end`). Swapping dates automatically.")
-            _ret_wf_start, _ret_wf_end = _ret_wf_end, _ret_wf_start
-
-        try:
-            _ret_waterfall_df = get_recovery_weekly_waterfall_metrics(_ret_wf_start.strftime("%Y-%m-%d"))
-        except Exception as e:
-            _ret_waterfall_df = pd.DataFrame()
-            st.warning(f"Could not load weekly active/risk waterfall metrics: {e}")
-
-        if _ret_waterfall_df is not None and not _ret_waterfall_df.empty:
-            _ret_wf = _ret_waterfall_df.copy()
-            _ret_wf["week_start_dt"] = pd.to_datetime(_ret_wf["week_start"], errors="coerce")
-            _ret_wf = _ret_wf[
-                (_ret_wf["week_start_dt"].notna())
-                & (_ret_wf["week_start_dt"] >= pd.to_datetime(_ret_wf_start))
-                & (_ret_wf["week_start_dt"] <= pd.to_datetime(_ret_wf_end))
-            ].copy()
-            _ret_wf = _ret_wf.sort_values("week_start", ascending=False)
-
-            if _ret_wf.empty:
-                st.info("No weekly waterfall data for the selected date range.")
-            else:
-
-                def _ret_build_waterfall_steps(steps):
-                    rows = []
-                    running = 0
-                    for step_label, value, step_type in steps:
-                        val = int(value)
-                        if step_type == "total":
-                            y0 = 0
-                            y1 = val
-                            running = val
-                            display_val = val
-                            direction = "total"
-                        else:
-                            y0 = running
-                            y1 = running + val
-                            running = y1
-                            display_val = val
-                            direction = "up" if val >= 0 else "down"
-                        rows.append(
-                            {
-                                "step": step_label,
-                                "start": y0,
-                                "end": y1,
-                                "value": display_val,
-                                "bar_type": direction,
-                            }
-                        )
-                    return pd.DataFrame(rows)
-
-                st.markdown("#### 📈 Active user stack (flow per week)")
-                _ret_seg_order = [
-                    "Active (week start)",
-                    "New acquired",
-                    "Reactivated",
-                    "Inactive / churned (farewell)",
-                ]
-                _ret_seg_stack_order = {s: i for i, s in enumerate(_ret_seg_order)}
-                _ret_stack_rows = []
-                for _, _rr in _ret_wf.sort_values("week_start").iterrows():
-                    _ret_stack_rows.extend(
-                        [
-                            {
-                                "week_start": _rr["week_start"],
-                                "segment": "Active (week start)",
-                                "stack_order": _ret_seg_stack_order["Active (week start)"],
-                                "users": int(_rr["start_active_users"]),
-                            },
-                            {
-                                "week_start": _rr["week_start"],
-                                "segment": "New acquired",
-                                "stack_order": _ret_seg_stack_order["New acquired"],
-                                "users": int(_rr["new_acquired_users"]),
-                            },
-                            {
-                                "week_start": _rr["week_start"],
-                                "segment": "Reactivated",
-                                "stack_order": _ret_seg_stack_order["Reactivated"],
-                                "users": int(_rr["reactivated_users"]),
-                            },
-                            {
-                                "week_start": _rr["week_start"],
-                                "segment": "Inactive / churned (farewell)",
-                                "stack_order": _ret_seg_stack_order["Inactive / churned (farewell)"],
-                                "users": -int(_rr["became_inactive_users"]),
-                            },
-                        ]
-                    )
-                _ret_stock_stack_df = pd.DataFrame(_ret_stack_rows)
-                _ret_stock_stack_df["users_abs"] = _ret_stock_stack_df["users"].abs()
-                _ret_stock_chart = (
-                    alt.Chart(_ret_stock_stack_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("week_start:N", sort=None, title="Week"),
-                        y=alt.Y("users:Q", stack="zero", title="Users"),
-                        color=alt.Color(
-                            "segment:N",
-                            title="",
-                            sort=_ret_seg_order,
-                            scale=alt.Scale(
-                                domain=_ret_seg_order,
-                                range=["#60a5fa", "#22c55e", "#a78bfa", "#ef4444"],
-                            ),
-                        ),
-                        order=alt.Order("stack_order:Q"),
-                        tooltip=[
-                            alt.Tooltip("week_start:N", title="Week"),
-                            alt.Tooltip("segment:N", title="Segment"),
-                            alt.Tooltip("users_abs:Q", title="Users (|count|)"),
-                        ],
-                    )
-                    .properties(height=340)
-                )
-                st.altair_chart(_ret_stock_chart, use_container_width=True)
-
-                st.markdown("#### 📈 Inactive / churned — cumulative (farewell sends)")
-                _ret_wf_cum = _ret_wf.sort_values("week_start").copy()
-                _ret_wf_cum["new_inactive"] = _ret_wf_cum["became_inactive_users"].astype(int)
-                _ret_wf_cum["cum_inactive_end"] = _ret_wf_cum["new_inactive"].cumsum()
-                _ret_wf_cum["prior_cumulative"] = _ret_wf_cum["cum_inactive_end"] - _ret_wf_cum["new_inactive"]
-                _ret_cum_stack_rows = []
-                for _, _rcr in _ret_wf_cum.iterrows():
-                    _ret_cum_stack_rows.append(
-                        {
-                            "week_start": _rcr["week_start"],
-                            "segment": "Prior cumulative",
-                            "stack_order": 0,
-                            "users": int(_rcr["prior_cumulative"]),
-                        }
-                    )
-                    _ret_cum_stack_rows.append(
-                        {
-                            "week_start": _rcr["week_start"],
-                            "segment": "New this week",
-                            "stack_order": 1,
-                            "users": int(_rcr["new_inactive"]),
-                        }
-                    )
-                _ret_cum_stack_df = pd.DataFrame(_ret_cum_stack_rows)
-                _ret_cum_seg_order = ["Prior cumulative", "New this week"]
-                _ret_cum_tooltip = _ret_cum_stack_df.merge(
-                    _ret_wf_cum[["week_start", "cum_inactive_end"]], on="week_start", how="left"
-                )
-                _ret_inactive_cum_chart = (
-                    alt.Chart(_ret_cum_tooltip)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("week_start:N", sort=None, title="Week"),
-                        y=alt.Y("users:Q", stack="zero", title="Users (cumulative inactive)"),
-                        color=alt.Color(
-                            "segment:N",
-                            title="",
-                            sort=_ret_cum_seg_order,
-                            scale=alt.Scale(
-                                domain=_ret_cum_seg_order,
-                                range=["#64748b", "#ef4444"],
-                            ),
-                        ),
-                        order=alt.Order("stack_order:Q"),
-                        tooltip=[
-                            alt.Tooltip("week_start:N", title="Week"),
-                            alt.Tooltip("segment:N", title="Segment"),
-                            alt.Tooltip("users:Q", title="Users in segment"),
-                            alt.Tooltip("cum_inactive_end:Q", title="Total cumulative (week end)"),
-                        ],
-                    )
-                    .properties(height=320)
-                )
-                st.altair_chart(_ret_inactive_cum_chart, use_container_width=True)
-                st.caption(
-                    "Running total of **became inactive (farewell)** counts week over week from the **waterfall start date**. "
-                    "Each bar stacks **prior cumulative** (gray) + **new this week** (red); bar top = cumulative through that week."
-                )
-
-                st.markdown("#### 📈 Weekly Timeline — Active & At-risk Stock")
-                _ret_selected_week = st.selectbox(
-                    "Select week for waterfall visuals",
-                    options=_ret_wf["week_start"].tolist(),
-                    index=0,
-                    key="ret_waterfall_week_select",
-                )
-                _ret_wrow = _ret_wf[_ret_wf["week_start"] == _ret_selected_week].iloc[0]
-
-                _ret_active_steps = _ret_build_waterfall_steps(
-                    [
-                        ("Start active", _ret_wrow["start_active_users"], "total"),
-                        ("+ New acquired", _ret_wrow["new_acquired_users"], "delta"),
-                        ("+ Reactivated", _ret_wrow["reactivated_users"], "delta"),
-                        ("- Became inactive", -int(_ret_wrow["became_inactive_users"]), "delta"),
-                        ("End active", _ret_wrow["end_active_users_observed"], "total"),
-                    ]
-                )
-                _ret_risk_24h_steps = _ret_build_waterfall_steps(
-                    [
-                        ("Start risk stock", _ret_wrow["start_risk_24h_users"], "total"),
-                        ("+ New at risk", _ret_wrow["new_risk_24h_users"], "delta"),
-                        ("- De-risked", -int(_ret_wrow["derisked_24h_users"]), "delta"),
-                        ("End risk stock", _ret_wrow["end_risk_24h_users"], "total"),
-                    ]
-                )
-                _ret_risk_rl_steps = _ret_build_waterfall_steps(
-                    [
-                        ("Start risk stock", _ret_wrow["start_risk_rl_users"], "total"),
-                        ("+ New at risk", _ret_wrow["new_risk_rl_users"], "delta"),
-                        ("- De-risked", -int(_ret_wrow["derisked_rl_users"]), "delta"),
-                        ("End risk stock", _ret_wrow["end_risk_rl_users"], "total"),
-                    ]
-                )
-                _ret_color_scale = alt.Scale(
-                    domain=["up", "down", "total"],
-                    range=["#22c55e", "#ef4444", "#60a5fa"],
-                )
-                _ret_active_chart = (
-                    alt.Chart(_ret_active_steps)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(height=300, title=f"Active Stock Waterfall ({_ret_selected_week})")
-                )
-                _ret_risk_24h_chart = (
-                    alt.Chart(_ret_risk_24h_steps)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(
-                        height=300,
-                        title=f"At-risk Stock Waterfall (24h No Message) ({_ret_selected_week})",
-                    )
-                )
-                _ret_risk_rl_chart = (
-                    alt.Chart(_ret_risk_rl_steps)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("step:N", sort=None, title=None),
-                        y=alt.Y("start:Q", title="Users"),
-                        y2="end:Q",
-                        color=alt.Color("bar_type:N", scale=_ret_color_scale, legend=None),
-                        tooltip=[
-                            alt.Tooltip("step:N", title="Step"),
-                            alt.Tooltip("value:Q", title="Delta / Level"),
-                            alt.Tooltip("start:Q", title="From"),
-                            alt.Tooltip("end:Q", title="To"),
-                        ],
-                    )
-                    .properties(
-                        height=300,
-                        title=f"At-risk Stock Waterfall (Recovery Ladder) ({_ret_selected_week})",
-                    )
-                )
-                st.altair_chart(_ret_active_chart, use_container_width=True)
-                _ret_c1, _ret_c2 = st.columns(2)
-                with _ret_c1:
-                    st.altair_chart(_ret_risk_24h_chart, use_container_width=True)
-                with _ret_c2:
-                    st.altair_chart(_ret_risk_rl_chart, use_container_width=True)
-                st.caption(
-                    f"Active reconciliation gap for `{_ret_selected_week}`: "
-                    f"{int(_ret_wrow['active_reconciliation_gap'])} "
-                    "(observed end active - computed end active)."
-                )
-                _ret_waterfall_display = _ret_wf.drop(columns=["week_start_dt"]).rename(
-                    columns={
-                        "week_start": "Week",
-                        "start_active_users": "Start active users",
-                        "new_acquired_users": "+ New acquired",
-                        "reactivated_users": "+ Reactivated",
-                        "became_inactive_users": "- Became inactive (farewell)",
-                        "end_active_users_computed": "End active (computed)",
-                        "end_active_users_observed": "End active (observed)",
-                        "active_reconciliation_gap": "Active reconciliation gap",
-                        "start_risk_24h_users": "Start risk 24h stock",
-                        "new_risk_24h_users": "New at-risk 24h",
-                        "derisked_24h_users": "De-risked after 24h",
-                        "end_risk_24h_users": "End risk 24h stock",
-                        "start_risk_rl_users": "Start RL risk stock",
-                        "new_risk_rl_users": "New at-risk RL",
-                        "derisked_rl_users": "De-risked after RL",
-                        "end_risk_rl_users": "End RL risk stock",
-                    }
-                )
-                st.dataframe(_ret_waterfall_display, use_container_width=True, hide_index=True)
-        else:
-            st.info("No weekly waterfall data for this date range.")
-    else:
-        st.caption(
-            "No recovery ladder sends in the last 12 weeks — reply timeline and waterfall are unavailable."
-        )
-
-    st.markdown("---")
-    st.markdown("### 📈 User Retention by Weekly Cohort")
-    # Use shared loader so all tabs/queries stay in sync with the latest internal-users.json
-    internal_waids = load_internal_users()
-    
-    # Build the retention query
-    internal_waids_str = "', '".join(internal_waids)
-
-    retention_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-
-user_messages AS (
-  SELECT
-    u.id  AS user_id,
-    u.full_name,
-    u.waid,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-
-user_first_last AS (
-  SELECT
-    user_id,
-    full_name,
-    waid,
-    MIN(local_date) AS first_active_date,
-    MAX(local_date) AS last_active_date
-  FROM user_messages
-  GROUP BY user_id, full_name, waid
-),
-
--- 1) Assign each user to a weekly cohort by first-active week (local time)
-user_with_cohort_week AS (
-  SELECT
-    ufl.*,
-    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
-  FROM user_first_last ufl
-),
-
--- 2) Map each active date to a cohort_day within that user's lifetime
-user_days AS (
-  SELECT
-    um.user_id,
-    uwc.full_name,
-    uwc.waid,
-    uwc.cohort_week_start,
-    um.local_date,
-    uwc.first_active_date,
-    (um.local_date - uwc.first_active_date)       AS day_offset,
-    (um.local_date - uwc.first_active_date) + 1   AS cohort_day
-  FROM user_messages um
-  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
-),
-
--- 3) Cohort size per week (denominator)
-cohort_sizes AS (
-  SELECT
-    cohort_week_start,
-    COUNT(DISTINCT user_id) AS cohort_size
-  FROM user_with_cohort_week
-  GROUP BY cohort_week_start
-),
-
--- 4) Numerator: active users per cohort week & cohort day
-users_active_on_day AS (
-  SELECT
-    cohort_week_start,
-    cohort_day,
-    COUNT(DISTINCT user_id) AS active_users,
-    STRING_AGG(DISTINCT full_name, ', ' ORDER BY full_name) AS user_names
-  FROM user_days
-  GROUP BY cohort_week_start, cohort_day
-),
-
--- 5) Final weekly cohort retention table
-cohort_retention_weekly AS (
-  SELECT
-    ua.cohort_week_start,
-    ua.cohort_day,
-    cs.cohort_size,
-    COALESCE(ua.active_users, 0) AS active_users,
-    ROUND(
-      100.0 * COALESCE(ua.active_users, 0) / cs.cohort_size,
-      1
-    ) AS retention_pct,
-    COALESCE(ua.user_names, '') AS user_names
-  FROM users_active_on_day ua
-  JOIN cohort_sizes cs
-    ON cs.cohort_week_start = ua.cohort_week_start
-)
-
-SELECT
-  cohort_week_start,
-  cohort_day,
-  cohort_size,
-  active_users,
-  retention_pct,
-  user_names
-FROM cohort_retention_weekly
-ORDER BY cohort_week_start, cohort_day
-"""
-    
-    try:
-        retention_df = run_query(retention_query)
-        
-        if retention_df.empty:
-            st.info("No retention data available yet. Users need to send messages to generate cohort data.")
-        else:
-            # Summary metrics
-            total_cohorts = retention_df['cohort_week_start'].nunique()
-            total_users = retention_df.groupby('cohort_week_start')['cohort_size'].first().sum()
-            
-            # Get rolling-window retention data for summary metrics
-            try:
-                rolling_retention_summary_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT
-    u.id  AS user_id,
-    u.full_name,
-    u.waid,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_last AS (
-  SELECT
-    user_id,
-    full_name,
-    waid,
-    MIN(local_date) AS first_active_date,
-    MAX(local_date) AS last_active_date
-  FROM user_messages
-  GROUP BY user_id, full_name, waid
-),
-user_with_cohort_week AS (
-  SELECT
-    ufl.*,
-    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
-  FROM user_first_last ufl
-),
-user_days AS (
-  SELECT
-    um.user_id,
-    uwc.full_name,
-    uwc.waid,
-    uwc.cohort_week_start,
-    um.local_date,
-    uwc.first_active_date,
-    (um.local_date - uwc.first_active_date) AS cohort_day
-  FROM user_messages um
-  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
-),
-user_activity_by_day AS (
-  SELECT
-    user_id,
-    cohort_week_start,
-    MAX(CASE WHEN cohort_day <= 7 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_7
-  FROM user_days
-  GROUP BY user_id, cohort_week_start
-),
-cohort_sizes AS (
-  SELECT
-    cohort_week_start,
-    COUNT(DISTINCT user_id) AS cohort_size
-  FROM user_with_cohort_week
-  GROUP BY cohort_week_start
-),
-rolling_retention_summary AS (
-  SELECT
-    uwc.cohort_week_start,
-    uwc.user_id,
-    COALESCE(uabd.active_day1_to_7, 0) AS active_within_7d
-  FROM user_with_cohort_week uwc
-  LEFT JOIN user_activity_by_day uabd ON uabd.user_id = uwc.user_id AND uabd.cohort_week_start = uwc.cohort_week_start
-),
-cohort_7d_retention AS (
-  SELECT
-    rrs.cohort_week_start,
-    cs.cohort_size,
-    CASE 
-      WHEN (CURRENT_DATE - rrs.cohort_week_start) >= 7 
-      THEN ROUND(100.0 * SUM(rrs.active_within_7d) / cs.cohort_size, 1) 
-      ELSE NULL 
-    END AS retention_7d
-  FROM rolling_retention_summary rrs
-  JOIN cohort_sizes cs ON cs.cohort_week_start = rrs.cohort_week_start
-  GROUP BY rrs.cohort_week_start, cs.cohort_size
-)
-SELECT AVG(retention_7d) AS avg_7d_retention
-FROM cohort_7d_retention
-WHERE retention_7d IS NOT NULL
-"""
-                avg_7d_result = run_query(rolling_retention_summary_query)
-                avg_7d_retention = avg_7d_result['avg_7d_retention'].iloc[0] if not avg_7d_result.empty and not pd.isna(avg_7d_result['avg_7d_retention'].iloc[0]) else None
-            except Exception:
-                avg_7d_retention = None
-            
-            # Get avg and median days active for top section
-            try:
-                days_active_summary_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT
-    u.id  AS user_id,
-    u.full_name,
-    u.waid,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_last AS (
-  SELECT
-    user_id,
-    full_name,
-    waid,
-    MIN(local_date) AS first_active_date,
-    MAX(local_date) AS last_active_date
-  FROM user_messages
-  GROUP BY user_id, full_name, waid
-),
-user_with_cohort_week AS (
-  SELECT
-    ufl.*,
-    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
-  FROM user_first_last ufl
-),
-user_days AS (
-  SELECT
-    um.user_id,
-    uwc.cohort_week_start,
-    um.local_date,
-    (um.local_date - uwc.first_active_date) AS cohort_day
-  FROM user_messages um
-  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
-),
-user_days_active AS (
-  SELECT
-    user_id,
-    cohort_week_start,
-    COUNT(DISTINCT local_date) FILTER (WHERE cohort_day <= 13) AS days_active_week2
-  FROM user_days
-  GROUP BY user_id, cohort_week_start
-)
-SELECT
-  ROUND(AVG(days_active_week2), 1) AS avg_days_active,
-  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_active_week2) AS median_days_active
-FROM user_days_active
-"""
-                days_active_summary = run_query(days_active_summary_query)
-                avg_days_active_summary = days_active_summary['avg_days_active'].iloc[0] if not days_active_summary.empty else None
-                median_days_active_summary = days_active_summary['median_days_active'].iloc[0] if not days_active_summary.empty else None
-            except Exception:
-                avg_days_active_summary = None
-                median_days_active_summary = None
-            
-            # Avg activities completed per week (per user: total completions / weeks in product, then avg)
-            try:
-                avg_activities_per_week_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT u.id AS user_id, (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_active AS (
-  SELECT user_id, MIN(local_date) AS first_active_date
-  FROM user_messages
-  GROUP BY user_id
-),
-today_local AS (
-  SELECT ((NOW() AT TIME ZONE 'America/Sao_Paulo')::date) AS d
-),
-user_completions AS (
-  SELECT
-    uah.user_id,
-    COUNT(*)::int AS total_completions
-  FROM user_activities_history uah
-  JOIN user_first_active ufa ON ufa.user_id = uah.user_id
-  GROUP BY uah.user_id
-),
-user_weeks AS (
-  SELECT
-    ufa.user_id,
-    GREATEST(1, ((tl.d - ufa.first_active_date) / 7)) AS weeks_in_product
-  FROM user_first_active ufa
-  CROSS JOIN today_local tl
-)
-SELECT ROUND(AVG(uc.total_completions::numeric / uw.weeks_in_product), 1) AS avg_activities_per_week
-FROM user_completions uc
-JOIN user_weeks uw ON uw.user_id = uc.user_id
-"""
-                avg_act_result = run_query(avg_activities_per_week_query)
-                avg_activities_per_week = avg_act_result['avg_activities_per_week'].iloc[0] if not avg_act_result.empty and not pd.isna(avg_act_result['avg_activities_per_week'].iloc[0]) else None
-            except Exception:
-                avg_activities_per_week = None
-            
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("Total Cohort Weeks", total_cohorts)
-            col2.metric("Total Users (All Cohorts)", total_users)
-            col3.metric("Avg 7d Retention", f"{avg_7d_retention:.1f}%" if avg_7d_retention is not None and not pd.isna(avg_7d_retention) else "N/A")
-            col4.metric("Avg Days Active", f"{avg_days_active_summary:.1f}" if avg_days_active_summary is not None and not pd.isna(avg_days_active_summary) else "N/A")
-            col5.metric("Median Days Active", f"{median_days_active_summary:.1f}" if median_days_active_summary is not None and not pd.isna(median_days_active_summary) else "N/A")
-            col6.metric("Avg activities/week", f"{avg_activities_per_week:.1f}" if avg_activities_per_week is not None and not pd.isna(avg_activities_per_week) else "N/A")
-            
-            # Quick overview: three tables (most active / most inactive / new users)
-            try:
-                overview_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT
-    u.id AS user_id,
-    u.full_name,
-    u.waid,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_last AS (
-  SELECT
-    user_id,
-    full_name,
-    MAX(waid) AS waid,
-    MIN(local_date) AS first_active_date,
-    MAX(local_date) AS last_active_date
-  FROM user_messages
-  GROUP BY user_id, full_name
-),
--- "Today" in same timezone as local_date (America/Sao_Paulo) for consistent lifetime
-today_local AS (
-  SELECT ((NOW() AT TIME ZONE 'America/Sao_Paulo')::date) AS d
-),
-user_days_count AS (
-  SELECT user_id, COUNT(DISTINCT local_date)::int AS active_days
-  FROM user_messages
-  GROUP BY user_id
-),
-activities_completed AS (
-  SELECT uah.user_id, COUNT(*)::int AS activities_completed
-  FROM user_activities_history uah
-  JOIN product_users pu ON pu.id = uah.user_id
-  WHERE uah.completed_at IS NOT NULL
-  GROUP BY uah.user_id
-),
-user_stats AS (
-  SELECT
-    ufl.user_id,
-    ufl.full_name,
-    ufl.waid,
-    (tl.d - ufl.first_active_date) AS lifetime,
-    udc.active_days,
-    COALESCE(ac.activities_completed, 0)::int AS activities_completed
-  FROM user_first_last ufl
-  CROSS JOIN today_local tl
-  JOIN user_days_count udc ON udc.user_id = ufl.user_id
-  LEFT JOIN activities_completed ac ON ac.user_id = ufl.user_id
-)
-SELECT user_id, full_name, waid, lifetime, active_days, activities_completed FROM user_stats ORDER BY full_name
-"""
-                overview_df = run_query(overview_query)
-                if not overview_df.empty:
-                    established = overview_df[overview_df['lifetime'] >= 7].copy()
-                    new_users = overview_df[overview_df['lifetime'] < 7].copy()
-                    most_active = established.sort_values('activities_completed', ascending=False)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_active['full_name'] = most_active.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
-                    most_active = most_active[['full_name', 'activities_completed', 'active_days', 'lifetime']]
-                    most_active.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    most_inactive = established.sort_values('activities_completed', ascending=True)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    most_inactive['full_name'] = most_inactive.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
-                    most_inactive = most_inactive[['full_name', 'activities_completed', 'active_days', 'lifetime']]
-                    most_inactive.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    new_users_display = new_users.sort_values('activities_completed', ascending=False)[['user_id', 'full_name', 'waid', 'activities_completed', 'active_days', 'lifetime']].reset_index(drop=True)
-                    new_users_display['full_name'] = new_users_display.apply(lambda r: format_display_name(r['full_name'], r['waid'], user_id=r.get('user_id')), axis=1)
-                    new_users_display = new_users_display[['full_name', 'activities_completed', 'active_days', 'lifetime']]
-                    new_users_display.columns = ['Name', 'Activities completed', 'Active days', 'Lifetime (days)']
-                    st.markdown("#### Quick overview")
-                    st.caption("Active/inactive order by total activities completed. Lifetime (days) = days since first activity (São Paulo). Established = 7+ days; New users = under 7 days.")
-                    t1, t2, t3 = st.columns(3)
-                    with t1:
-                        st.markdown("**Most active** (established)")
-                        st.dataframe(most_active, use_container_width=True, hide_index=True)
-                    with t2:
-                        st.markdown("**Most inactive** (established)")
-                        st.dataframe(most_inactive, use_container_width=True, hide_index=True)
-                    with t3:
-                        st.markdown("**New users** (< 7 days)")
-                        st.dataframe(new_users_display, use_container_width=True, hide_index=True)
-            except Exception:
-                pass
-            
-            st.markdown("---")
-            
-            # Retention curves
-            st.markdown("#### 📉 Retention Curves by Cohort")
-            st.caption("Each line shows the retention curve for a weekly cohort: retention % (y-axis) over days since first active (x-axis).")
-
-            # Build data for retention curves (one line per cohort)
-            import altair as alt
-            
-            curves_data = retention_df.copy()
-            curves_data['cohort_week_start_str'] = curves_data['cohort_week_start'].astype(str)
-
-            # Limit to first 50 days for readability
-            curves_data_filtered = curves_data[curves_data['cohort_day'] <= 50].copy()
-
-            if not curves_data_filtered.empty:
-                curves_chart = alt.Chart(curves_data_filtered).mark_line(point=True).encode(
-                    x=alt.X('cohort_day:Q', title='Days Since First Active'),
-                    y=alt.Y('retention_pct:Q', title='Retention %'),
-                    color=alt.Color('cohort_week_start_str:N', title='Cohort Week'),
-                    tooltip=[
-                        alt.Tooltip('cohort_week_start_str:N', title='Cohort Week'),
-                        alt.Tooltip('cohort_day:Q', title='Day'),
-                        alt.Tooltip('retention_pct:Q', title='Retention %', format='.1f'),
-                        alt.Tooltip('active_users:Q', title='Active Users'),
-                        alt.Tooltip('cohort_size:Q', title='Cohort Size'),
-                    ]
-                ).properties(
-                    height=300
-                )
-
-                st.altair_chart(curves_chart, use_container_width=True)
-            
-            st.markdown("---")
-            
-            # Activity completions by cohort: consecutive 7-day blocks (W1=days 0-6, W2=7-13, W3=14-20, W4=21-27)
-            try:
-                activity_completions_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT
-    u.id  AS user_id,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_last AS (
-  SELECT user_id, MIN(local_date) AS first_active_date
-  FROM user_messages
-  GROUP BY user_id
-),
-user_with_cohort_week AS (
-  SELECT
-    user_id,
-    first_active_date,
-    date_trunc('week', first_active_date)::date AS cohort_week_start
-  FROM user_first_last
-),
--- Consecutive 7-day blocks: W1=0-6, W2=7-13, W3=14-20, W4=21-27 (count per block only)
-completions_by_block AS (
-  SELECT
-    uah.user_id,
-    uwc.cohort_week_start,
-    COUNT(*) FILTER (WHERE ((uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date - uwc.first_active_date) BETWEEN 0 AND 6)::int AS c_w1,
-    COUNT(*) FILTER (WHERE ((uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date - uwc.first_active_date) BETWEEN 7 AND 13)::int AS c_w2,
-    COUNT(*) FILTER (WHERE ((uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date - uwc.first_active_date) BETWEEN 14 AND 20)::int AS c_w3,
-    COUNT(*) FILTER (WHERE ((uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date - uwc.first_active_date) BETWEEN 21 AND 27)::int AS c_w4
-  FROM user_activities_history uah
-  JOIN user_with_cohort_week uwc ON uwc.user_id = uah.user_id
-  WHERE ((uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date - uwc.first_active_date) BETWEEN 0 AND 27
-  GROUP BY uah.user_id, uwc.cohort_week_start
-),
-user_completions_blocks AS (
-  SELECT
-    uwc.user_id,
-    uwc.cohort_week_start,
-    COALESCE(c.c_w1, 0) AS c_w1,
-    COALESCE(c.c_w2, 0) AS c_w2,
-    COALESCE(c.c_w3, 0) AS c_w3,
-    COALESCE(c.c_w4, 0) AS c_w4
-  FROM user_with_cohort_week uwc
-  LEFT JOIN completions_by_block c ON c.user_id = uwc.user_id AND c.cohort_week_start = uwc.cohort_week_start
-),
-cohort_sizes AS (
-  SELECT cohort_week_start, COUNT(DISTINCT user_id) AS cohort_size
-  FROM user_with_cohort_week
-  GROUP BY cohort_week_start
-)
-SELECT
-  ucb.cohort_week_start,
-  cs.cohort_size,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 1) / cs.cohort_size, 1) AS w1_pct_1plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 2) / cs.cohort_size, 1) AS w1_pct_2plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 3) / cs.cohort_size, 1) AS w1_pct_3plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 4) / cs.cohort_size, 1) AS w1_pct_4plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w2 >= 1) / cs.cohort_size, 1) AS w2_pct_1plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w2 >= 2) / cs.cohort_size, 1) AS w2_pct_2plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w2 >= 3) / cs.cohort_size, 1) AS w2_pct_3plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w2 >= 4) / cs.cohort_size, 1) AS w2_pct_4plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w3 >= 1) / cs.cohort_size, 1) AS w3_pct_1plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w3 >= 2) / cs.cohort_size, 1) AS w3_pct_2plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w3 >= 3) / cs.cohort_size, 1) AS w3_pct_3plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w3 >= 4) / cs.cohort_size, 1) AS w3_pct_4plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w4 >= 1) / cs.cohort_size, 1) AS w4_pct_1plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w4 >= 2) / cs.cohort_size, 1) AS w4_pct_2plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w4 >= 3) / cs.cohort_size, 1) AS w4_pct_3plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w4 >= 4) / cs.cohort_size, 1) AS w4_pct_4plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 1 AND ucb.c_w2 >= 1) / cs.cohort_size, 1) AS w1_w2_1plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 2 AND ucb.c_w2 >= 2) / cs.cohort_size, 1) AS w1_w2_2plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 3 AND ucb.c_w2 >= 3) / cs.cohort_size, 1) AS w1_w2_3plus,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE ucb.c_w1 >= 4 AND ucb.c_w2 >= 4) / cs.cohort_size, 1) AS w1_w2_4plus
-FROM user_completions_blocks ucb
-JOIN cohort_sizes cs ON cs.cohort_week_start = ucb.cohort_week_start
-GROUP BY ucb.cohort_week_start, cs.cohort_size
-ORDER BY ucb.cohort_week_start DESC
-"""
-                activity_completions_df = run_query(activity_completions_query)
-                if not activity_completions_df.empty:
-                    st.markdown("---")
-                    st.markdown("#### 🏃 Activity completions by cohort (consecutive 7-day blocks)")
-
-                    import altair as alt
-                    try:
-                        from datetime import datetime
-                        import pytz
-                        today_local = datetime.now(pytz.timezone("America/Sao_Paulo")).date()
-                    except Exception:
-                        today_local = pd.Timestamp.utcnow().date()
-
-                    ac = activity_completions_df.copy()
-                    ac["cohort_week_start"] = pd.to_datetime(ac["cohort_week_start"])
-                    ac["days_old"] = (pd.Timestamp(today_local) - ac["cohort_week_start"]).dt.days
-
-                    # Line chart: X = W1, W2, W3, W4 (consecutive blocks); Y = avg % who did 1+/2+/3+/4+ in THAT block
-                    chart_rows = []
-                    for w_idx, (w_name, w_days) in enumerate([("W1", 7), ("W2", 14), ("W3", 21), ("W4", 28)]):
-                        eligible = ac[ac["days_old"] >= w_days]
-                        if eligible.empty:
-                            continue
-                        for metric in ["1plus", "2plus", "3plus", "4plus"]:
-                            col = f"w{w_idx + 1}_pct_{metric}"
-                            if col in eligible.columns:
-                                chart_rows.append({
-                                    "window": w_name,
-                                    "metric": f"{metric.replace('plus', '+')} in block",
-                                    "pct": eligible[col].mean(),
-                                })
-                    if chart_rows:
-                        chart_df = pd.DataFrame(chart_rows)
-                        chart = alt.Chart(chart_df).mark_line(point=True).encode(
-                            x=alt.X("window:N", title="Block", sort=["W1", "W2", "W3", "W4"]),
-                            y=alt.Y("pct:Q", title="%"),
-                            color=alt.Color("metric:N", title="Completed", scale=alt.Scale(range=["#00d4aa", "#7b68ee", "#f59e0b", "#ef4444"])),
-                            tooltip=[alt.Tooltip("window:N", title="Block"), alt.Tooltip("metric:N", title="Metric"), alt.Tooltip("pct:Q", title="%", format=".1f")],
-                        ).properties(height=320, title="% of cohort with 1+ / 2+ / 3+ / 4+ activities per block")
-                        st.altair_chart(chart, use_container_width=True)
-                        st.caption("Averages include only cohorts old enough for that block (e.g. W4 only cohorts ≥ 28 days old).")
-                    else:
-                        st.caption("Not enough cohort data yet for the chart.")
-
-                    # Table 1: W1 only — % completed 1+, 2+, 3+, 4+ in first 7 days (cohorts with data)
-                    st.markdown("**W1 (first 7 days) — % of cohort who completed 1+, 2+, 3+, 4+**")
-                    ac_w1 = ac[ac["days_old"] >= 7][["cohort_week_start", "cohort_size", "w1_pct_1plus", "w1_pct_2plus", "w1_pct_3plus", "w1_pct_4plus"]].copy()
-                    ac_w1["cohort_week_start"] = ac_w1["cohort_week_start"].dt.strftime("%Y-%m-%d")
-                    ac_w1 = ac_w1.rename(columns={
-                        "cohort_week_start": "Cohort Week",
-                        "cohort_size": "Cohort Size",
-                        "w1_pct_1plus": "% 1+",
-                        "w1_pct_2plus": "% 2+",
-                        "w1_pct_3plus": "% 3+",
-                        "w1_pct_4plus": "% 4+",
-                    })
-                    st.dataframe(
-                        ac_w1,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Cohort Week": st.column_config.TextColumn(width="small"),
-                            "Cohort Size": st.column_config.NumberColumn(width="small", format="%d"),
-                            "% 1+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 2+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 3+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 4+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                        }
-                    )
-                    # Table 2: W2 only — % completed 1+, 2+, 3+, 4+ in second 7 days
-                    st.markdown("**W2 (second 7 days) — % of cohort who completed 1+, 2+, 3+, 4+**")
-                    ac_w2 = ac[ac["days_old"] >= 14][["cohort_week_start", "cohort_size", "w2_pct_1plus", "w2_pct_2plus", "w2_pct_3plus", "w2_pct_4plus"]].copy()
-                    ac_w2["cohort_week_start"] = ac_w2["cohort_week_start"].dt.strftime("%Y-%m-%d")
-                    ac_w2 = ac_w2.rename(columns={
-                        "cohort_week_start": "Cohort Week",
-                        "cohort_size": "Cohort Size",
-                        "w2_pct_1plus": "% 1+",
-                        "w2_pct_2plus": "% 2+",
-                        "w2_pct_3plus": "% 3+",
-                        "w2_pct_4plus": "% 4+",
-                    })
-                    st.dataframe(
-                        ac_w2,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Cohort Week": st.column_config.TextColumn(width="small"),
-                            "Cohort Size": st.column_config.NumberColumn(width="small", format="%d"),
-                            "% 1+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 2+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 3+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 4+": st.column_config.NumberColumn(width="small", format="%.1f"),
-                        }
-                    )
-                    # Table 3: 2 consecutive weeks (W1 and W2) — % who hit 1+/2+/3+/4+ in both W1 and W2
-                    st.markdown("**2 consecutive weeks (W1 & W2) — % of cohort who completed 1+, 2+, 3+, or 4+ in both weeks**")
-                    ac_w1w2 = ac[ac["days_old"] >= 14][["cohort_week_start", "cohort_size", "w1_w2_1plus", "w1_w2_2plus", "w1_w2_3plus", "w1_w2_4plus"]].copy()
-                    ac_w1w2["cohort_week_start"] = ac_w1w2["cohort_week_start"].dt.strftime("%Y-%m-%d")
-                    ac_w1w2 = ac_w1w2.rename(columns={
-                        "cohort_week_start": "Cohort Week",
-                        "cohort_size": "Cohort Size",
-                        "w1_w2_1plus": "% 1+ both",
-                        "w1_w2_2plus": "% 2+ both",
-                        "w1_w2_3plus": "% 3+ both",
-                        "w1_w2_4plus": "% 4+ both",
-                    })
-                    st.dataframe(
-                        ac_w1w2,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Cohort Week": st.column_config.TextColumn(width="small"),
-                            "Cohort Size": st.column_config.NumberColumn(width="small", format="%d"),
-                            "% 1+ both": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 2+ both": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 3+ both": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% 4+ both": st.column_config.NumberColumn(width="small", format="%.1f"),
-                        }
-                    )
-                else:
-                    st.markdown("---")
-                    st.markdown("#### 🏃 Activity completions by cohort (consecutive 7-day blocks)")
-                    st.info("No activity completion data by cohort yet.")
-            except Exception as e:
-                st.warning(f"Could not load activity completions by cohort: {e}")
-
-            # Rolling-window retention metrics (at bottom of tab)
-            st.markdown("---")
-            st.markdown("#### 📊 Rolling-Window Retention Metrics")
-            st.caption("Retention measured as % of users with at least one interaction within the specified time window.")
-            rolling_retention_query = f"""
-WITH internal_waids AS (
-  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
-),
-product_users AS (
-  SELECT id, full_name, waid
-  FROM users
-  WHERE waid NOT IN (SELECT waid FROM internal_waids)
-),
-user_messages AS (
-  SELECT
-    u.id  AS user_id,
-    u.full_name,
-    u.waid,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
-  FROM messages m
-  JOIN product_users u ON (u.waid = m.waid OR u.id = m.user_id)
-  WHERE m.sender = 'user'
-),
-user_first_last AS (
-  SELECT
-    user_id,
-    full_name,
-    waid,
-    MIN(local_date) AS first_active_date,
-    MAX(local_date) AS last_active_date
-  FROM user_messages
-  GROUP BY user_id, full_name, waid
-),
-user_with_cohort_week AS (
-  SELECT
-    ufl.*,
-    date_trunc('week', ufl.first_active_date)::date AS cohort_week_start
-  FROM user_first_last ufl
-),
-user_days AS (
-  SELECT
-    um.user_id,
-    uwc.full_name,
-    uwc.waid,
-    uwc.cohort_week_start,
-    um.local_date,
-    uwc.first_active_date,
-    (um.local_date - uwc.first_active_date) AS cohort_day
-  FROM user_messages um
-  JOIN user_with_cohort_week uwc ON uwc.user_id = um.user_id
-),
-cohort_sizes AS (
-  SELECT
-    cohort_week_start,
-    COUNT(DISTINCT user_id) AS cohort_size
-  FROM user_with_cohort_week
-  GROUP BY cohort_week_start
-),
-user_activity_by_day AS (
-  SELECT
-    user_id,
-    cohort_week_start,
-    MAX(CASE WHEN cohort_day = 1 THEN 1 ELSE 0 END) AS active_day1,
-    MAX(CASE WHEN cohort_day <= 2 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_or_2,
-    MAX(CASE WHEN cohort_day <= 3 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_3,
-    MAX(CASE WHEN cohort_day <= 7 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_7,
-    MAX(CASE WHEN cohort_day <= 14 AND cohort_day >= 1 THEN 1 ELSE 0 END) AS active_day1_to_14
-  FROM user_days
-  GROUP BY user_id, cohort_week_start
-),
-rolling_retention AS (
-  SELECT
-    uwc.cohort_week_start,
-    uwc.user_id,
-    uwc.first_active_date,
-    COALESCE(uabd.active_day1, 0) AS active_within_1d,
-    COALESCE(uabd.active_day1_or_2, 0) AS active_within_2d,
-    COALESCE(uabd.active_day1_to_3, 0) AS active_within_3d,
-    COALESCE(uabd.active_day1_to_7, 0) AS active_within_7d,
-    COALESCE(uabd.active_day1_to_14, 0) AS active_within_14d,
-    COUNT(DISTINCT ud.local_date) FILTER (WHERE ud.cohort_day <= 6) AS days_active_week1,
-    COUNT(DISTINCT ud.local_date) FILTER (WHERE ud.cohort_day <= 13) AS days_active_week2,
-    COUNT(*) FILTER (WHERE ud.cohort_day <= 6) AS interactions_week1
-  FROM user_with_cohort_week uwc
-  LEFT JOIN user_days ud ON ud.user_id = uwc.user_id
-  LEFT JOIN user_activity_by_day uabd ON uabd.user_id = uwc.user_id AND uabd.cohort_week_start = uwc.cohort_week_start
-  GROUP BY uwc.cohort_week_start, uwc.user_id, uwc.first_active_date, uabd.active_day1, uabd.active_day1_or_2, uabd.active_day1_to_3, uabd.active_day1_to_7, uabd.active_day1_to_14
-),
-cohort_rolling_metrics AS (
-  SELECT
-    rr.cohort_week_start,
-    cs.cohort_size,
-    (CURRENT_DATE - rr.cohort_week_start) AS days_since_cohort_start,
-    CASE WHEN (CURRENT_DATE - rr.cohort_week_start) >= 1 THEN ROUND(100.0 * SUM(rr.active_within_1d) / cs.cohort_size, 1) ELSE NULL END AS retention_1d,
-    CASE WHEN (CURRENT_DATE - rr.cohort_week_start) >= 2 THEN ROUND(100.0 * SUM(rr.active_within_2d) / cs.cohort_size, 1) ELSE NULL END AS retention_2d,
-    CASE WHEN (CURRENT_DATE - rr.cohort_week_start) >= 3 THEN ROUND(100.0 * SUM(rr.active_within_3d) / cs.cohort_size, 1) ELSE NULL END AS retention_3d,
-    CASE WHEN (CURRENT_DATE - rr.cohort_week_start) >= 7 THEN ROUND(100.0 * SUM(rr.active_within_7d) / cs.cohort_size, 1) ELSE NULL END AS retention_7d,
-    ROUND(AVG(rr.days_active_week2), 1) AS avg_days_active,
-    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rr.days_active_week2) AS median_days_active,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE rr.interactions_week1 >= 10) / cs.cohort_size, 1) AS pct_10plus_interactions_week1
-  FROM rolling_retention rr
-  JOIN cohort_sizes cs ON cs.cohort_week_start = rr.cohort_week_start
-  GROUP BY rr.cohort_week_start, cs.cohort_size
-)
-SELECT
-  cohort_week_start,
-  cohort_size,
-  retention_1d,
-  retention_2d,
-  retention_3d,
-  retention_7d,
-  avg_days_active,
-  median_days_active,
-  pct_10plus_interactions_week1
-FROM cohort_rolling_metrics
-ORDER BY cohort_week_start DESC
-"""
-            try:
-                rolling_retention_df = run_query(rolling_retention_query)
-                if not rolling_retention_df.empty:
-                    display_rolling_df = rolling_retention_df.copy()
-                    display_rolling_df['cohort_week_start'] = pd.to_datetime(display_rolling_df['cohort_week_start']).dt.strftime('%Y-%m-%d')
-                    display_rolling_df = display_rolling_df.rename(columns={
-                        'cohort_week_start': 'Cohort Week',
-                        'cohort_size': 'Cohort Size',
-                        'retention_1d': '1d Retention',
-                        'retention_2d': '2d Retention',
-                        'retention_3d': '3d Retention',
-                        'retention_7d': '7d Retention',
-                        'avg_days_active': 'Avg Days Active',
-                        'median_days_active': 'Median Days Active',
-                        'pct_10plus_interactions_week1': '% with 10+ Interactions (Week 1)'
-                    })
-                    retention_cols = ['1d Retention', '2d Retention', '3d Retention', '7d Retention']
-                    for col in retention_cols:
-                        if col in display_rolling_df.columns:
-                            display_rolling_df[col] = display_rolling_df[col].apply(lambda x: 'N/A' if pd.isna(x) else f"{x:.1f}%")
-                    st.dataframe(
-                        display_rolling_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Cohort Week": st.column_config.TextColumn(width="small"),
-                            "Cohort Size": st.column_config.NumberColumn(width="small", format="%d"),
-                            "1d Retention": st.column_config.TextColumn(width="small"),
-                            "2d Retention": st.column_config.TextColumn(width="small"),
-                            "3d Retention": st.column_config.TextColumn(width="small"),
-                            "7d Retention": st.column_config.TextColumn(width="small"),
-                            "Avg Days Active": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "Median Days Active": st.column_config.NumberColumn(width="small", format="%.1f"),
-                            "% with 10+ Interactions (Week 1)": st.column_config.NumberColumn(width="small", format="%.1f"),
-                        }
-                    )
-                else:
-                    st.info("No rolling-window retention data available yet.")
-            except Exception as e:
-                st.warning(f"Could not load rolling-window retention metrics: {e}")
-            
-    except Exception as e:
+        monthly_df = pd.DataFrame()
+        weekly_df = pd.DataFrame()
         st.error(f"Error loading retention data: {e}")
         st.exception(e)
+
+    if not monthly_df.empty:
+        monthly_df = monthly_df.copy()
+        monthly_df["month_offset"] = monthly_df["month_offset"].astype(int)
+        monthly_df["cohort_size"] = monthly_df["cohort_size"].astype(int)
+        monthly_df["returned_users"] = monthly_df["returned_users"].astype(int)
+        monthly_df["retention_pct"] = pd.to_numeric(monthly_df["retention_pct"], errors="coerce")
+
+        cohort_sizes = (
+            monthly_df.groupby("cohort_month", as_index=False)["cohort_size"].first()
+        )
+        total_users = int(cohort_sizes["cohort_size"].sum())
+        n_cohorts = int(cohort_sizes["cohort_month"].nunique())
+        m1 = monthly_df[monthly_df["month_offset"] == 1]
+        avg_m1 = (
+            100.0 * m1["returned_users"].sum() / m1["cohort_size"].sum()
+            if not m1.empty and m1["cohort_size"].sum()
+            else None
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Monthly cohorts", n_cohorts)
+        c2.metric("Users in cohorts", total_users)
+        c3.metric(
+            "Avg month-1 retention",
+            f"{avg_m1:.1f}%" if avg_m1 is not None else "N/A",
+        )
+
+        hide_small = st.checkbox(
+            "Hide monthly cohorts with fewer than 5 users",
+            value=True,
+            help="Early months are tiny and dominate the triangle without changing the story.",
+        )
+        plot_monthly = monthly_df.copy()
+        if hide_small:
+            plot_monthly = plot_monthly[plot_monthly["cohort_size"] >= 5]
+
+        if not plot_monthly.empty:
+            st.markdown("#### Monthly retention triangle")
+            st.caption(
+                "Rows = first-activity month. Columns = calendar months since that month. "
+                "Cell = % of the original cohort that logged an activity in that month."
+            )
+            plot_monthly["cohort_label"] = plot_monthly.apply(
+                lambda r: f"{r['cohort_month']} (n={int(r['cohort_size'])})", axis=1
+            )
+            month_order = sorted(plot_monthly["cohort_label"].unique())
+            heatmap = (
+                alt.Chart(plot_monthly)
+                .mark_rect()
+                .encode(
+                    x=alt.X(
+                        "month_offset:O",
+                        title="Months since first activity month",
+                    ),
+                    y=alt.Y(
+                        "cohort_label:N",
+                        title="Cohort month",
+                        sort=month_order,
+                    ),
+                    color=alt.Color(
+                        "retention_pct:Q",
+                        title="Retention %",
+                        scale=alt.Scale(domain=[0, 100], scheme="greens"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("cohort_month:N", title="Cohort"),
+                        alt.Tooltip("cohort_size:Q", title="Cohort size"),
+                        alt.Tooltip("month_offset:O", title="Month offset"),
+                        alt.Tooltip("returned_users:Q", title="Returned users"),
+                        alt.Tooltip("retention_pct:Q", title="Retention %", format=".1f"),
+                    ],
+                )
+            )
+            labels = (
+                alt.Chart(plot_monthly)
+                .mark_text(fontSize=11)
+                .encode(
+                    x="month_offset:O",
+                    y=alt.Y("cohort_label:N", sort=month_order),
+                    text=alt.Text("retention_pct:Q", format=".0f"),
+                    color=alt.condition(
+                        alt.datum.retention_pct >= 55,
+                        alt.value("#ffffff"),
+                        alt.value("#111111"),
+                    ),
+                )
+            )
+            st.altair_chart(
+                (heatmap + labels).properties(height=max(220, 36 * len(month_order))),
+                use_container_width=True,
+            )
+
+            triangle_table = plot_monthly.pivot_table(
+                index=["cohort_month", "cohort_size"],
+                columns="month_offset",
+                values="retention_pct",
+                aggfunc="first",
+            ).reset_index()
+            triangle_table.columns = [
+                f"M{c}" if isinstance(c, (int, float)) else c
+                for c in triangle_table.columns
+            ]
+            triangle_table = triangle_table.rename(
+                columns={"cohort_month": "Cohort month", "cohort_size": "Cohort size"}
+            )
+            st.dataframe(triangle_table, use_container_width=True, hide_index=True)
+        else:
+            st.info("No monthly cohorts match the current size filter.")
+    else:
+        st.info("No monthly retention data yet. Users need to log an activity.")
+
+    st.markdown("---")
+    st.markdown("#### Weekly retention curves")
+    st.caption(
+        "X = weeks since first logged activity (7-day age buckets). Y = % of the original "
+        "weekly cohort that logged ≥1 activity in that week. Week 0 is 100% by definition."
+    )
+
+    if weekly_df.empty:
+        st.info("No weekly retention data yet. Users need to log an activity.")
+    else:
+        weekly_df = weekly_df.copy()
+        weekly_df["week_offset"] = weekly_df["week_offset"].astype(int)
+        weekly_df["cohort_size"] = weekly_df["cohort_size"].astype(int)
+        weekly_df["returned_users"] = weekly_df["returned_users"].astype(int)
+        weekly_df["retention_pct"] = pd.to_numeric(weekly_df["retention_pct"], errors="coerce")
+        weekly_df["cohort_week_start"] = weekly_df["cohort_week_start"].astype(str)
+
+        curve_mode = st.radio(
+            "Curve view",
+            ["By weekly cohort", "Aggregate"],
+            horizontal=True,
+            help="Aggregate is size-weighted across cohorts that have reached each week.",
+        )
+
+        if curve_mode == "By weekly cohort":
+            cohort_options = (
+                weekly_df.groupby("cohort_week_start")["cohort_size"]
+                .first()
+                .sort_index(ascending=False)
+            )
+            default_n = min(8, len(cohort_options))
+            selected_cohorts = st.multiselect(
+                "Weekly cohorts",
+                options=list(cohort_options.index),
+                default=list(cohort_options.index[:default_n]),
+                format_func=lambda w: f"{w} (n={int(cohort_options.loc[w])})",
+            )
+            curves = weekly_df[weekly_df["cohort_week_start"].isin(selected_cohorts)].copy()
+            if curves.empty:
+                st.info("Select at least one weekly cohort.")
+            else:
+                curves["cohort_label"] = curves.apply(
+                    lambda r: f"{r['cohort_week_start']} (n={int(r['cohort_size'])})",
+                    axis=1,
+                )
+                chart = (
+                    alt.Chart(curves)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("week_offset:Q", title="Weeks since first activity"),
+                        y=alt.Y(
+                            "retention_pct:Q",
+                            title="Retention %",
+                            scale=alt.Scale(domain=[0, 100]),
+                        ),
+                        color=alt.Color("cohort_label:N", title="Cohort week"),
+                        tooltip=[
+                            alt.Tooltip("cohort_week_start:N", title="Cohort week"),
+                            alt.Tooltip("cohort_size:Q", title="Cohort size"),
+                            alt.Tooltip("week_offset:Q", title="Week"),
+                            alt.Tooltip("returned_users:Q", title="Returned users"),
+                            alt.Tooltip("retention_pct:Q", title="Retention %", format=".1f"),
+                        ],
+                    )
+                    .properties(height=360)
+                )
+                st.altair_chart(chart, use_container_width=True)
+        else:
+            agg = (
+                weekly_df.groupby("week_offset", as_index=False)
+                .agg(
+                    returned_users=("returned_users", "sum"),
+                    cohort_size=("cohort_size", "sum"),
+                    n_cohorts=("cohort_week_start", "nunique"),
+                )
+            )
+            agg["retention_pct"] = (
+                100.0 * agg["returned_users"] / agg["cohort_size"].replace(0, pd.NA)
+            ).round(1)
+            agg.loc[agg["week_offset"] == 0, "retention_pct"] = 100.0
+            chart = (
+                alt.Chart(agg)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("week_offset:Q", title="Weeks since first activity"),
+                    y=alt.Y(
+                        "retention_pct:Q",
+                        title="Retention %",
+                        scale=alt.Scale(domain=[0, 100]),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("week_offset:Q", title="Week"),
+                        alt.Tooltip("n_cohorts:Q", title="Cohorts included"),
+                        alt.Tooltip("cohort_size:Q", title="Users in included cohorts"),
+                        alt.Tooltip("returned_users:Q", title="Returned users"),
+                        alt.Tooltip("retention_pct:Q", title="Retention %", format=".1f"),
+                    ],
+                )
+                .properties(height=360, title="Aggregate weekly retention (size-weighted)")
+            )
+            st.altair_chart(chart, use_container_width=True)
+            st.caption(
+                "Each week includes only cohorts old enough for that week to have fully elapsed, "
+                "so later weeks are a shrinking, more mature subset."
+            )
+            st.dataframe(
+                agg.rename(
+                    columns={
+                        "week_offset": "Week",
+                        "n_cohorts": "Cohorts included",
+                        "cohort_size": "Users in included cohorts",
+                        "returned_users": "Returned users",
+                        "retention_pct": "Retention %",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # =============================================================================
