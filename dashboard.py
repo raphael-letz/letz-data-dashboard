@@ -709,6 +709,8 @@ USER_VISIBLE_MESSAGE_EXCLUDED_TYPES = (
     "tool_result",
     "turn_audit",
     "weekly_digest",
+    # Pipeline trace (claimed / started / ready). The sent reply is a separate text row.
+    "reply_checkpoint",
 )
 
 
