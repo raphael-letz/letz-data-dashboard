@@ -14,6 +14,7 @@ import html
 import calendar
 import csv
 import io
+import urllib.error
 import urllib.request
 import pytz
 from dotenv import load_dotenv
@@ -1042,6 +1043,157 @@ ORDER BY row_type, activity_date
     return run_query(query)
 
 
+OPENROUTER_ANALYTICS_URL = "https://openrouter.ai/api/v1/analytics/query"
+OPENROUTER_PROD_API_KEY_NAME = "letz-prod"
+
+
+def _sao_paulo_today():
+    return datetime.now(pytz.timezone("America/Sao_Paulo")).date()
+
+
+def get_openrouter_management_key() -> str:
+    """Management key for OpenRouter analytics. Separate from the inference key."""
+    api_key = None
+    try:
+        if hasattr(st, "secrets") and "OPENROUTER_MANAGEMENT_API_KEY" in st.secrets:
+            api_key = st.secrets["OPENROUTER_MANAGEMENT_API_KEY"]
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.getenv("OPENROUTER_MANAGEMENT_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Add OPENROUTER_MANAGEMENT_API_KEY to .env or Streamlit secrets."
+        )
+    return str(api_key).strip()
+
+
+@st.cache_data(ttl=300)
+def get_openrouter_letz_prod_daily_usage(start_date: str, end_date_exclusive: str) -> pd.DataFrame:
+    """
+    Daily letz-prod spend from OpenRouter.
+
+    start_date is inclusive and end_date_exclusive is exclusive, both YYYY-MM-DD
+    in UTC, which is how OpenRouter bills a calendar day.
+    """
+    api_key = get_openrouter_management_key()
+    body = {
+        "metrics": ["total_usage"],
+        "dimensions": ["api_key_id"],
+        "granularity": "day",
+        "time_range": {
+            "start": f"{start_date}T00:00:00Z",
+            "end": f"{end_date_exclusive}T00:00:00Z",
+        },
+        "limit": 1000,
+    }
+    req = urllib.request.Request(
+        OPENROUTER_ANALYTICS_URL,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"OpenRouter analytics returned HTTP {exc.code}.") from None
+    except urllib.error.URLError:
+        raise RuntimeError("Could not reach OpenRouter.") from None
+
+    envelope = payload.get("data") if isinstance(payload, dict) else None
+    rows = envelope.get("data") if isinstance(envelope, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("OpenRouter analytics returned an unexpected payload.")
+    meta = envelope.get("metadata") if isinstance(envelope, dict) else {}
+    if isinstance(meta, dict) and meta.get("truncated"):
+        raise RuntimeError("OpenRouter analytics truncated the spend query.")
+    prod_rows = [row for row in rows if row.get("api_key_id") == OPENROUTER_PROD_API_KEY_NAME]
+    if not prod_rows:
+        raise RuntimeError("OpenRouter returned no letz-prod spend for this window.")
+    return pd.DataFrame(
+        {
+            "date": [str(row.get("date__day"))[:10] for row in prod_rows],
+            "usd": [float(row.get("total_usage") or 0) for row in prod_rows],
+        }
+    )
+
+
+def _sum_openrouter_spend(daily: pd.DataFrame, start, end) -> float:
+    if daily is None or daily.empty or end < start:
+        return 0.0
+    mask = (daily["date"] >= start.isoformat()) & (daily["date"] <= end.isoformat())
+    return float(daily.loc[mask, "usd"].sum())
+
+
+def openrouter_prod_spend_summary(as_of=None) -> dict:
+    """
+    letz-prod USD for the dashboard windows.
+
+    Last 7 completed days, the 7 days before those, month-to-date through
+    yesterday, and month-to-date as of 7 days ago. Dates are the São Paulo
+    calendar dates, billed on OpenRouter's UTC day.
+    """
+    if as_of is None:
+        as_of = _sao_paulo_today()
+    month_start = as_of.replace(day=1)
+    prev_as_of = as_of - timedelta(days=7)
+    prev_month_start = prev_as_of.replace(day=1)
+    fetch_start = min(as_of - timedelta(days=14), month_start, prev_month_start)
+    daily = get_openrouter_letz_prod_daily_usage(fetch_start.isoformat(), as_of.isoformat())
+    return {
+        "current_7d": _sum_openrouter_spend(daily, as_of - timedelta(days=7), as_of - timedelta(days=1)),
+        "prior_7d": _sum_openrouter_spend(daily, as_of - timedelta(days=14), as_of - timedelta(days=8)),
+        "mtd": _sum_openrouter_spend(daily, month_start, as_of - timedelta(days=1)),
+        "mtd_prev": _sum_openrouter_spend(daily, prev_month_start, prev_as_of - timedelta(days=1)),
+    }
+
+
+def _blank_llm_cost_mau_row(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or (df["metric"] == "LLM cost/MAU").any():
+        return df
+    row = {col: None for col in df.columns}
+    row["sort_order"] = 5
+    row["metric"] = "LLM cost/MAU"
+    row["value_type"] = "usd"
+    out = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    return out.sort_values("sort_order").reset_index(drop=True)
+
+
+def attach_openrouter_cost_per_mau(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill LLM cost/MAU from letz-prod spend and the MAU row already in the table."""
+    if df is None or df.empty:
+        return df
+    mau = df.loc[df["metric"] == "MAU (avg. rolling 30-day MAU)"]
+    if mau.empty:
+        return df
+    current_mau = float(mau.iloc[0]["current_value"] or 0)
+    previous_mau = float(mau.iloc[0]["previous_value"] or 0)
+    as_of = _sao_paulo_today()
+    days_in_month = calendar.monthrange(as_of.year, as_of.month)[1]
+    spend = openrouter_prod_spend_summary(as_of)
+
+    def per_mau(period_cost: float, mau_n: float):
+        if not mau_n:
+            return None
+        return round((period_cost / 7.0 * days_in_month) / mau_n, 2)
+
+    row = {col: None for col in df.columns}
+    row.update({
+        "sort_order": 5,
+        "metric": "LLM cost/MAU",
+        "value_type": "usd",
+        "current_value": per_mau(spend["current_7d"], current_mau),
+        "previous_value": per_mau(spend["prior_7d"], previous_mau),
+    })
+    base = df.loc[df["metric"] != "LLM cost/MAU"]
+    out = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
+    return out.sort_values("sort_order").reset_index(drop=True)
+
+
 @st.cache_data(ttl=300)
 def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.DataFrame:
     """
@@ -1057,9 +1209,10 @@ def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.Dat
     trace types think/tool_use/tool_result/turn_audit/weekly_digest).
 
     LLM cost/MAU uses the same avg rolling 30-day MAU as the MAU row.
-    Numerator is messages.type = 'turn_audit' USD for those onboarded users
-    in each 7-day window, annualized to a monthly equivalent:
-    (7d cost / 7 * days in current month) / MAU.
+    The numerator is OpenRouter billed spend on the letz-prod key for each
+    7-day window (UTC days). Monthly run rate:
+    (7d cost / 7 * days in current month) / MAU. The row is filled in Python
+    after this query, in attach_openrouter_cost_per_mau.
 
     Retention (first-activity definition): among onboarded external users who
     completed a first activity and have matured into the window.
@@ -1155,45 +1308,6 @@ activity_summary AS (
     ON dm.period = dd.period
    AND dm.local_date = dd.local_date
   GROUP BY dd.period
-),
-llm_costs AS (
-  SELECT
-    o.id AS user_id,
-    (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date,
-    (m.message::jsonb ->> 'usd')::numeric AS usd_cost
-  FROM messages m
-  JOIN onboarded o
-    ON (m.user_id = o.id OR (m.user_id IS NULL AND m.waid = o.waid))
-  WHERE m.type = 'turn_audit'
-    AND m.message IS NOT NULL
-    AND m.message LIKE '{{%'
-    AND m.sent_at >= o.onboarded_at
-),
-cost_summary AS (
-  SELECT
-    d.period,
-    COALESCE(SUM(lc.usd_cost), 0) AS period_cost
-  FROM report_days d
-  LEFT JOIN llm_costs lc ON lc.local_date = d.local_date
-  GROUP BY d.period
-),
-cost_per_mau AS (
-  SELECT
-    a.period,
-    CASE
-      WHEN a.avg_mau IS NULL OR a.avg_mau = 0 THEN NULL
-      ELSE ROUND(
-        (c.period_cost / 7.0
-         * EXTRACT(DAY FROM (
-             date_trunc('month', (SELECT as_of_local_date FROM params))
-             + INTERVAL '1 month' - INTERVAL '1 day'
-           ))::numeric
-        ) / a.avg_mau,
-        2
-      )
-    END AS cost_per_mau
-  FROM activity_summary a
-  JOIN cost_summary c ON c.period = a.period
 ),
 first_activity AS (
   SELECT s.period, s.snapshot_ts, o.id, MIN(a.completed_at) AS first_completed_at
@@ -1334,15 +1448,6 @@ metric_rows AS (
   FROM activity_summary
   UNION ALL
   SELECT
-    5,
-    'LLM cost/MAU',
-    'usd',
-    MAX(cost_per_mau) FILTER (WHERE period = 'Last 7D'),
-    MAX(cost_per_mau) FILTER (WHERE period = 'Previous 7D'),
-    NULL, NULL, NULL, NULL
-  FROM cost_per_mau
-  UNION ALL
-  SELECT
     5 + sort_order,
     metric,
     'retention',
@@ -1417,18 +1522,16 @@ llm_cost_base AS (
 @st.cache_data(ttl=300)
 def get_llm_cost_headline_metrics(exclude_internal: bool = True) -> pd.DataFrame:
     """
-    LLM cost KPI inputs for the Cost tab.
+    Cost-tab headline inputs.
 
-    Returns current/prior 7d totals, avg rolling-30d MAU over those windows
-    (same definition as Quick Insights), and month-to-date cost through yesterday
-    (America/Sao_Paulo) for the current-month run rate.
+    MAU matches Quick Insights. Spend is OpenRouter letz-prod total_usage:
+    last 7 days, previous 7 days, month-to-date through yesterday, and
+    month-to-date as of 7 days ago.
     """
-    base_cte = get_llm_cost_base_cte(exclude_internal)
     internal_waids = load_internal_users() if exclude_internal else []
     internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
     query = f"""
-{base_cte},
-internal_waids AS (
+WITH internal_waids AS (
     SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
 ),
 params AS (
@@ -1472,46 +1575,22 @@ mau_summary AS (
         ROUND(AVG(mau) FILTER (WHERE period = 'Last 7D'), 1) AS current_7d_mau,
         ROUND(AVG(mau) FILTER (WHERE period = 'Previous 7D'), 1) AS prior_7d_mau
     FROM daily_mau
-),
-cost_summary AS (
-    SELECT
-        COALESCE(SUM(usd_cost) FILTER (
-            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  BETWEEN (SELECT as_of_local_date - 7 FROM params)
-                      AND (SELECT as_of_local_date - 1 FROM params)
-        ), 0) AS current_7d_total,
-        COALESCE(SUM(usd_cost) FILTER (
-            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  BETWEEN (SELECT as_of_local_date - 14 FROM params)
-                      AND (SELECT as_of_local_date - 8 FROM params)
-        ), 0) AS prior_7d_total,
-        COALESCE(SUM(usd_cost) FILTER (
-            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  >= date_trunc('month', (SELECT as_of_local_date FROM params))::date
-              AND (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  < (SELECT as_of_local_date FROM params)
-        ), 0) AS mtd_total,
-        COALESCE(SUM(usd_cost) FILTER (
-            WHERE (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  >= date_trunc('month', (SELECT as_of_local_date FROM params) - INTERVAL '7 days')::date
-              AND (date_time_utc AT TIME ZONE 'America/Sao_Paulo')::date
-                  < (SELECT as_of_local_date - 7 FROM params)
-        ), 0) AS mtd_total_prev_7d,
-        (SELECT as_of_local_date FROM params) AS as_of_local_date
-    FROM llm_cost_base
 )
 SELECT
-    c.current_7d_total,
-    c.prior_7d_total,
-    c.mtd_total,
-    c.mtd_total_prev_7d,
-    c.as_of_local_date,
     m.current_7d_mau,
-    m.prior_7d_mau
-FROM cost_summary c
-CROSS JOIN mau_summary m
+    m.prior_7d_mau,
+    (SELECT as_of_local_date FROM params) AS as_of_local_date
+FROM mau_summary m
 """
-    return run_query(query)
+    df = run_query(query)
+    if df.empty:
+        return df
+    spend = openrouter_prod_spend_summary(_sao_paulo_today())
+    df["current_7d_total"] = spend["current_7d"]
+    df["prior_7d_total"] = spend["prior_7d"]
+    df["mtd_total"] = spend["mtd"]
+    df["mtd_total_prev_7d"] = spend["mtd_prev"]
+    return df
 
 
 LLM_COST_FORECAST_SHEET_ID = "1ARpMh-V-U2BNPTwBQezCpEKrZaiTyk4_GOMV8JDvJn4"
@@ -4575,6 +4654,13 @@ if selected_section == "📊 Quick Insights":
         _eng_df = pd.DataFrame()
         st.warning(f"Could not load engagement comparison: {_eng_err}")
 
+    if not _eng_df.empty:
+        try:
+            _eng_df = attach_openrouter_cost_per_mau(_eng_df)
+        except Exception as _or_err:
+            st.warning(f"Could not load OpenRouter LLM cost: {_or_err}")
+            _eng_df = _blank_llm_cost_mau_row(_eng_df)
+
     st.markdown("#### KPI")
     if not _eng_df.empty:
         _eng_rows_html = []
@@ -4608,7 +4694,7 @@ if selected_section == "📊 Quick Insights":
         )
         st.caption(
             "* DEU = users who sent ≥1 message to the coach that day. "
-            "LLM cost/MAU = monthly-equivalent LLM spend (messages turn_audit USD) ÷ the MAU row above. "
+            "LLM cost/MAU = (7-day OpenRouter letz-prod spend ÷ 7 × days in the current month) ÷ the MAU row above. "
             "Retention: among users who completed a first activity and had enough time to mature into the "
             "window. 7D counts a second activity within 7 days of the first; "
             "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
@@ -5542,23 +5628,27 @@ if selected_section == "💰 Cost":
         prior_7d_mau = float(cost_headline.get("prior_7d_mau", 0) or 0)
     except Exception as e:
         st.warning(f"Could not load headline cost metrics: {e}")
-        current_7d_total = prior_7d_total = mtd_total = mtd_total_prev_7d = 0.0
+        current_7d_total = prior_7d_total = mtd_total = mtd_total_prev_7d = None
         current_7d_mau = prior_7d_mau = 0.0
 
     # Monthly-equivalent cost/MAU from each 7d window: (7d cost / 7 * days_in_month) / MAU
     current_cost_per_mau = (
         (current_7d_total / 7.0 * _days_in_month) / current_7d_mau
-        if current_7d_mau else None
+        if current_7d_mau and current_7d_total is not None else None
     )
     prior_cost_per_mau = (
         (prior_7d_total / 7.0 * _days_in_month) / prior_7d_mau
-        if prior_7d_mau else None
+        if prior_7d_mau and prior_7d_total is not None else None
     )
 
     # Month run rate = MTD ÷ elapsed days × days in month (through yesterday)
-    current_run_rate = (mtd_total / _mtd_days) * _days_in_month if _mtd_days else None
+    current_run_rate = (
+        (mtd_total / _mtd_days) * _days_in_month
+        if _mtd_days and mtd_total is not None else None
+    )
     prior_run_rate = (
-        (mtd_total_prev_7d / _prev_mtd_days) * _prev_days_in_month if _prev_mtd_days else None
+        (mtd_total_prev_7d / _prev_mtd_days) * _prev_days_in_month
+        if _prev_mtd_days and mtd_total_prev_7d is not None else None
     )
 
     try:
@@ -5649,12 +5739,18 @@ if selected_section == "💰 Cost":
         "</table>",
         unsafe_allow_html=True,
     )
+    st.caption(
+        "Spend is OpenRouter letz-prod. "
+        "Cost/MAU = (7-day spend ÷ 7 × days in the month) ÷ rolling 30-day MAU. "
+        "Run rate = month-to-date through yesterday ÷ elapsed days × days in the month."
+    )
 
     st.markdown("---")
 
     # ── 1. Weekly per-user cost trend (median / avg / p25 / p75) ───────────
     st.markdown("#### Weekly LLM cost per real user — trend")
     st.caption(
+        "Per user, from turn audits. OpenRouter does not split the bill by user. "
         "One box per completed local calendar week (Mon–Sun). Box spans p25–p75, "
         "white tick = median, orange line = average."
     )
@@ -5716,6 +5812,7 @@ if selected_section == "💰 Cost":
     # ── 2. Cost per user life day ──────────────────────────────
     st.markdown("#### LLM cost per real user by day of user life")
     st.caption(
+        "Per user, from turn audits. OpenRouter does not split the bill by user. "
         "Day 1 = signup day (local time). Life days with fewer than 5 active real "
         "users are hidden from the chart to avoid noisy long-tail days."
     )
