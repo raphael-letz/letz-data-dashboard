@@ -1598,6 +1598,10 @@ LLM_COST_FORECAST_GID = "1487726926"
 LLM_COST_FORECAST_CACHE_PATH = os.path.join(
     os.path.dirname(__file__), ".context", "llm-cost-forecast.json"
 )
+# Forecast tab: 1% of messages are marketing templates; the rest are service/utility.
+META_MARKETING_MESSAGE_SHARE = 0.01
+META_MARKETING_RATE_USD = 0.0625
+META_SERVICE_RATE_USD = 0.0068
 
 
 def _parse_forecast_usd(value) -> float | None:
@@ -1637,6 +1641,10 @@ def _save_llm_cost_forecast_cache(budgets: dict, source: str) -> None:
         "months": budgets.get("run_rate") or {},
         "cost_per_mau": budgets.get("cost_per_mau") or {},
         "run_rate": budgets.get("run_rate") or {},
+        "marketing_run_rate": budgets.get("marketing_run_rate") or {},
+        "utility_run_rate": budgets.get("utility_run_rate") or {},
+        "window_run_rate": budgets.get("window_run_rate") or {},
+        "forecast_mau": budgets.get("forecast_mau") or {},
     }
     try:
         os.makedirs(os.path.dirname(LLM_COST_FORECAST_CACHE_PATH), exist_ok=True)
@@ -1674,6 +1682,7 @@ def _budgets_from_forecast_csv(csv_text: str) -> dict:
     Returns dict with:
       cost_per_mau — row labeled "LLM cost/MAU" (sheet row 5)
       run_rate     — row labeled "LLM (Openrouter)" (sheet row 12)
+      marketing_run_rate, utility_run_rate, window_run_rate, forecast_mau
     """
     rows = list(csv.reader(io.StringIO(csv_text)))
     if not rows:
@@ -1694,7 +1703,14 @@ def _budgets_from_forecast_csv(csv_text: str) -> dict:
     if not month_cols:
         return {}
 
-    budgets = {"cost_per_mau": {}, "run_rate": {}}
+    budgets = {
+        "cost_per_mau": {},
+        "run_rate": {},
+        "marketing_run_rate": {},
+        "utility_run_rate": {},
+        "window_run_rate": {},
+        "forecast_mau": {},
+    }
     for row in rows[header_idx + 1:]:
         label_cells = [c.strip().lower() for c in row[:3]]
         label = " ".join(c for c in label_cells if c)
@@ -1702,6 +1718,14 @@ def _budgets_from_forecast_csv(csv_text: str) -> dict:
             budgets["cost_per_mau"] = _months_from_labeled_row(row, month_cols)
         elif "llm" in label and "openrouter" in label:
             budgets["run_rate"] = _months_from_labeled_row(row, month_cols)
+        elif "marketing template" in label:
+            budgets["marketing_run_rate"] = _months_from_labeled_row(row, month_cols)
+        elif "utility template" in label:
+            budgets["utility_run_rate"] = _months_from_labeled_row(row, month_cols)
+        elif "24h-window" in label or "24h window" in label:
+            budgets["window_run_rate"] = _months_from_labeled_row(row, month_cols)
+        elif label == "mau":
+            budgets["forecast_mau"] = _months_from_labeled_row(row, month_cols)
     return budgets
 
 
@@ -1737,6 +1761,10 @@ def get_llm_cost_budget_series() -> tuple[dict, str]:
     budgets = {
         "cost_per_mau": cache.get("cost_per_mau") or {},
         "run_rate": cache.get("run_rate") or cache.get("months") or {},
+        "marketing_run_rate": cache.get("marketing_run_rate") or {},
+        "utility_run_rate": cache.get("utility_run_rate") or {},
+        "window_run_rate": cache.get("window_run_rate") or {},
+        "forecast_mau": cache.get("forecast_mau") or {},
     }
     synced_at = cache.get("synced_at")
     source = "cached forecast"
@@ -1757,6 +1785,124 @@ def get_llm_cost_forecast_for_month(month_name: str) -> tuple[float | None, str]
     """Return (run_rate budget usd, source_label) for a calendar month name."""
     _cost_per_mau, run_rate, source = get_llm_cost_budgets_for_month(month_name)
     return run_rate, source
+
+
+def split_meta_message_cost(message_count) -> tuple[float | None, float | None, float | None]:
+    """Return (marketing, service/utility, total) USD for a message count."""
+    if message_count is None or (isinstance(message_count, float) and pd.isna(message_count)):
+        return None, None, None
+    n = float(message_count)
+    marketing = n * META_MARKETING_MESSAGE_SHARE * META_MARKETING_RATE_USD
+    service = n * (1.0 - META_MARKETING_MESSAGE_SHARE) * META_SERVICE_RATE_USD
+    return marketing, service, marketing + service
+
+
+def get_meta_message_budgets_for_month(month_name: str) -> tuple[float | None, float | None, float | None, str]:
+    """Return (marketing run rate, service/utility run rate, cost/MAU, source)."""
+    budgets, source = get_llm_cost_budget_series()
+
+    def month_val(key: str) -> float | None:
+        return _parse_forecast_usd((budgets.get(key) or {}).get(month_name))
+
+    marketing = month_val("marketing_run_rate")
+    utility = month_val("utility_run_rate")
+    window = month_val("window_run_rate")
+    forecast_mau = month_val("forecast_mau")
+    service = None
+    if utility is not None or window is not None:
+        service = (utility or 0.0) + (window or 0.0)
+    total = None
+    if marketing is not None or service is not None:
+        total = (marketing or 0.0) + (service or 0.0)
+    cost_per_mau = None
+    if total is not None and forecast_mau:
+        cost_per_mau = total / forecast_mau
+    return marketing, service, cost_per_mau, source
+
+
+@st.cache_data(ttl=300)
+def get_meta_outbound_message_counts() -> pd.DataFrame:
+    """
+    Billable outbound coach messages in America/Sao_Paulo.
+
+    Includes internal users. Excludes failed sends and internal trace rows.
+    Windows match the LLM cost tab: last 7 completed days, previous 7,
+    month-to-date through yesterday, and month-to-date as of 7 days ago.
+    """
+    query = """
+WITH params AS (
+    SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date AS as_of_local_date
+),
+bounds AS (
+    SELECT
+        as_of_local_date,
+        as_of_local_date - 7 AS current_start,
+        as_of_local_date - 1 AS current_end,
+        as_of_local_date - 14 AS prior_start,
+        as_of_local_date - 8 AS prior_end,
+        date_trunc('month', as_of_local_date)::date AS month_start,
+        (as_of_local_date - 7) AS prev_as_of,
+        date_trunc('month', as_of_local_date - 7)::date AS prev_month_start
+    FROM params
+),
+msgs AS (
+    SELECT (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+    FROM messages m
+    WHERE m.sender = 'companion'
+      AND COALESCE(m.status, '') <> 'failed'
+      AND COALESCE(m.type, '') NOT IN (
+          'think', 'tool_use', 'tool_result', 'turn_audit',
+          'reply_checkpoint', 'weekly_digest'
+      )
+      AND m.sent_at >= (
+          SELECT (LEAST(prior_start, month_start, prev_month_start)::timestamp
+                  AT TIME ZONE 'America/Sao_Paulo')
+          FROM bounds
+      )
+)
+SELECT
+    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.current_start AND b.current_end) AS current_7d,
+    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.prior_start AND b.prior_end) AS prior_7d,
+    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.month_start AND b.current_end) AS mtd,
+    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.prev_month_start AND (b.prev_as_of - 1)) AS mtd_prev
+FROM bounds b
+"""
+    return run_query(query)
+
+
+def attach_meta_message_cost_per_mau(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill Meta messaging cost/MAU from outbound volume and the MAU row."""
+    if df is None or df.empty:
+        return df
+    mau = df.loc[df["metric"] == "MAU (avg. rolling 30-day MAU)"]
+    if mau.empty:
+        return df
+    current_mau = float(mau.iloc[0]["current_value"] or 0)
+    previous_mau = float(mau.iloc[0]["previous_value"] or 0)
+    counts = get_meta_outbound_message_counts()
+    if counts is None or counts.empty:
+        return df
+    row_counts = counts.iloc[0]
+    as_of = _sao_paulo_today()
+    days_in_month = calendar.monthrange(as_of.year, as_of.month)[1]
+
+    def per_mau(message_count, mau_n):
+        _marketing, _service, total = split_meta_message_cost(message_count)
+        if total is None or not mau_n:
+            return None
+        return round((total / 7.0 * days_in_month) / mau_n, 2)
+
+    row = {col: None for col in df.columns}
+    row.update({
+        "sort_order": 5.5,
+        "metric": "Meta messaging cost/MAU",
+        "value_type": "usd",
+        "current_value": per_mau(row_counts.get("current_7d"), current_mau),
+        "previous_value": per_mau(row_counts.get("prior_7d"), previous_mau),
+    })
+    base = df.loc[df["metric"] != "Meta messaging cost/MAU"]
+    out = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
+    return out.sort_values("sort_order").reset_index(drop=True)
 
 
 @st.cache_data(ttl=300)
@@ -4640,7 +4786,7 @@ if selected_section == "📊 Quick Insights":
         if abs(diff) < 1e-9:
             zero_label = "$0.00" if value_type == "usd" else "0.0"
             return f'<span style="color:#888;">{zero_label}</span>'
-        # Higher is better except LLM cost/MAU
+        # Higher is better, except cost rows (value_type usd).
         improvement = diff < 0 if value_type == "usd" else diff > 0
         color = "#00d4aa" if improvement else "#ff6b6b"
         arrow = "▲" if diff > 0 else "▼"
@@ -4660,6 +4806,10 @@ if selected_section == "📊 Quick Insights":
         except Exception as _or_err:
             st.warning(f"Could not load OpenRouter LLM cost: {_or_err}")
             _eng_df = _blank_llm_cost_mau_row(_eng_df)
+        try:
+            _eng_df = attach_meta_message_cost_per_mau(_eng_df)
+        except Exception as _meta_err:
+            st.warning(f"Could not load Meta messaging cost: {_meta_err}")
 
     st.markdown("#### KPI")
     if not _eng_df.empty:
@@ -4695,6 +4845,7 @@ if selected_section == "📊 Quick Insights":
         st.caption(
             "* DEU = users who sent ≥1 message to the coach that day. "
             "LLM cost/MAU = (7-day OpenRouter letz-prod spend ÷ 7 × days in the current month) ÷ the MAU row above. "
+            "Meta messaging cost/MAU uses that same formula on outbound coach messages. "
             "Retention: among users who completed a first activity and had enough time to mature into the "
             "window. 7D counts a second activity within 7 days of the first; "
             "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
@@ -5658,6 +5809,46 @@ if selected_section == "💰 Cost":
     except Exception:
         budget_cost_per_mau = budget_run_rate = None
 
+    try:
+        msg_counts = get_meta_outbound_message_counts()
+        msg_row = msg_counts.iloc[0] if msg_counts is not None and not msg_counts.empty else {}
+        current_msgs = float(msg_row.get("current_7d", 0) or 0)
+        prior_msgs = float(msg_row.get("prior_7d", 0) or 0)
+        mtd_msgs = float(msg_row.get("mtd", 0) or 0)
+        mtd_msgs_prev = float(msg_row.get("mtd_prev", 0) or 0)
+    except Exception as e:
+        st.warning(f"Could not load Meta message counts: {e}")
+        current_msgs = prior_msgs = mtd_msgs = mtd_msgs_prev = None
+
+    def _meta_monthly(message_count, elapsed_days, days_in_month):
+        marketing, service, total = split_meta_message_cost(message_count)
+        if total is None or not elapsed_days:
+            return None, None, None
+        scale = days_in_month / float(elapsed_days)
+        return marketing * scale, service * scale, total * scale
+
+    def _meta_per_mau(message_count, mau_n):
+        _marketing, _service, total = _meta_monthly(message_count, 7, _days_in_month)
+        if total is None or not mau_n:
+            return None
+        return total / mau_n
+
+    meta_mau_current = _meta_per_mau(current_msgs, current_7d_mau)
+    meta_mau_prior = _meta_per_mau(prior_msgs, prior_7d_mau)
+    meta_mkt_run, meta_svc_run, _meta_total_run = _meta_monthly(
+        mtd_msgs, _mtd_days, _days_in_month
+    )
+    meta_mkt_run_prev, meta_svc_run_prev, _meta_total_run_prev = _meta_monthly(
+        mtd_msgs_prev, _prev_mtd_days, _prev_days_in_month
+    )
+
+    try:
+        budget_meta_mkt, budget_meta_svc, budget_meta_mau, _meta_budget_source = (
+            get_meta_message_budgets_for_month(_month_name)
+        )
+    except Exception:
+        budget_meta_mkt = budget_meta_svc = budget_meta_mau = None
+
     def _fmt_usd(value, precision=2):
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return "—"
@@ -5712,6 +5903,27 @@ if selected_section == "💰 Cost":
             "budget": budget_run_rate,
             "precision": 0,
         },
+        {
+            "metric": "Meta messaging cost/MAU (last 7d)",
+            "current": meta_mau_current,
+            "previous": meta_mau_prior,
+            "budget": budget_meta_mau,
+            "precision": 2,
+        },
+        {
+            "metric": f"Marketing — run rate ({_month_name})",
+            "current": meta_mkt_run,
+            "previous": meta_mkt_run_prev,
+            "budget": budget_meta_mkt,
+            "precision": 0,
+        },
+        {
+            "metric": f"Service/utility — run rate ({_month_name})",
+            "current": meta_svc_run,
+            "previous": meta_svc_run_prev,
+            "budget": budget_meta_svc,
+            "precision": 0,
+        },
     ]
 
     st.markdown("#### KPI")
@@ -5740,8 +5952,8 @@ if selected_section == "💰 Cost":
         unsafe_allow_html=True,
     )
     st.caption(
-        "Spend is OpenRouter letz-prod. "
-        "Cost/MAU = (7-day spend ÷ 7 × days in the month) ÷ rolling 30-day MAU. "
+        "LLM spend is OpenRouter letz-prod. Meta messaging is outbound coach messages. "
+        "Cost/MAU = (7-day cost ÷ 7 × days in the month) ÷ rolling 30-day MAU. "
         "Run rate = month-to-date through yesterday ÷ elapsed days × days in the month."
     )
 
