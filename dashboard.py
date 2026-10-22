@@ -3910,29 +3910,14 @@ ORDER BY wb.week_start DESC;
 
 @st.cache_data(ttl=300)
 def get_deep_dive_user_options() -> pd.DataFrame:
-    """Load the user selector options for User Deep Dive."""
+    """Load the user selector options for User Deep Dive.
+
+    The 24h activity flag is a per-user index probe on
+    (waid, sender, sent_at). A single scan of messages cannot use that
+    index, and that scan was the whole cost of opening this page.
+    """
     return run_query("""
-        WITH unique_users AS (
-            SELECT DISTINCT ON (waid)
-                id,
-                COALESCE(full_name, 'Unknown') as full_name,
-                waid,
-                timezone,
-                created_at,
-                coach_name,
-                metadata,
-                tags
-            FROM users
-            ORDER BY waid, created_at DESC
-        ),
-        active_users AS (
-            SELECT DISTINCT user_id
-            FROM messages
-            WHERE sender = 'user'
-              AND sent_at >= NOW() - INTERVAL '24 hours'
-              AND user_id IS NOT NULL
-        ),
-        user_slogans AS (
+        WITH user_slogans AS (
             SELECT DISTINCT ON (user_id)
                 user_id,
                 content->>'slogan' as slogan
@@ -3943,26 +3928,32 @@ def get_deep_dive_user_options() -> pd.DataFrame:
         )
         SELECT
             u.id,
-            u.full_name,
+            COALESCE(u.full_name, 'Unknown') AS full_name,
             u.waid,
             u.timezone,
             u.created_at,
             u.coach_name,
             COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
-            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END AS is_active_24h,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(u.tags, '[]'::jsonb)), 0) > 0 THEN true ELSE false END AS has_tags,
-            CASE
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements_text(COALESCE(u.tags, '[]'::jsonb)) AS t(tag)
-                    WHERE LOWER(t.tag) = 'dotz'
-                ) THEN true
-                ELSE false
-            END AS is_dotz
-        FROM unique_users u
-        LEFT JOIN active_users a ON u.id = a.user_id
+            EXISTS (
+                SELECT 1
+                FROM messages m
+                WHERE m.waid = u.waid
+                  AND m.sender = 'user'
+                  AND m.user_id IS NOT NULL
+                  AND m.sent_at >= NOW() - INTERVAL '24 hours'
+                  AND m.type::text <> ALL (
+                      ARRAY['think', 'tool_use', 'tool_result', 'turn_audit']::text[]
+                  )
+            ) AS is_active_24h,
+            COALESCE(jsonb_array_length(COALESCE(u.tags, '[]'::jsonb)), 0) > 0 AS has_tags,
+            EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(COALESCE(u.tags, '[]'::jsonb)) AS t(tag)
+                WHERE LOWER(t.tag) = 'dotz'
+            ) AS is_dotz
+        FROM users u
         LEFT JOIN user_slogans us ON u.id = us.user_id
-        ORDER BY u.full_name ASC
+        ORDER BY full_name ASC
         LIMIT 500
     """)
 
