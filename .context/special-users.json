@@ -17,7 +17,8 @@
     "555196939336",
     "5511997792994",
     "5511998855725",
-    "5511950822122"
+    "5511950822122",
+    "5511995662005"
   ],
   "known_identities": {
     "556193835151": { "name": "Ricardo Guerra" },
@@ -30,8 +31,9 @@
     "491732089223": { "name": "Claudia Massei" },
     "5511997792994": { "name": "Luisa Dalla Costa" },
     "5511998855725": { "name": "Santiago Fossatti" },
-    "5511950822122": { "name": "Monica", "joined": "2026-10-07" }
+    "5511950822122": { "name": "Monica", "joined": "2026-10-07" },
+    "5511995662005": { "name": "Vitoria", "joined": "2026-10-22" }
   },
-  "last_updated": "2026-10-12",
+  "last_updated": "2026-10-22",
   "notes": "Canonical source for investor WAIDs. Flag with [investor] tag in dashboard and dotz daily summary (Query 7). When this list changes, also update special_waids in analysis/dotz_daily_summary/dotz-surge-daily-queries.sql."
 }
