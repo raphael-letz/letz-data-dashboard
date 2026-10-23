@@ -1598,8 +1598,8 @@ LLM_COST_FORECAST_GID = "1487726926"
 LLM_COST_FORECAST_CACHE_PATH = os.path.join(
     os.path.dirname(__file__), ".context", "llm-cost-forecast.json"
 )
-# Forecast tab: 1% of messages are marketing templates; the rest are service/utility.
-META_MARKETING_MESSAGE_SHARE = 0.01
+# Meta WhatsApp rates. MARKETING templates use the marketing rate.
+# UTILITY templates and messages with no template_category (service) use the service rate.
 META_MARKETING_RATE_USD = 0.0625
 META_SERVICE_RATE_USD = 0.0068
 
@@ -1787,13 +1787,21 @@ def get_llm_cost_forecast_for_month(month_name: str) -> tuple[float | None, str]
     return run_rate, source
 
 
-def split_meta_message_cost(message_count) -> tuple[float | None, float | None, float | None]:
-    """Return (marketing, service/utility, total) USD for a message count."""
-    if message_count is None or (isinstance(message_count, float) and pd.isna(message_count)):
+def split_meta_message_cost(marketing_count, service_count) -> tuple[float | None, float | None, float | None]:
+    """Return (marketing, service/utility, total) USD.
+
+    marketing_count is template_category = MARKETING.
+    service_count is every other outbound message: UTILITY templates and
+    messages with no category.
+    """
+    if marketing_count is None or service_count is None:
         return None, None, None
-    n = float(message_count)
-    marketing = n * META_MARKETING_MESSAGE_SHARE * META_MARKETING_RATE_USD
-    service = n * (1.0 - META_MARKETING_MESSAGE_SHARE) * META_SERVICE_RATE_USD
+    if isinstance(marketing_count, float) and pd.isna(marketing_count):
+        return None, None, None
+    if isinstance(service_count, float) and pd.isna(service_count):
+        return None, None, None
+    marketing = float(marketing_count) * META_MARKETING_RATE_USD
+    service = float(service_count) * META_SERVICE_RATE_USD
     return marketing, service, marketing + service
 
 
@@ -1823,11 +1831,13 @@ def get_meta_message_budgets_for_month(month_name: str) -> tuple[float | None, f
 @st.cache_data(ttl=300)
 def get_meta_outbound_message_counts() -> pd.DataFrame:
     """
-    Billable outbound coach messages in America/Sao_Paulo.
+    Billable outbound coach messages in America/Sao_Paulo, split by Meta price.
 
-    Includes internal users. Excludes failed sends and internal trace rows.
-    Windows match the LLM cost tab: last 7 completed days, previous 7,
-    month-to-date through yesterday, and month-to-date as of 7 days ago.
+    Marketing is template_category = MARKETING. Utility templates and messages
+    with no category are service. Includes internal users. Excludes failed
+    sends and internal trace rows. Windows match the LLM cost tab: last 7
+    completed days, previous 7, month-to-date through yesterday, and
+    month-to-date as of 7 days ago.
     """
     query = """
 WITH params AS (
@@ -1846,7 +1856,9 @@ bounds AS (
     FROM params
 ),
 msgs AS (
-    SELECT (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date
+    SELECT
+        (m.sent_at AT TIME ZONE 'America/Sao_Paulo')::date AS local_date,
+        COALESCE(UPPER(m.template_category), '') = 'MARKETING' AS is_marketing
     FROM messages m
     WHERE m.sender = 'companion'
       AND COALESCE(m.status, '') <> 'failed'
@@ -1861,11 +1873,32 @@ msgs AS (
       )
 )
 SELECT
-    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.current_start AND b.current_end) AS current_7d,
-    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.prior_start AND b.prior_end) AS prior_7d,
-    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.month_start AND b.current_end) AS mtd,
-    (SELECT COUNT(*) FROM msgs WHERE local_date BETWEEN b.prev_month_start AND (b.prev_as_of - 1)) AS mtd_prev
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.current_start AND b.current_end AND is_marketing
+    ) AS current_7d_marketing,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.current_start AND b.current_end AND NOT is_marketing
+    ) AS current_7d_service,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.prior_start AND b.prior_end AND is_marketing
+    ) AS prior_7d_marketing,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.prior_start AND b.prior_end AND NOT is_marketing
+    ) AS prior_7d_service,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.month_start AND b.current_end AND is_marketing
+    ) AS mtd_marketing,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.month_start AND b.current_end AND NOT is_marketing
+    ) AS mtd_service,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.prev_month_start AND (b.prev_as_of - 1) AND is_marketing
+    ) AS mtd_prev_marketing,
+    COUNT(*) FILTER (
+        WHERE local_date BETWEEN b.prev_month_start AND (b.prev_as_of - 1) AND NOT is_marketing
+    ) AS mtd_prev_service
 FROM bounds b
+LEFT JOIN msgs ON TRUE
 """
     return run_query(query)
 
@@ -1886,8 +1919,8 @@ def attach_meta_message_cost_per_mau(df: pd.DataFrame) -> pd.DataFrame:
     as_of = _sao_paulo_today()
     days_in_month = calendar.monthrange(as_of.year, as_of.month)[1]
 
-    def per_mau(message_count, mau_n):
-        _marketing, _service, total = split_meta_message_cost(message_count)
+    def per_mau(marketing_count, service_count, mau_n):
+        _marketing, _service, total = split_meta_message_cost(marketing_count, service_count)
         if total is None or not mau_n:
             return None
         return round((total / 7.0 * days_in_month) / mau_n, 2)
@@ -1897,8 +1930,16 @@ def attach_meta_message_cost_per_mau(df: pd.DataFrame) -> pd.DataFrame:
         "sort_order": 5.5,
         "metric": "Meta messaging cost/MAU",
         "value_type": "usd",
-        "current_value": per_mau(row_counts.get("current_7d"), current_mau),
-        "previous_value": per_mau(row_counts.get("prior_7d"), previous_mau),
+        "current_value": per_mau(
+            row_counts.get("current_7d_marketing"),
+            row_counts.get("current_7d_service"),
+            current_mau,
+        ),
+        "previous_value": per_mau(
+            row_counts.get("prior_7d_marketing"),
+            row_counts.get("prior_7d_service"),
+            previous_mau,
+        ),
     })
     base = df.loc[df["metric"] != "Meta messaging cost/MAU"]
     out = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
@@ -4845,7 +4886,8 @@ if selected_section == "📊 Quick Insights":
         st.caption(
             "* DEU = users who sent ≥1 message to the coach that day. "
             "LLM cost/MAU = (7-day OpenRouter letz-prod spend ÷ 7 × days in the current month) ÷ the MAU row above. "
-            "Meta messaging cost/MAU uses that same formula on outbound coach messages. "
+            "Meta messaging cost/MAU uses that same formula on outbound coach messages: "
+            "marketing templates at $0.0625, utility templates and service messages at $0.0068. "
             "Retention: among users who completed a first activity and had enough time to mature into the "
             "window. 7D counts a second activity within 7 days of the first; "
             "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
@@ -5812,34 +5854,44 @@ if selected_section == "💰 Cost":
     try:
         msg_counts = get_meta_outbound_message_counts()
         msg_row = msg_counts.iloc[0] if msg_counts is not None and not msg_counts.empty else {}
-        current_msgs = float(msg_row.get("current_7d", 0) or 0)
-        prior_msgs = float(msg_row.get("prior_7d", 0) or 0)
-        mtd_msgs = float(msg_row.get("mtd", 0) or 0)
-        mtd_msgs_prev = float(msg_row.get("mtd_prev", 0) or 0)
+
+        def _count_pair(marketing_key, service_key):
+            return (
+                float(msg_row.get(marketing_key, 0) or 0),
+                float(msg_row.get(service_key, 0) or 0),
+            )
+
+        current_mkt_n, current_svc_n = _count_pair("current_7d_marketing", "current_7d_service")
+        prior_mkt_n, prior_svc_n = _count_pair("prior_7d_marketing", "prior_7d_service")
+        mtd_mkt_n, mtd_svc_n = _count_pair("mtd_marketing", "mtd_service")
+        mtd_prev_mkt_n, mtd_prev_svc_n = _count_pair("mtd_prev_marketing", "mtd_prev_service")
     except Exception as e:
         st.warning(f"Could not load Meta message counts: {e}")
-        current_msgs = prior_msgs = mtd_msgs = mtd_msgs_prev = None
+        current_mkt_n = current_svc_n = prior_mkt_n = prior_svc_n = None
+        mtd_mkt_n = mtd_svc_n = mtd_prev_mkt_n = mtd_prev_svc_n = None
 
-    def _meta_monthly(message_count, elapsed_days, days_in_month):
-        marketing, service, total = split_meta_message_cost(message_count)
+    def _meta_monthly(marketing_count, service_count, elapsed_days, days_in_month):
+        marketing, service, total = split_meta_message_cost(marketing_count, service_count)
         if total is None or not elapsed_days:
             return None, None, None
         scale = days_in_month / float(elapsed_days)
         return marketing * scale, service * scale, total * scale
 
-    def _meta_per_mau(message_count, mau_n):
-        _marketing, _service, total = _meta_monthly(message_count, 7, _days_in_month)
+    def _meta_per_mau(marketing_count, service_count, mau_n):
+        _marketing, _service, total = _meta_monthly(
+            marketing_count, service_count, 7, _days_in_month
+        )
         if total is None or not mau_n:
             return None
         return total / mau_n
 
-    meta_mau_current = _meta_per_mau(current_msgs, current_7d_mau)
-    meta_mau_prior = _meta_per_mau(prior_msgs, prior_7d_mau)
+    meta_mau_current = _meta_per_mau(current_mkt_n, current_svc_n, current_7d_mau)
+    meta_mau_prior = _meta_per_mau(prior_mkt_n, prior_svc_n, prior_7d_mau)
     meta_mkt_run, meta_svc_run, _meta_total_run = _meta_monthly(
-        mtd_msgs, _mtd_days, _days_in_month
+        mtd_mkt_n, mtd_svc_n, _mtd_days, _days_in_month
     )
     meta_mkt_run_prev, meta_svc_run_prev, _meta_total_run_prev = _meta_monthly(
-        mtd_msgs_prev, _prev_mtd_days, _prev_days_in_month
+        mtd_prev_mkt_n, mtd_prev_svc_n, _prev_mtd_days, _prev_days_in_month
     )
 
     try:
@@ -5953,6 +6005,9 @@ if selected_section == "💰 Cost":
     )
     st.caption(
         "LLM spend is OpenRouter letz-prod. Meta messaging is outbound coach messages. "
+        "Marketing templates (template_category MARKETING) are $0.0625. "
+        "Utility templates and service messages (no category) are $0.0068. "
+        "template_category is recorded from 16 Oct 2026; earlier messages count as service. "
         "Cost/MAU = (7-day cost ÷ 7 × days in the month) ÷ rolling 30-day MAU. "
         "Run rate = month-to-date through yesterday ÷ elapsed days × days in the month."
     )
