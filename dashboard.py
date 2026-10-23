@@ -1200,7 +1200,7 @@ def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.Dat
     Investor-facing engagement comparison for Quick Insights.
 
     Rows: DEU, DAU, avg rolling 30-day MAU, DAU/MAU, LLM cost/MAU,
-    7D/14D/30D/60D/90D retention.
+    1D/7D/14D/30D/60D/90D retention.
     Columns: last 7 completed local days vs previous 7 completed local days
     (America/Sao_Paulo; today excluded for DEU/DAU/MAU/cost).
 
@@ -1216,6 +1216,7 @@ def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.Dat
 
     Retention (first-activity definition): among onboarded external users who
     completed a first activity and have matured into the window.
+    - 1D: second activity within 24 hours of first
     - 7D: second activity within 7 days of first
     - 14D / 30D / 60D / 90D: any subsequent activity after day 14 / 30 / 60 / 90 from first
     """
@@ -1324,6 +1325,7 @@ repeat_retention AS (
     f.snapshot_ts,
     f.id,
     f.first_completed_at,
+    MAX((a.completed_at <= f.first_completed_at + INTERVAL '1 day')::int) = 1 AS repeat_within_1d,
     MAX((a.completed_at <= f.first_completed_at + INTERVAL '7 days')::int) = 1 AS repeat_within_7d,
     MAX((a.completed_at > f.first_completed_at + INTERVAL '14 days')::int) = 1 AS repeat_after_14d,
     MAX((a.completed_at > f.first_completed_at + INTERVAL '30 days')::int) = 1 AS repeat_after_30d,
@@ -1340,20 +1342,34 @@ retention_summary AS (
   SELECT
     period,
     1 AS sort_order,
-    '7D retention' AS metric,
-    COUNT(*) FILTER (WHERE repeat_within_7d) AS numerator,
+    '1D retention' AS metric,
+    COUNT(*) FILTER (WHERE repeat_within_1d) AS numerator,
     COUNT(*) AS denominator,
+    ROUND(
+      100.0 * COUNT(*) FILTER (WHERE repeat_within_1d) / NULLIF(COUNT(*), 0),
+      1
+    ) AS rate
+  FROM repeat_retention
+  WHERE first_completed_at <= snapshot_ts - INTERVAL '1 day'
+  GROUP BY period
+  UNION ALL
+  SELECT
+    period,
+    2,
+    '7D retention',
+    COUNT(*) FILTER (WHERE repeat_within_7d),
+    COUNT(*),
     ROUND(
       100.0 * COUNT(*) FILTER (WHERE repeat_within_7d) / NULLIF(COUNT(*), 0),
       1
-    ) AS rate
+    )
   FROM repeat_retention
   WHERE first_completed_at <= snapshot_ts - INTERVAL '7 days'
   GROUP BY period
   UNION ALL
   SELECT
     period,
-    2,
+    3,
     '14D retention',
     COUNT(*) FILTER (WHERE repeat_after_14d),
     COUNT(*),
@@ -1367,7 +1383,7 @@ retention_summary AS (
   UNION ALL
   SELECT
     period,
-    3,
+    4,
     '30D retention',
     COUNT(*) FILTER (WHERE repeat_after_30d),
     COUNT(*),
@@ -1381,7 +1397,7 @@ retention_summary AS (
   UNION ALL
   SELECT
     period,
-    4,
+    5,
     '60D retention',
     COUNT(*) FILTER (WHERE repeat_after_60d),
     COUNT(*),
@@ -1395,7 +1411,7 @@ retention_summary AS (
   UNION ALL
   SELECT
     period,
-    5,
+    6,
     '90D retention',
     COUNT(*) FILTER (WHERE repeat_after_90d),
     COUNT(*),
@@ -4889,7 +4905,8 @@ if selected_section == "📊 Quick Insights":
             "Meta messaging cost/MAU uses that same formula on outbound coach messages: "
             "marketing templates at $0.0625, utility templates and service messages at $0.0068. "
             "Retention: among users who completed a first activity and had enough time to mature into the "
-            "window. 7D counts a second activity within 7 days of the first; "
+            "window. 1D counts a second activity within 24 hours of the first; "
+            "7D counts a second activity within 7 days of the first; "
             "14D / 30D / 60D / 90D count any subsequent activity after day 14 / 30 / 60 / 90. External users only."
         )
     else:
