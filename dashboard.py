@@ -4083,8 +4083,7 @@ def get_deep_dive_user_options() -> pd.DataFrame:
             ) AS is_dotz
         FROM users u
         LEFT JOIN user_slogans us ON u.id = us.user_id
-        ORDER BY full_name ASC
-        LIMIT 500
+        ORDER BY full_name ASC, u.id ASC
     """)
 
 
