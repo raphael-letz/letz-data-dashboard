@@ -1195,6 +1195,79 @@ def attach_openrouter_cost_per_mau(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def get_north_star_weekly_metrics(exclude_internal: bool = True) -> pd.DataFrame:
+    """
+    Weekly North Star metric: % of onboarded users who logged 2+ active days
+    in their first 7D (days 0-7 from onboarding completion).
+    """
+    internal_waids = load_internal_users() if exclude_internal else []
+    internal_waids_str = "', '".join(internal_waids) if internal_waids else "''"
+    query = f"""
+WITH internal_waids AS (
+  SELECT unnest(ARRAY['{internal_waids_str}'])::varchar AS waid
+),
+params AS (
+  SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Sao_Paulo')::date AS today_sp
+),
+onboarded AS (
+  SELECT
+    u.id,
+    MIN(acf.updated_at) AS onboarded_at,
+    (MIN(acf.updated_at) AT TIME ZONE 'America/Sao_Paulo')::date AS d0
+  FROM users u
+  JOIN ai_companion_flows acf
+    ON acf.user_id = u.id
+   AND acf.type = 'onboarding'
+   AND acf.is_complete = 'true'
+  WHERE u.waid NOT IN (SELECT waid FROM internal_waids WHERE waid <> '')
+  GROUP BY u.id
+),
+user_first_7d AS (
+  SELECT
+    o.id,
+    o.d0,
+    date_trunc('week', o.d0)::date AS week_start,
+    COUNT(DISTINCT (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date) FILTER (
+      WHERE uah.completed_at >= o.onboarded_at
+        AND (uah.completed_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN o.d0 AND o.d0 + 7
+    ) AS active_days_first_7d
+  FROM onboarded o
+  LEFT JOIN user_activities_history uah
+    ON uah.user_id = o.id
+  GROUP BY o.id, o.d0
+),
+bounds AS (
+  SELECT
+    COALESCE(MIN(week_start), date_trunc('week', (SELECT today_sp FROM params))::date) AS min_week,
+    date_trunc('week', (SELECT today_sp FROM params))::date AS max_week
+  FROM user_first_7d
+),
+weeks AS (
+  SELECT gs::date AS week_start
+  FROM bounds b,
+       generate_series(b.min_week, b.max_week, INTERVAL '7 days') AS gs
+)
+SELECT
+  TO_CHAR(w.week_start, 'YYYY-MM-DD') AS week_start,
+  COUNT(u.id)::int AS onboarded_users,
+  COUNT(u.id) FILTER (WHERE u.active_days_first_7d >= 2)::int AS hit_users,
+  COALESCE(
+    ROUND(
+      100.0 * COUNT(u.id) FILTER (WHERE u.active_days_first_7d >= 2) / NULLIF(COUNT(u.id), 0),
+      1
+    ),
+    0.0
+  ) AS hit_pct
+FROM weeks w
+LEFT JOIN user_first_7d u
+  ON u.week_start = w.week_start
+GROUP BY w.week_start
+ORDER BY w.week_start;
+"""
+    return run_query(query)
+
+
+@st.cache_data(ttl=300)
 def get_quick_insights_engagement_table(exclude_internal: bool = True) -> pd.DataFrame:
     """
     Investor-facing engagement comparison for Quick Insights.
@@ -3967,29 +4040,14 @@ ORDER BY wb.week_start DESC;
 
 @st.cache_data(ttl=300)
 def get_deep_dive_user_options() -> pd.DataFrame:
-    """Load the user selector options for User Deep Dive."""
+    """Load the user selector options for User Deep Dive.
+
+    The 24h activity flag is a per-user index probe on
+    (waid, sender, sent_at). A single scan of messages cannot use that
+    index, and that scan was the whole cost of opening this page.
+    """
     return run_query("""
-        WITH unique_users AS (
-            SELECT DISTINCT ON (waid)
-                id,
-                COALESCE(full_name, 'Unknown') as full_name,
-                waid,
-                timezone,
-                created_at,
-                coach_name,
-                metadata,
-                tags
-            FROM users
-            ORDER BY waid, created_at DESC
-        ),
-        active_users AS (
-            SELECT DISTINCT user_id
-            FROM messages
-            WHERE sender = 'user'
-              AND sent_at >= NOW() - INTERVAL '24 hours'
-              AND user_id IS NOT NULL
-        ),
-        user_slogans AS (
+        WITH user_slogans AS (
             SELECT DISTINCT ON (user_id)
                 user_id,
                 content->>'slogan' as slogan
@@ -4000,26 +4058,32 @@ def get_deep_dive_user_options() -> pd.DataFrame:
         )
         SELECT
             u.id,
-            u.full_name,
+            COALESCE(u.full_name, 'Unknown') AS full_name,
             u.waid,
             u.timezone,
             u.created_at,
             u.coach_name,
             COALESCE(NULLIF(u.metadata->>'mantra', ''), us.slogan) AS slogan,
-            CASE WHEN a.user_id IS NOT NULL THEN true ELSE false END AS is_active_24h,
-            CASE WHEN COALESCE(jsonb_array_length(COALESCE(u.tags, '[]'::jsonb)), 0) > 0 THEN true ELSE false END AS has_tags,
-            CASE
-                WHEN EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements_text(COALESCE(u.tags, '[]'::jsonb)) AS t(tag)
-                    WHERE LOWER(t.tag) = 'dotz'
-                ) THEN true
-                ELSE false
-            END AS is_dotz
-        FROM unique_users u
-        LEFT JOIN active_users a ON u.id = a.user_id
+            EXISTS (
+                SELECT 1
+                FROM messages m
+                WHERE m.waid = u.waid
+                  AND m.sender = 'user'
+                  AND m.user_id IS NOT NULL
+                  AND m.sent_at >= NOW() - INTERVAL '24 hours'
+                  AND m.type::text <> ALL (
+                      ARRAY['think', 'tool_use', 'tool_result', 'turn_audit']::text[]
+                  )
+            ) AS is_active_24h,
+            COALESCE(jsonb_array_length(COALESCE(u.tags, '[]'::jsonb)), 0) > 0 AS has_tags,
+            EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(COALESCE(u.tags, '[]'::jsonb)) AS t(tag)
+                WHERE LOWER(t.tag) = 'dotz'
+            ) AS is_dotz
+        FROM users u
         LEFT JOIN user_slogans us ON u.id = us.user_id
-        ORDER BY u.full_name ASC
+        ORDER BY full_name ASC
         LIMIT 500
     """)
 
@@ -4867,6 +4931,84 @@ if selected_section == "📊 Quick Insights":
             _eng_df = attach_meta_message_cost_per_mau(_eng_df)
         except Exception as _meta_err:
             st.warning(f"Could not load Meta messaging cost: {_meta_err}")
+
+    st.markdown("#### North Star")
+    try:
+        _ns_df = get_north_star_weekly_metrics(exclude_internal)
+    except Exception as _ns_err:
+        _ns_df = pd.DataFrame()
+        st.warning(f"Could not load North Star metrics: {_ns_err}")
+
+    if not _ns_df.empty:
+        try:
+            import altair as alt
+
+            _ns_df = _ns_df.copy()
+            _ns_df["week_dt"] = pd.to_datetime(_ns_df["week_start"], errors="coerce")
+            _ns_df = _ns_df.sort_values("week_dt").reset_index(drop=True)
+            _ns_df["hit_pct"] = pd.to_numeric(_ns_df["hit_pct"], errors="coerce").fillna(0.0)
+            _ns_df["onboarded_users"] = pd.to_numeric(_ns_df["onboarded_users"], errors="coerce").fillna(0).astype(int)
+            _ns_df["hit_users"] = pd.to_numeric(_ns_df["hit_users"], errors="coerce").fillna(0).astype(int)
+            _ns_df["week_label"] = _ns_df["week_dt"].dt.strftime("%d %b")
+            _ns_df["week_order"] = _ns_df.index
+
+            _total_ns_weeks = len(_ns_df)
+            _default_ns_weeks = min(10, _total_ns_weeks)
+            _ns_chart_slot = st.container()
+
+            if _total_ns_weeks > 10:
+                _ns_weeks_to_show = st.slider(
+                    "Weeks",
+                    min_value=10,
+                    max_value=_total_ns_weeks,
+                    value=_default_ns_weeks,
+                    step=1,
+                    key="north_star_weeks_slider",
+                    label_visibility="collapsed",
+                )
+            else:
+                _ns_weeks_to_show = _total_ns_weeks
+
+            _ns_view = _ns_df.tail(_ns_weeks_to_show).copy()
+
+            _ns_bars = (
+                alt.Chart(_ns_view)
+                .mark_bar(color="#00d4aa")
+                .encode(
+                    x=alt.X(
+                        "week_label:N",
+                        sort=alt.EncodingSortField(field="week_order", order="ascending"),
+                        title=None,
+                        axis=alt.Axis(labelAngle=0),
+                    ),
+                    y=alt.Y(
+                        "hit_pct:Q",
+                        title="% Onboarded (2+ Active Days in 7D)",
+                        scale=alt.Scale(domain=[0, 100]),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("week_start:N", title="Week Start"),
+                        alt.Tooltip("hit_pct:Q", title="% Hit (2+ Days in 7D)", format=".1f"),
+                        alt.Tooltip("hit_users:Q", title="Hit 2+ Days"),
+                        alt.Tooltip("onboarded_users:Q", title="Onboarded Users"),
+                    ],
+                )
+            )
+            _ns_target = (
+                alt.Chart(pd.DataFrame({"target": [70.0]}))
+                .mark_rule(strokeDash=[4, 4], color="#ffffff", strokeWidth=2)
+                .encode(y="target:Q")
+            )
+
+            with _ns_chart_slot:
+                st.altair_chart(
+                    (_ns_bars + _ns_target).properties(height=300),
+                    use_container_width=True,
+                )
+        except Exception as _ns_chart_err:
+            st.warning(f"Could not render North Star chart: {_ns_chart_err}")
+
+    st.markdown("---")
 
     st.markdown("#### KPI")
     if not _eng_df.empty:
